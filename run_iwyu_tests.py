@@ -49,9 +49,13 @@ def TestIwyuOnRelevantFiles(filename):
   # foo-*.cc files, which is not kosher but is legal), in addition
   # to foo.h (if present) and foo.cc.
   all_files = (glob.glob('%s-*' % all_but_extension) +
+               glob.glob('%s.inline.*' % all_but_extension) +
                glob.glob('%s/*/%s-*' % (dirname, basename)) +
+               glob.glob('%s/*/%s.inline.*' % (dirname, basename)) +
                glob.glob('%s.h' % all_but_extension) +
-               glob.glob('%s/*/%s.h' % (dirname, basename)))
+               glob.glob('%s.hpp' % all_but_extension) +
+               glob.glob('%s/*/%s.h' % (dirname, basename)) +
+               glob.glob('%s/*/%s.hpp' % (dirname, basename)))
 
   files_to_check = [f for f in all_files if not f.endswith(extension)]
   files_to_check.append(filename)

@@ -110,7 +110,8 @@ string GetCanonicalName(string file_path) {
       || StripRight(&file_path, "_regtest")
       || StripRight(&file_path, "_test")
       || StripLeft(&file_path, "test_headercompile_");
-  StripRight(&file_path, "-inl");
+  StripRight(&file_path, ".inline")
+      || StripRight(&file_path, "-inl");
   // .h files in /public/ match .cc files in /internal/
   const string::size_type internal_pos = file_path.find("/internal/");
   if (internal_pos != string::npos)
