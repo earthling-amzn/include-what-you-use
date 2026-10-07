@@ -94,8 +94,9 @@ using std::multimap;
 class IwyuPreprocessorInfo : public clang::PPCallbacks,
                              public clang::CommentHandler {
  public:
-  IwyuPreprocessorInfo() : main_file_(nullptr),
-                           empty_file_info_(nullptr, this, "") {}
+  explicit IwyuPreprocessorInfo(clang::Preprocessor& preprocessor)
+      : preprocessor_(&preprocessor), main_file_(nullptr),
+        empty_file_info_(nullptr, this, "") {}
 
   // The client *must* call this from the beginning of HandleTranslationUnit()
   void HandlePreprocessingDone();
@@ -194,11 +195,21 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
                const clang::MacroDefinition& definition,
                clang::SourceRange range) override;
 
-  // Not needed for iwyu:
-  // virtual void If();
-  // virtual void Elif();
-  // virtual void Else();
-  // virtual void Endif();
+  void If(clang::SourceLocation loc, clang::SourceRange condition_range,
+          ConditionValueKind condition_value) override;
+  void Elif(clang::SourceLocation loc, clang::SourceRange condition_range,
+            ConditionValueKind condition_value,
+            clang::SourceLocation if_loc) override;
+  void Elifdef(clang::SourceLocation loc, const clang::Token& id,
+               const clang::MacroDefinition& definition) override;
+  void Elifdef(clang::SourceLocation loc, clang::SourceRange condition_range,
+               clang::SourceLocation if_loc) override;
+  void Elifndef(clang::SourceLocation loc, const clang::Token& id,
+                const clang::MacroDefinition& definition) override;
+  void Elifndef(clang::SourceLocation loc, clang::SourceRange condition_range,
+                clang::SourceLocation if_loc) override;
+  void Else(clang::SourceLocation loc, clang::SourceLocation if_loc) override;
+  void Endif(clang::SourceLocation loc, clang::SourceLocation if_loc) override;
 
   void InclusionDirective(clang::SourceLocation hash_loc,
                           const clang::Token& include_token,
@@ -230,6 +241,29 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
                      clang::SourceRange comment_range) override;
 
  private:
+  struct ConditionalState {
+    const clang::IdentifierInfo* macro;
+    bool is_ifndef;
+    bool in_alternative;
+  };
+
+  struct PendingDottedInlineExport {
+    const clang::FileEntry* includer;
+    const clang::FileEntry* includee;
+    string include_name_as_written;
+    vector<ConditionalState> conditions;
+  };
+
+  void EnterConditional(clang::SourceLocation loc,
+                        const clang::IdentifierInfo* macro,
+                        bool is_ifndef);
+  void EnterAlternative(clang::SourceLocation loc);
+  void ExitConditional(clang::SourceLocation loc);
+  void MaybeRecordDottedInlineExport(
+      clang::SourceLocation includer_loc, const clang::FileEntry* includee,
+      const string& include_name_as_written);
+  void FinalizeDottedInlineExports();
+
   // Returns true if includee is considered part of the main
   // compilation unit.  We always generate warnings for violations in
   // files are part of the main compilation unit.
@@ -295,6 +329,10 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
   // Return true if at the current point in the parse of the given files,
   // there is a pending "begin_keep" pragma.
   bool HasOpenBeginKeep(const clang::FileEntry* file) const;
+
+  clang::Preprocessor* preprocessor_;
+  map<const clang::FileEntry*, vector<ConditionalState>> conditional_stacks_;
+  vector<PendingDottedInlineExport> pending_dotted_inline_exports_;
 
   // The C++ source file passed in as an argument to the compiler (as
   // opposed to other files seen via #includes).

@@ -30,6 +30,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "clang/AST/Decl.h"
 #include "clang/Basic/IdentifierTable.h"
+#include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/MacroInfo.h"
 
 using clang::FileEntry;
@@ -78,6 +79,43 @@ string NormalizeNamespaces(string symbol) {
               symbol.substr(index + strlen(kAnonymousNamespaceQualifier)));
   }
   return symbol;
+}
+
+bool StripHeaderExtension(string* path) {
+  return StripRight(path, ".h")
+      || StripRight(path, ".H")
+      || StripRight(path, ".hpp")
+      || StripRight(path, ".hxx")
+      || StripRight(path, ".hh")
+      || StripRight(path, ".inl");
+}
+
+// Return true for dotted inline-definition header conventions after a known
+// header extension, e.g. foo.inline.h and foo.inline.hpp.
+bool IsDottedInlineHeader(string path) {
+  path = NormalizeFilePath(path);
+  return StripHeaderExtension(&path) && EndsWith(path, ".inline");
+}
+
+bool IsInlineDefinitionsHeader(string path) {
+  path = NormalizeFilePath(path);
+  if (StripRight(&path, ".inl"))
+    return true;
+  if (!StripHeaderExtension(&path))
+    return false;
+  return EndsWith(path, ".inline") || EndsWith(path, "-inl");
+}
+
+bool IsExactPlainCounterpart(string inline_path, string plain_path) {
+  inline_path = NormalizeFilePath(inline_path);
+  plain_path = NormalizeFilePath(plain_path);
+  if (IsInlineDefinitionsHeader(plain_path) ||
+      !StripHeaderExtension(&inline_path) ||
+      !StripRight(&inline_path, ".inline") ||
+      !StripHeaderExtension(&plain_path)) {
+    return false;
+  }
+  return inline_path == plain_path;
 }
 
 }  // namespace
@@ -423,6 +461,61 @@ void IwyuPreprocessorInfo::InsertIntoFileInfoMap(
   }
 }
 
+void IwyuPreprocessorInfo::MaybeRecordDottedInlineExport(
+    SourceLocation includer_loc, const FileEntry* includee,
+    const string& include_name_as_written) {
+  const FileEntry* includer = GetFileEntry(includer_loc);
+  if (!includer || !includee || include_name_as_written.empty())
+    return;
+  const string includer_path = GetFilePath(includer);
+  const string includee_path = GetFilePath(includee);
+  if (!IsDottedInlineHeader(includer_path) ||
+      !IsExactPlainCounterpart(includer_path, includee_path)) {
+    return;
+  }
+  pending_dotted_inline_exports_.push_back(
+      {includer, includee, include_name_as_written,
+       GetOrDefault(conditional_stacks_, includer,
+                    vector<ConditionalState>())});
+}
+
+void IwyuPreprocessorInfo::FinalizeDottedInlineExports() {
+  set<pair<string, string>> added;
+  for (const PendingDottedInlineExport& pending :
+       pending_dotted_inline_exports_) {
+    bool unconditional = pending.conditions.empty();
+    if (pending.conditions.size() == 1) {
+      const ConditionalState& condition = pending.conditions.front();
+      clang::HeaderFileInfo& info =
+          preprocessor_->getHeaderSearchInfo().getFileInfo(pending.includer);
+      const clang::IdentifierInfo* controlling_macro =
+          info.getControllingMacro(preprocessor_->getExternalSource());
+      unconditional = !condition.in_alternative && controlling_macro &&
+                      (!condition.macro ||
+                       (condition.is_ifndef &&
+                        condition.macro == controlling_macro));
+    }
+    if (!unconditional)
+      continue;
+
+    const string includer_path = GetFilePath(pending.includer);
+    const string includee_path = GetFilePath(pending.includee);
+    if (!added.insert({includee_path, includer_path}).second)
+      continue;
+    const string quoted_includer = ConvertToQuotedInclude(includer_path);
+    const MappedInclude map_to(quoted_includer, includer_path);
+    VERRS(8) << "Adding dotted-inline export mapping: "
+             << pending.include_name_as_written << " -> "
+             << quoted_includer << "\n";
+    MutableGlobalIncludePicker()->AddMapping(
+        pending.include_name_as_written, map_to);
+    const string context_free_includee = ConvertToQuotedInclude(includee_path);
+    if (context_free_includee != pending.include_name_as_written) {
+      MutableGlobalIncludePicker()->AddMapping(context_free_includee, map_to);
+    }
+  }
+}
+
 // Sometimes, we can tell just by looking at an #include line
 // that iwyu should never recommend removing the #include.  For
 // instance, if it has an IWYU pragma saying to keep it.
@@ -626,6 +719,9 @@ void IwyuPreprocessorInfo::AddDirectInclude(
   MutableGlobalIncludePicker()->AddDirectInclude(
       GetFilePath(includer), GetFilePath(includee), include_name_as_written);
 
+  MaybeRecordDottedInlineExport(includer_loc, includee,
+                                include_name_as_written);
+
   MaybeProtectInclude(includer_loc, includee, include_name_as_written);
 
   ERRSYM(includer) << "Added an #include: " << GetFilePath(includer)
@@ -685,9 +781,82 @@ void IwyuPreprocessorInfo::MacroDefined(const Token& id,
   }
 }
 
+void IwyuPreprocessorInfo::EnterConditional(
+    SourceLocation loc, const clang::IdentifierInfo* macro, bool is_ifndef) {
+  const FileEntry* file = GetFileEntry(loc);
+  if (!file)
+    return;
+  conditional_stacks_[file].push_back({macro, is_ifndef, false});
+}
+
+void IwyuPreprocessorInfo::EnterAlternative(SourceLocation loc) {
+  const FileEntry* file = GetFileEntry(loc);
+  if (!file)
+    return;
+  vector<ConditionalState>& stack = conditional_stacks_[file];
+  if (!stack.empty())
+    stack.back().in_alternative = true;
+}
+
+void IwyuPreprocessorInfo::ExitConditional(SourceLocation loc) {
+  const FileEntry* file = GetFileEntry(loc);
+  if (!file)
+    return;
+  vector<ConditionalState>& stack = conditional_stacks_[file];
+  if (!stack.empty())
+    stack.pop_back();
+}
+
+void IwyuPreprocessorInfo::If(
+    SourceLocation loc, SourceRange /*condition_range*/,
+    ConditionValueKind /*condition_value*/) {
+  EnterConditional(loc, nullptr, false);
+}
+
+void IwyuPreprocessorInfo::Elif(
+    SourceLocation loc, SourceRange /*condition_range*/,
+    ConditionValueKind /*condition_value*/, SourceLocation /*if_loc*/) {
+  EnterAlternative(loc);
+}
+
+void IwyuPreprocessorInfo::Elifdef(
+    SourceLocation loc, const Token& /*id*/,
+    const MacroDefinition& /*definition*/) {
+  EnterAlternative(loc);
+}
+
+void IwyuPreprocessorInfo::Elifdef(
+    SourceLocation loc, SourceRange /*condition_range*/,
+    SourceLocation /*if_loc*/) {
+  EnterAlternative(loc);
+}
+
+void IwyuPreprocessorInfo::Elifndef(
+    SourceLocation loc, const Token& /*id*/,
+    const MacroDefinition& /*definition*/) {
+  EnterAlternative(loc);
+}
+
+void IwyuPreprocessorInfo::Elifndef(
+    SourceLocation loc, SourceRange /*condition_range*/,
+    SourceLocation /*if_loc*/) {
+  EnterAlternative(loc);
+}
+
+void IwyuPreprocessorInfo::Else(
+    SourceLocation loc, SourceLocation /*if_loc*/) {
+  EnterAlternative(loc);
+}
+
+void IwyuPreprocessorInfo::Endif(
+    SourceLocation loc, SourceLocation /*if_loc*/) {
+  ExitConditional(loc);
+}
+
 void IwyuPreprocessorInfo::Ifdef(SourceLocation loc,
                                  const Token& id,
                                  const MacroDefinition& /*definition*/) {
+  EnterConditional(loc, id.getIdentifierInfo(), false);
   ERRSYM(GetFileEntry(id.getLocation()))
       << "[ #ifdef      ] " << PrintableLoc(id.getLocation())
       << ": " << GetName(id) << "\n";
@@ -697,6 +866,7 @@ void IwyuPreprocessorInfo::Ifdef(SourceLocation loc,
 void IwyuPreprocessorInfo::Ifndef(SourceLocation loc,
                                   const Token& id,
                                   const MacroDefinition& /*definition*/) {
+  EnterConditional(loc, id.getIdentifierInfo(), true);
   ERRSYM(GetFileEntry(id.getLocation()))
       << "[ #ifndef     ] " << PrintableLoc(id.getLocation())
       << ": " << GetName(id) << "\n";
@@ -1034,6 +1204,8 @@ void IwyuPreprocessorInfo::HandlePreprocessingDone() {
   for (const Token& token : macros_called_from_macros_) {
     FindAndReportMacroUse(GetName(token), token.getLocation());
   }
+
+  FinalizeDottedInlineExports();
 
   // Other post-processing steps.
   for (auto& file_info_map_entry : iwyu_file_info_map_) {

@@ -4323,7 +4323,8 @@ class IwyuAction : public ASTFrontendAction {
     // Do this first thing after getting our hands on a CompilerInstance.
     InitGlobals(compiler);
 
-    auto* const preprocessor_consumer = new IwyuPreprocessorInfo();
+    auto* const preprocessor_consumer =
+        new IwyuPreprocessorInfo(compiler.getPreprocessor());
     compiler.getPreprocessor().addPPCallbacks(
         std::unique_ptr<PPCallbacks>(preprocessor_consumer));
     compiler.getPreprocessor().addCommentHandler(preprocessor_consumer);

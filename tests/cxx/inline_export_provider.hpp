@@ -1,0 +1,4 @@
+#ifndef INCLUDE_WHAT_YOU_USE_TESTS_CXX_INLINE_EXPORT_PROVIDER_HPP_
+#define INCLUDE_WHAT_YOU_USE_TESTS_CXX_INLINE_EXPORT_PROVIDER_HPP_
+class InlineExportProvider { public: int Get() const; };
+#endif
