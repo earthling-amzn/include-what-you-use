@@ -10,6 +10,7 @@
 #include "iwyu_output.h"
 
 #include <algorithm>                    // for sort, find
+#include <cctype>                       // for tolower
 #include <cstdio>                       // for snprintf
 #include <iterator>                     // for inserter
 #include <map>                          // for _Rb_tree_const_iterator, etc
@@ -19,13 +20,16 @@
 #include "iwyu_ast_util.h"
 #include "iwyu_globals.h"
 #include "iwyu_include_picker.h"
+#include "iwyu_lexer_utils.h"
 #include "iwyu_location_util.h"
 #include "iwyu_path_util.h"
 #include "iwyu_preprocessor.h"
 #include "iwyu_stl_util.h"
 #include "iwyu_string_util.h"
 #include "iwyu_verrs.h"
+#include "iwyu_version.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
@@ -33,6 +37,8 @@
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/Type.h"
 #include "clang/Basic/SourceLocation.h"
+#include "clang/Basic/SourceManager.h"
+#include "clang/Basic/Version.h"
 
 namespace include_what_you_use {
 
@@ -489,11 +495,52 @@ string MungedForwardDeclareLine(const NamedDecl* decl) {
   CHECK_UNREACHABLE_("Unexpected decl type for MungedForwardDeclareLine");
 }
 
+static string PhysicalForwardDeclareSpelling(const NamedDecl* fwd_decl) {
+  const SourceRange decl_range = GetSourceRangeOfClassDecl(fwd_decl);
+  const SourceLocation begin = GetInstantiationLoc(decl_range.getBegin());
+  const SourceLocation end = GetInstantiationLoc(decl_range.getEnd());
+  if (begin.isInvalid() || end.isInvalid())
+    return string();
+
+  const clang::SourceManager& source_manager = *GlobalSourceManager();
+  const clang::FileID begin_file = source_manager.getFileID(begin);
+  if (begin_file.isInvalid() || begin_file != source_manager.getFileID(end))
+    return string();
+
+  const unsigned begin_line = source_manager.getSpellingLineNumber(begin);
+  const unsigned end_line = source_manager.getSpellingLineNumber(end);
+  if (begin_line == 0 || end_line < begin_line)
+    return string();
+
+  const SourceLocation physical_begin =
+      source_manager.translateLineCol(begin_file, begin_line, 1);
+  const SourceLocation physical_end_line =
+      source_manager.translateLineCol(begin_file, end_line, 1);
+  if (physical_begin.isInvalid() || physical_end_line.isInvalid())
+    return string();
+
+  bool invalid = false;
+  const char* begin_data = source_manager.getCharacterData(physical_begin,
+                                                            &invalid);
+  if (invalid || !begin_data)
+    return string();
+  const char* end_line_data = source_manager.getCharacterData(
+      physical_end_line, &invalid);
+  if (invalid || !end_line_data || end_line_data < begin_data)
+    return string();
+  const llvm::StringRef final_line = GetSourceTextUntilEndOfLine(
+      physical_end_line, DefaultDataGetter());
+  return string(begin_data,
+                static_cast<size_t>(end_line_data - begin_data) +
+                    final_line.size());
+}
 }  // namespace internal
 
 OneIncludeOrForwardDeclareLine::OneIncludeOrForwardDeclareLine(
     const NamedDecl* fwd_decl)
-    : line_(internal::MungedForwardDeclareLine(fwd_decl)), fwd_decl_(fwd_decl) {
+    : line_(internal::MungedForwardDeclareLine(fwd_decl)),
+      source_spelling_(internal::PhysicalForwardDeclareSpelling(fwd_decl)),
+      fwd_decl_(fwd_decl) {
   const SourceRange decl_lines = GetSourceRangeOfClassDecl(fwd_decl);
   // We always want to use the instantiation line numbers: for code like
   //     FORWARD_DECLARE_CLASS(MyClass);
@@ -514,8 +561,10 @@ OneIncludeOrForwardDeclareLine::OneIncludeOrForwardDeclareLine(
 }
 
 OneIncludeOrForwardDeclareLine::OneIncludeOrForwardDeclareLine(
-    const FileEntry* included_file, const string& quoted_include, int linenum)
+    const FileEntry* included_file, const string& quoted_include, int linenum,
+    const string& source_spelling)
     : line_("#include " + quoted_include),
+      source_spelling_(source_spelling),
       start_linenum_(linenum),
       end_linenum_(linenum),
       quoted_include_(quoted_include),
@@ -554,16 +603,32 @@ IwyuFileInfo::IwyuFileInfo(const clang::FileEntry* this_file,
     desired_includes_have_been_calculated_(false)
 {}
 
-void IwyuFileInfo::AddAssociatedHeader(const IwyuFileInfo* other) {
+void IwyuFileInfo::AddAssociatedHeader(const IwyuFileInfo* other,
+                                        const string& relationship,
+                                        const string& reason_code,
+                                        const string& reason) {
   VERRS(6) << "Adding " << GetFilePath(other->file_)
-           << " as associated header for " << GetFilePath(file_) << "\n";
+           << " as associated header for " << GetFilePath(file_)
+           << " (" << reason_code << ")\n";
   associated_headers_.insert(other);
+  const auto duplicate = std::find_if(
+      associated_header_details_.begin(), associated_header_details_.end(),
+      [&](const AssociatedHeader& association) {
+        return association.file_info == other &&
+               association.relationship == relationship &&
+               association.reason_code == reason_code;
+      });
+  if (duplicate == associated_header_details_.end()) {
+    associated_header_details_.push_back(
+        {other, relationship, reason_code, reason});
+  }
 }
 
 void IwyuFileInfo::AddInclude(const clang::FileEntry* includee,
-                              const string& quoted_includee, int linenumber) {
-  OneIncludeOrForwardDeclareLine new_include(includee, quoted_includee,
-                                             linenumber);
+                              const string& quoted_includee, int linenumber,
+                              const string& source_spelling) {
+  OneIncludeOrForwardDeclareLine new_include(
+      includee, quoted_includee, linenumber, source_spelling);
   new_include.set_present();
 
   // It's possible for the same #include to be seen multiple times
@@ -589,14 +654,17 @@ void IwyuFileInfo::AddInclude(const clang::FileEntry* includee,
 }
 
 void IwyuFileInfo::AddForwardDeclare(const clang::NamedDecl* fwd_decl,
-                                     bool definitely_keep_fwd_decl) {
+                                     const string& keep_reason_code,
+                                     const string& keep_reason) {
   CHECK_(fwd_decl && "forward_declare_decl unexpectedly nullptr");
   CHECK_((isa<ClassTemplateDecl>(fwd_decl) || isa<TagDecl>(fwd_decl)) &&
          "Can only forward declare tag types and class templates");
   lines_.push_back(OneIncludeOrForwardDeclareLine(fwd_decl));
   lines_.back().set_present();
-  if (definitely_keep_fwd_decl)
+  if (!keep_reason_code.empty()) {
     lines_.back().set_desired();
+    lines_.back().SetForwardDeclareKeepReason(keep_reason_code, keep_reason);
+  }
   direct_forward_declares_.insert(fwd_decl);   // store in another way as well
   VERRS(6) << "Found forward-declare: "
            << GetFilePath(file_) << ":" << lines_.back().LineNumberString()
@@ -693,8 +761,26 @@ void IwyuFileInfo::ReportIncludeFileUse(const clang::FileEntry* included_file,
   LogSymbolUse("Marked use of include-file", symbol_uses_.back());
 }
 
-void IwyuFileInfo::ReportKnownDesiredFile(const FileEntry* included_file) {
+void IwyuFileInfo::ReportKnownDesiredFile(
+    const FileEntry* included_file, const string& reason_code,
+    const string& reason) {
   kept_includes_.insert(included_file);
+  kept_include_reasons_.insert(
+      std::make_pair(included_file, KeepReason{reason_code, reason}));
+}
+
+void IwyuFileInfo::ReportProtectedFileReason(
+    const FileEntry* included_file, const string& reason_code,
+    const string& reason) {
+  kept_include_reasons_.insert(
+      std::make_pair(included_file, KeepReason{reason_code, reason}));
+}
+
+void IwyuFileInfo::AddStructuredDiagnostic(SourceLocation location,
+                                           const string& code,
+                                           const string& message,
+                                           const string& severity) {
+  structured_diagnostics_.push_back({location, code, message, severity});
 }
 
 void IwyuFileInfo::ReportForwardDeclareUse(SourceLocation use_loc,
@@ -1712,21 +1798,25 @@ void IwyuFileInfo::CalculateIwyuViolations(vector<OneUse>* uses) {
   }
 }
 
+static string GetWarningDescription(const OneUse& use) {
+  string warning;
+  if (use.is_full_use()) {
+    warning = use.symbol_name() + " is defined in " + use.suggested_header() +
+              ", which isn't directly #included";
+  } else {
+    warning = use.symbol_name() + " needs a declaration, but does not provide "
+              "or directly #include one";
+  }
+  if (!use.comment().empty())
+    warning += " " + use.comment();
+  return warning + ".";
+}
+
 static string GetWarningMsg(const OneUse& use) {
   const SourceLocation spelling_loc = GetSpellingLoc(use.use_loc());
   const SourceLocation instantiation_loc = GetInstantiationLoc(use.use_loc());
-  string warning = PrintableLoc(spelling_loc) + ": warning: ";
-  if (use.is_full_use()) {
-    warning += (use.symbol_name() + " is defined in " + use.suggested_header()
-                + ", which isn't directly #included");
-  } else {
-    warning += (use.symbol_name() + " needs a declaration"
-                + ", but does not provide or directly #include one");
-  }
-  if (!use.comment().empty()) {
-    warning += " " + use.comment();
-  }
-  warning += ".\n";
+  string warning = PrintableLoc(spelling_loc) + ": warning: " +
+                   GetWarningDescription(use) + "\n";
   if (instantiation_loc != spelling_loc) {
     // Only set/print this if it's different from the spelling location.
     warning += PrintableLoc(instantiation_loc) + ": note: used here.\n";
@@ -1857,6 +1947,7 @@ void CalculateDesiredIncludesAndForwardDeclares(
       auto range = fwd_decl_map.equal_range(use.decl());
       for (auto it = range.first; it != range.second; ++it) {
         it->second->set_desired();
+        it->second->mark_desired_by_use();
       }
     } else if (ContainsKey(include_map, use.suggested_header())) {
       // If we satisfy a forward-declare use from a file, let the file
@@ -1879,6 +1970,10 @@ void CalculateDesiredIncludesAndForwardDeclares(
   for (OneIncludeOrForwardDeclareLine& line : *lines) {
     if (line.is_desired() && !line.is_present() && line.IsIncludeLine() &&
         ContainsKey(associated_desired_includes, line.quoted_include())) {
+      line.SetStructuredDecision(
+          "add", "suppress", "provided_by_associated_header",
+          "The associated header's desired state already provides this "
+          "include.");
       line.clear_desired();
     }
   }
@@ -1891,6 +1986,7 @@ void CalculateDesiredIncludesAndForwardDeclares(
   for (OneIncludeOrForwardDeclareLine& line : *lines) {
     if (!line.is_desired() && line.IsIncludeLine() &&
         ContainsKey(kept_includes, line.included_file())) {
+      line.mark_restored_by_keep();
       line.set_desired();
     }
   }
@@ -1934,6 +2030,17 @@ void CleanupPrefixHeaderIncludes(
     }
     if (IsRemovablePrefixHeader(file_entry, preprocessor_info)) {
       CHECK_(file_entry && "FileEntry should exist to be prefix header");
+      if (line.is_present()) {
+        line.SetStructuredDecision(
+            "remove", "apply", "prefix_header_remove",
+            "The remove policy drops an in-source item already provided by "
+            "a command-line prefix header.");
+      } else {
+        line.SetStructuredDecision(
+            "add", "suppress", "prefix_header_add_suppressed",
+            "Prefix-header policy suppresses adding an item already provided "
+            "by a command-line prefix header.");
+      }
       line.clear_desired();
       VERRS(6) << "Ignoring '" << line.line()
                << "': is superseded by command line include "
@@ -2019,7 +2126,7 @@ LineSortOrdinal GetLineSortOrdinal(const OneIncludeOrForwardDeclareLine& line,
 
   const std::string quoted_include = line.quoted_include();
   if (ContainsKey(associated_quoted_includes, quoted_include)) {
-    if (EndsWith(quoted_include, "-inl.h\""))
+    if (IsInlineHeaderFile(quoted_include))
       return LineSortOrdinal::AssociatedInlineDefinitions;
     return LineSortOrdinal::AssociatedHeader;
   }
@@ -2177,7 +2284,9 @@ void IwyuFileInfo::HandlePreprocessingDone() {
       ERRSYM(file_) << "Keep #include " << macro_use_includee->getName()
                     << " in " << file_->getName()
                     << " because used macro is defined by includer.\n";
-      ReportKnownDesiredFile(macro_use_includee);
+      ReportKnownDesiredFile(
+          macro_use_includee, "reverse_macro_dependency",
+          "A macro used by this include is defined by the includer.");
     } else {
       string private_include =
           ConvertToQuotedInclude(GetFilePath(macro_use_includee));
@@ -2230,9 +2339,476 @@ void IwyuFileInfo::ResolvePendingAnalysis() {
                                 using_decl->shadow_begin()->getTargetDecl(),
                                 /* flags */ UF_None,
                                 "(for un-referenced using)");
+
       }
     }
   }
+}
+
+namespace {
+
+llvm::json::Object UnavailableValue() {
+  return llvm::json::Object{{"status", "unavailable"}, {"value", nullptr}};
+}
+
+llvm::json::Object NotApplicableValue() {
+  return llvm::json::Object{{"status", "not_applicable"},
+                            {"value", nullptr}};
+}
+
+struct StructuredLocationValue {
+  string path;
+  int64_t line;
+  int64_t column;
+};
+
+bool StructuredLocation(SourceLocation location,
+                        bool use_expansion_location,
+                        StructuredLocationValue* result) {
+  if (location.isInvalid())
+    return false;
+  const SourceLocation resolved = use_expansion_location
+      ? GetInstantiationLoc(location) : GetSpellingLoc(location);
+  if (resolved.isInvalid())
+    return false;
+  const clang::FileEntry* file = GetLocFileEntry(resolved);
+  if (!file)
+    return false;
+  const clang::FullSourceLoc full_location(resolved, *GlobalSourceManager());
+  bool invalid = false;
+  const unsigned line = full_location.getSpellingLineNumber(&invalid);
+  if (invalid || line == 0)
+    return false;
+  const unsigned column = full_location.getSpellingColumnNumber(&invalid);
+  if (invalid || column == 0)
+    return false;
+  *result = {NormalizeFilePath(GetFilePath(file)),
+             static_cast<int64_t>(line), static_cast<int64_t>(column)};
+  return true;
+}
+
+llvm::json::Object LocationObject(const StructuredLocationValue& location) {
+  return llvm::json::Object{{"path", location.path},
+                            {"line", location.line},
+                            {"column", location.column}};
+}
+
+llvm::json::Object AvailableLocation(SourceLocation location,
+                                     bool use_expansion_location) {
+  StructuredLocationValue value;
+  if (!StructuredLocation(location, use_expansion_location, &value))
+    return UnavailableValue();
+  return llvm::json::Object{{"status", "known"},
+                            {"value", LocationObject(value)}};
+}
+
+llvm::json::Object KnownString(const string& value) {
+  return llvm::json::Object{{"status", "known"}, {"value", value}};
+}
+
+llvm::json::Object UnavailableDesiredState() {
+  return llvm::json::Object{{"status", "unavailable"},
+                            {"complete", false}, {"items", nullptr}};
+}
+
+string StructuredFileKind(const string& path) {
+  if (IsInlineHeaderFile(path))
+    return "inline_header";
+
+  string lower = path;
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  static const char* const header_extensions[] = {
+      ".h", ".hh", ".hpp", ".hxx"};
+  static const char* const source_extensions[] = {
+      ".c", ".cc", ".cxx", ".cpp", ".c++", ".cp", ".m", ".mm"};
+  for (const char* extension : header_extensions) {
+    if (EndsWith(lower, extension))
+      return "header";
+  }
+  for (const char* extension : source_extensions) {
+    if (EndsWith(lower, extension))
+      return "source";
+  }
+  return "other";
+}
+
+}  // namespace
+
+string IwyuFileInfo::file_path() const {
+  return NormalizeFilePath(GetFilePath(file_));
+}
+
+void IwyuFileInfo::EmitStructuredOutputRecord() const {
+  struct OperationRef {
+    const OneIncludeOrForwardDeclareLine* line;
+    string subject_action;
+    string disposition;
+    string item_kind;
+    string reason_code;
+    string reason;
+  };
+
+  const auto item_kind = [](const OneIncludeOrForwardDeclareLine& line) {
+    return line.IsIncludeLine() ? string("include")
+                                : string("forward_declaration");
+  };
+
+  map<pair<string, string>, int> present_occurrences;
+  for (const OneIncludeOrForwardDeclareLine& line : lines_) {
+    if (line.is_present() && !line.is_elaborated_type())
+      ++present_occurrences[{item_kind(line), line.line()}];
+  }
+  const bool has_duplicate_occurrence = std::any_of(
+      present_occurrences.begin(), present_occurrences.end(),
+      [](const auto& occurrence) { return occurrence.second > 1; });
+
+  vector<OperationRef> operations;
+  if (!has_duplicate_occurrence) {
+    for (const OneIncludeOrForwardDeclareLine& line : lines_) {
+      if (line.is_elaborated_type())
+        continue;
+      if (line.has_structured_decision()) {
+        operations.push_back(
+            {&line, line.decision_subject_action(),
+             line.decision_disposition(), item_kind(line),
+             line.decision_reason_code(), line.decision_reason()});
+        continue;
+      }
+      if (line.is_desired() == line.is_present())
+        continue;
+      if (line.is_present()) {
+        operations.push_back({&line, "remove", "apply", item_kind(line),
+                              "undesired_item_present",
+                              "Present item is absent from IWYU's desired "
+                              "state."});
+      } else {
+        operations.push_back({&line, "add", "apply", item_kind(line),
+                              "desired_item_missing",
+                              "IWYU's desired item is absent from the file."});
+      }
+    }
+  }
+
+  const auto operation_key = [](const OperationRef& operation) {
+    const map<string, int> subject_rank = {
+        {"remove", 0}, {"add", 1}, {"keep", 2}};
+    const map<string, int> disposition_rank = {
+        {"apply", 0}, {"keep", 1}, {"suppress", 2}, {"report", 3}};
+    const int kind_rank = operation.item_kind == "include" ? 0 : 1;
+    // Native v1 removal ranges are unavailable and addition ranges are
+    // not-applicable, so spelling is the next stable key.
+    const bool exact_present_spelling =
+        operation.line->is_present() && operation.subject_action != "add";
+    const string spelling = exact_present_spelling
+                                ? operation.line->source_spelling()
+                                : operation.line->line();
+    return std::make_tuple(subject_rank.at(operation.subject_action),
+                           disposition_rank.at(operation.disposition),
+                           kind_rank, spelling, operation.reason_code);
+  };
+
+  const auto operation_spelling = [](const OperationRef& operation) {
+    // Operations on present items identify their exact physical source text.
+    // Generated additions remain canonical.
+    if (operation.line->is_present() && operation.subject_action != "add")
+      return operation.line->source_spelling();
+    return operation.line->line();
+  };
+
+  const auto operation_symbols = [&](const OperationRef& operation) {
+    struct UseFact {
+      const OneUse* use;
+      string name;
+      bool has_qualified_name;
+      string qualified_name;
+      StructuredLocationValue location;
+    };
+    vector<UseFact> facts;
+    for (const OneUse& use : symbol_uses_) {
+      if (use.ignore_use() || use.symbol_name().empty())
+        continue;
+      bool motivates = false;
+      if (operation.line->IsIncludeLine()) {
+        motivates = use.has_suggested_header() &&
+            use.suggested_header() == operation.line->quoted_include();
+      } else {
+        motivates = !use.is_full_use() && !use.has_suggested_header() &&
+            use.decl() == operation.line->fwd_decl();
+      }
+      if (!motivates)
+        continue;
+      StructuredLocationValue location;
+      if (!StructuredLocation(use.use_loc(), true, &location) ||
+          location.path != file_path()) {
+        continue;
+      }
+      const string name = use.short_symbol_name().empty()
+          ? use.symbol_name() : use.short_symbol_name();
+      facts.push_back({&use, name, use.decl() != nullptr,
+                       use.symbol_name(), location});
+    }
+    const auto fact_key = [](const UseFact& fact) {
+      const string primary = fact.has_qualified_name
+          ? fact.qualified_name : fact.name;
+      const int requirement = fact.use->is_full_use() ? 0 : 1;
+      const int identity_availability = fact.has_qualified_name ? 0 : 1;
+      return std::make_tuple(primary, fact.name, fact.location.path,
+                             fact.location.line, fact.location.column,
+                             requirement, identity_availability);
+    };
+    const auto use_identity_key = [](const UseFact& fact) {
+      const string primary = fact.has_qualified_name
+          ? fact.qualified_name : fact.name;
+      const int requirement = fact.use->is_full_use() ? 0 : 1;
+      return std::make_tuple(primary, fact.name, fact.location.path,
+                             fact.location.line, fact.location.column,
+                             requirement);
+    };
+    std::sort(facts.begin(), facts.end(),
+              [&](const UseFact& lhs, const UseFact& rhs) {
+                return fact_key(lhs) < fact_key(rhs);
+              });
+    facts.erase(std::unique(
+        facts.begin(), facts.end(), [&](const UseFact& lhs, const UseFact& rhs) {
+          return use_identity_key(lhs) == use_identity_key(rhs);
+        }), facts.end());
+
+    llvm::json::Array symbols;
+    size_t begin = 0;
+    while (begin < facts.size()) {
+      size_t end = begin + 1;
+      const string group_identity = facts[begin].has_qualified_name
+          ? facts[begin].qualified_name : facts[begin].name;
+      while (end < facts.size() && facts[end].name == facts[begin].name &&
+             (facts[end].has_qualified_name
+                  ? facts[end].qualified_name : facts[end].name) ==
+                 group_identity) {
+        ++end;
+      }
+      llvm::json::Array uses;
+      for (size_t index = begin; index < end; ++index) {
+        const UseFact& fact = facts[index];
+        uses.push_back(llvm::json::Object{
+            {"location", LocationObject(fact.location)},
+            {"requirement", fact.use->is_full_use()
+                                ? "full" : "forward_declaration"},
+            {"origin", "unknown"},
+            {"condition", UnavailableValue()},
+            {"macro", UnavailableValue()}});
+      }
+      const UseFact& first = facts[begin];
+      const UseFact* declaration_fact = nullptr;
+      for (size_t index = begin; index < end; ++index) {
+        if (facts[index].has_qualified_name) {
+          declaration_fact = &facts[index];
+          break;
+        }
+      }
+      llvm::json::Object symbol;
+      symbol["name"] = first.name;
+      symbol["qualified_name"] = declaration_fact
+          ? KnownString(declaration_fact->qualified_name) : UnavailableValue();
+      symbol["declaration"] = declaration_fact
+          ? AvailableLocation(declaration_fact->use->decl_loc(), false)
+          : UnavailableValue();
+      symbol["uses"] = std::move(uses);
+      symbols.push_back(std::move(symbol));
+      begin = end;
+    }
+    return symbols;
+  };
+  std::sort(operations.begin(), operations.end(),
+            [&](const OperationRef& lhs, const OperationRef& rhs) {
+              return operation_key(lhs) < operation_key(rhs);
+            });
+
+  llvm::json::Array operation_values;
+  int operation_number = 1;
+  for (const OperationRef& operation : operations) {
+    llvm::json::Object provider;
+    provider["selected"] = UnavailableValue();
+    provider["candidates"] = UnavailableValue();
+    provider["chain"] = UnavailableValue();
+
+    llvm::json::Object value;
+    value["id"] = "op-" + to_string(operation_number++);
+    value["subject_action"] = operation.subject_action;
+    value["disposition"] = operation.disposition;
+    value["item_kind"] = operation.item_kind;
+    value["spelling"] = operation_spelling(operation);
+    value["source_range"] = operation.subject_action == "add"
+                                ? NotApplicableValue()
+                                : UnavailableValue();
+    value["reason_code"] = operation.reason_code;
+    value["reason"] = operation.reason;
+    value["symbols"] = operation_symbols(operation);
+    value["provider"] = std::move(provider);
+    value["edit_condition"] = UnavailableValue();
+    value["policy"] = UnavailableValue();
+    value["multi_config"] = UnavailableValue();
+    operation_values.push_back(std::move(value));
+  }
+
+  vector<const OneIncludeOrForwardDeclareLine*> desired_lines;
+  if (!has_duplicate_occurrence) {
+    for (const OneIncludeOrForwardDeclareLine& line : lines_) {
+      if (line.is_desired() && !line.is_elaborated_type())
+        desired_lines.push_back(&line);
+    }
+    const set<string> associated = AssociatedQuotedIncludes();
+    std::sort(desired_lines.begin(), desired_lines.end(),
+              [&](const OneIncludeOrForwardDeclareLine* lhs,
+                  const OneIncludeOrForwardDeclareLine* rhs) {
+                const IwyuFileInfo* lhs_info = lhs->IsIncludeLine()
+                    ? preprocessor_info_->FileInfoFor(lhs->included_file())
+                    : nullptr;
+                const IwyuFileInfo* rhs_info = rhs->IsIncludeLine()
+                    ? preprocessor_info_->FileInfoFor(rhs->included_file())
+                    : nullptr;
+                return internal::GetSortKey(*lhs, associated, lhs_info) <
+                       internal::GetSortKey(*rhs, associated, rhs_info);
+              });
+  }
+
+  llvm::json::Array desired_items;
+  for (const OneIncludeOrForwardDeclareLine* line : desired_lines) {
+    llvm::json::Array symbols;
+    for (const auto& symbol_count : line->symbol_counts()) {
+      if (!symbol_count.first.empty())
+        symbols.push_back(symbol_count.first);
+    }
+    llvm::json::Object item;
+    item["item_kind"] = item_kind(*line);
+    const bool retained_by_policy =
+        line->is_present() && line->has_structured_decision() &&
+        line->decision_disposition() != "apply";
+    item["spelling"] = (!line->IsIncludeLine() && line->is_present()) ||
+                               retained_by_policy
+                           ? line->source_spelling()
+                           : line->line();
+    item["symbols"] = std::move(symbols);
+    desired_items.push_back(std::move(item));
+  }
+
+  vector<AssociatedHeader> sorted_associations = associated_header_details_;
+  std::sort(sorted_associations.begin(), sorted_associations.end(),
+            [](const AssociatedHeader& lhs, const AssociatedHeader& rhs) {
+              return std::make_tuple(
+                         NormalizeFilePath(GetFilePath(lhs.file_info->file_)),
+                         lhs.relationship, lhs.reason_code) <
+                     std::make_tuple(
+                         NormalizeFilePath(GetFilePath(rhs.file_info->file_)),
+                         rhs.relationship, rhs.reason_code);
+            });
+  llvm::json::Array associations;
+  for (const AssociatedHeader& association : sorted_associations) {
+    associations.push_back(llvm::json::Object{
+        {"path", NormalizeFilePath(GetFilePath(association.file_info->file_))},
+        {"relationship", association.relationship},
+        {"reason_code", association.reason_code},
+        {"reason", association.reason}});
+  }
+
+  llvm::json::Array diagnostics;
+  const string absolute_file_path =
+      NormalizeFilePath(MakeAbsolutePath(file_path()));
+  for (const GlobalStructuredDiagnostic& diagnostic :
+       GlobalStructuredDiagnostics()) {
+    if (NormalizeFilePath(MakeAbsolutePath(diagnostic.file_path)) !=
+        absolute_file_path) {
+      continue;
+    }
+    diagnostics.push_back(llvm::json::Object{
+        {"severity", "warning"},
+        {"code", diagnostic.code},
+        {"message", diagnostic.message},
+        {"location", UnavailableValue()}});
+  }
+  for (const StructuredDiagnostic& diagnostic : structured_diagnostics_) {
+    diagnostics.push_back(llvm::json::Object{
+        {"severity", diagnostic.severity},
+        {"code", diagnostic.code},
+        {"message", diagnostic.message},
+        {"location", AvailableLocation(diagnostic.location, false)}});
+  }
+  for (const OneUse& use : symbol_uses_) {
+    if (!use.is_iwyu_violation())
+      continue;
+    diagnostics.push_back(llvm::json::Object{
+        {"severity", "warning"},
+        {"code", use.is_full_use() ? "missing_direct_include"
+                                    : "missing_declaration"},
+        {"message", GetWarningDescription(use)},
+        {"location", AvailableLocation(use.use_loc(), true)}});
+  }
+  if (has_duplicate_occurrence) {
+    diagnostics.push_back(llvm::json::Object{
+        {"severity", "warning"},
+        {"code", "duplicate_occurrence_unrepresentable"},
+        {"message", "Duplicate item occurrences cannot be represented "
+                    "unambiguously by output schema version 1."},
+        {"location", UnavailableValue()}});
+  }
+
+  llvm::json::Object git_revision;
+  const string revision = IWYU_GIT_REV;
+  if (revision.empty()) {
+    git_revision = UnavailableValue();
+  } else {
+    git_revision = llvm::json::Object{{"status", "known"},
+                                      {"value", revision}};
+  }
+
+  const CommandlineFlags& flags = GlobalFlags();
+  llvm::json::Object tool;
+  tool["name"] = "include-what-you-use";
+  tool["version"] = IWYU_VERSION_STRING;
+  tool["git_revision"] = std::move(git_revision);
+  tool["clang_version"] = CLANG_VERSION_STRING;
+
+  llvm::json::Object invocation;
+  invocation["id"] = flags.invocation_id;
+  invocation["index"] = flags.invocation_index;
+  invocation["translation_unit"] = flags.translation_unit;
+  invocation["configuration"] = UnavailableValue();
+  invocation["command_digest"] = flags.command_digest;
+
+  llvm::json::Object file;
+  file["path"] = file_path();
+  file["kind"] = StructuredFileKind(file_path());
+
+  llvm::json::Object desired_state;
+  if (has_duplicate_occurrence) {
+    desired_state = UnavailableDesiredState();
+  } else {
+    desired_state["status"] = "known";
+    desired_state["complete"] = true;
+    desired_state["items"] = std::move(desired_items);
+  }
+
+  llvm::json::Object record;
+  record["schema_version"] = 1;
+  record["record_type"] = "file_analysis";
+  record["tool"] = std::move(tool);
+  record["invocation"] = std::move(invocation);
+  record["file"] = std::move(file);
+  const bool has_applied_edit = std::any_of(
+      operations.begin(), operations.end(), [](const OperationRef& operation) {
+        return operation.disposition == "apply" &&
+            (operation.subject_action == "add" ||
+             operation.subject_action == "remove");
+      });
+  record["status"] = has_duplicate_occurrence
+                         ? "skipped"
+                         : (has_applied_edit ? "changes" : "correct");
+  record["associated_headers"] = std::move(associations);
+  record["analyzed_configurations"] = UnavailableValue();
+  record["operations"] = std::move(operation_values);
+  record["desired_state"] = std::move(desired_state);
+  record["diagnostics"] = std::move(diagnostics);
+
+  llvm::outs() << llvm::json::Value(std::move(record)) << '\n';
 }
 
 size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
@@ -2244,15 +2820,54 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
   set<string> associated_desired_includes = AssociatedDesiredIncludes();
 
   CalculateIwyuViolations(&symbol_uses_);
-  EmitWarningMessages(symbol_uses_);
+  if (GlobalFlags().output_format == CommandlineFlags::kTextOutput)
+    EmitWarningMessages(symbol_uses_);
   internal::CalculateDesiredIncludesAndForwardDeclares(
       symbol_uses_, associated_desired_includes, kept_includes_,  &lines_);
+
+  // Keep decisions are operations even though the protected item is present in
+  // both the input and desired state. Preserve the recommendation that policy
+  // overrode instead of losing it when desired membership is restored.
+  for (OneIncludeOrForwardDeclareLine& line : lines_) {
+    const bool has_symbol_motivation = std::any_of(
+        line.symbol_counts().begin(), line.symbol_counts().end(),
+        [](const auto& symbol_count) { return !symbol_count.first.empty(); });
+    if (!line.IsIncludeLine() || !line.is_present() ||
+        (!line.was_restored_by_keep() && has_symbol_motivation))
+      continue;
+    const auto reason = kept_include_reasons_.find(line.included_file());
+    if (reason != kept_include_reasons_.end()) {
+      line.SetStructuredDecision("remove", "keep", reason->second.reason_code,
+                                 reason->second.reason);
+    }
+  }
+
+  for (OneIncludeOrForwardDeclareLine& line : lines_) {
+    if (line.IsIncludeLine() || !line.is_present() || !line.is_desired() ||
+        !line.has_forward_declare_keep_reason() ||
+        line.was_desired_by_use()) {
+      continue;
+    }
+    line.SetStructuredDecision(
+        "remove", "keep", line.forward_declare_keep_reason_code(),
+        line.forward_declare_keep_reason());
+  }
 
   // Remove desired inclusions that have been inhibited by pragma
   // "no_include".
   for (OneIncludeOrForwardDeclareLine& line : lines_) {
-    if (line.IsIncludeLine() &&
+    if (line.IsIncludeLine() && line.is_desired() &&
         preprocessor_info_->IncludeIsInhibited(file_, line.quoted_include())) {
+      if (line.is_present()) {
+        line.SetStructuredDecision(
+            "remove", "apply", "pragma_no_include_remove",
+            "IWYU pragma no_include excludes this present include from the "
+            "desired state.");
+      } else {
+        line.SetStructuredDecision(
+            "add", "suppress", "pragma_no_include",
+            "IWYU pragma no_include suppresses this proposed addition.");
+      }
       line.clear_desired();
     }
   }
@@ -2263,7 +2878,8 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
   size_t num_edits = internal::PrintableDiffs(
       GetFilePath(file_), preprocessor_info_, AssociatedQuotedIncludes(),
       lines_, &diff_output);
-  errs() << diff_output;
+  if (GlobalFlags().output_format == CommandlineFlags::kTextOutput)
+    errs() << diff_output;
 
   return num_edits;
 }

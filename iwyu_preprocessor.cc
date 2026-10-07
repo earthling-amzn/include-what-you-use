@@ -9,9 +9,10 @@
 
 #include "iwyu_preprocessor.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstddef>                      // for size_t
 #include <cstring>
-#include <algorithm>
 #include <iterator>
 #include <string>                       // for string, basic_string, etc
 #include <utility>                      // for pair, make_pair
@@ -58,7 +59,23 @@ namespace {
 // At first blush, iwyu_output is the place to put it, but that would
 // introduce a circular dependency between iwyu_output and
 // iwyu_ast_util.
-void Warn(SourceLocation loc, const string& message) {
+void Warn(IwyuPreprocessorInfo* preprocessor_info, SourceLocation loc,
+          const string& message) {
+  if (GlobalFlags().output_format == CommandlineFlags::kJsonOutput) {
+    const FileEntry* origin_file = GetFileEntry(loc);
+    IwyuFileInfo* file_info = nullptr;
+    if (origin_file && ShouldReportIWYUViolationsFor(origin_file))
+      file_info = preprocessor_info->FileInfoFor(origin_file);
+    if (!file_info && preprocessor_info->main_file()) {
+      file_info = preprocessor_info->FileInfoFor(
+          preprocessor_info->main_file());
+    }
+    if (file_info) {
+      file_info->AddStructuredDiagnostic(
+          loc, "preprocessor_warning", message);
+    }
+    return;
+  }
   errs() << PrintableLoc(loc) << ": warning: " << message << "\n";
 }
 
@@ -82,39 +99,46 @@ string NormalizeNamespaces(string symbol) {
 }
 
 bool StripHeaderExtension(string* path) {
-  return StripRight(path, ".h")
-      || StripRight(path, ".H")
-      || StripRight(path, ".hpp")
-      || StripRight(path, ".hxx")
-      || StripRight(path, ".hh")
-      || StripRight(path, ".inl");
+  static const char* const extensions[] = {".h", ".hh", ".hpp", ".hxx"};
+  string lower = *path;
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  for (const char* extension : extensions) {
+    if (EndsWith(lower, extension)) {
+      path->resize(path->size() - strlen(extension));
+      return true;
+    }
+  }
+  return false;
 }
 
-// Return true for dotted inline-definition header conventions after a known
-// header extension, e.g. foo.inline.h and foo.inline.hpp.
+// Dotted inline headers have export semantics not shared by legacy -inl
+// headers, but generic classification belongs in IsInlineHeaderFile.
 bool IsDottedInlineHeader(string path) {
+  if (!IsInlineHeaderFile(path))
+    return false;
   path = NormalizeFilePath(path);
-  return StripHeaderExtension(&path) && EndsWith(path, ".inline");
-}
-
-bool IsInlineDefinitionsHeader(string path) {
-  path = NormalizeFilePath(path);
-  if (StripRight(&path, ".inl"))
-    return true;
   if (!StripHeaderExtension(&path))
     return false;
-  return EndsWith(path, ".inline") || EndsWith(path, "-inl");
+  std::transform(path.begin(), path.end(), path.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return EndsWith(path, ".inline");
 }
 
 bool IsExactPlainCounterpart(string inline_path, string plain_path) {
   inline_path = NormalizeFilePath(inline_path);
   plain_path = NormalizeFilePath(plain_path);
-  if (IsInlineDefinitionsHeader(plain_path) ||
+  if (IsInlineHeaderFile(plain_path) ||
       !StripHeaderExtension(&inline_path) ||
-      !StripRight(&inline_path, ".inline") ||
       !StripHeaderExtension(&plain_path)) {
     return false;
   }
+  string lower_inline = inline_path;
+  std::transform(lower_inline.begin(), lower_inline.end(), lower_inline.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  if (!EndsWith(lower_inline, ".inline"))
+    return false;
+  inline_path.resize(inline_path.size() - strlen(".inline"));
   return inline_path == plain_path;
 }
 
@@ -137,6 +161,22 @@ static string GetIncludeNameAsWritten(SourceLocation include_loc) {
 
 static string GetName(const Token& token) {
   return token.getIdentifierInfo()->getName().str();
+}
+
+// Returns the exact physical source line containing an include token. The
+// canonical spelling used for desired state is retained separately.
+static string GetSourceLineAsWritten(SourceLocation include_loc) {
+  const SourceLocation spelling_loc = GetInstantiationLoc(include_loc);
+  if (spelling_loc.isInvalid())
+    return string();
+  const clang::SourceManager& source_manager = *GlobalSourceManager();
+  const clang::FileID file_id = source_manager.getFileID(spelling_loc);
+  const unsigned line = source_manager.getSpellingLineNumber(spelling_loc);
+  const SourceLocation line_begin = source_manager.translateLineCol(
+      file_id, line, 1);
+  if (line_begin.isInvalid())
+    return string();
+  return GetSourceTextUntilEndOfLine(line_begin, DefaultDataGetter()).str();
 }
 
 //------------------------------------------------------------
@@ -253,7 +293,7 @@ void IwyuPreprocessorInfo::HandlePragmaComment(SourceRange comment_range) {
           std::make_pair(this_file_entry, export_range));
     } else {
       // No pragma allowed within "begin_exports" - "end_exports"
-      Warn(begin_loc, "Expected end_exports pragma");
+      Warn(this, begin_loc, "Expected end_exports pragma");
     }
     return;
   }
@@ -267,7 +307,7 @@ void IwyuPreprocessorInfo::HandlePragmaComment(SourceRange comment_range) {
       keep_location_ranges_.insert(std::make_pair(this_file_entry, keep_range));
     } else {
       // No pragmas allowed within "begin_keep" - "end_keep"
-      Warn(begin_loc, "Expected end_keep pragma");
+      Warn(this, begin_loc, "Expected end_keep pragma");
     }
     return;
   }
@@ -279,7 +319,7 @@ void IwyuPreprocessorInfo::HandlePragmaComment(SourceRange comment_range) {
   }
 
   if (MatchOneToken(tokens, "end_exports", 1, begin_loc)) {
-    Warn(begin_loc, "end_exports without a begin_exports");
+    Warn(this, begin_loc, "end_exports without a begin_exports");
     return;
   }
 
@@ -290,7 +330,7 @@ void IwyuPreprocessorInfo::HandlePragmaComment(SourceRange comment_range) {
   }
 
   if (MatchOneToken(tokens, "end_keep", 1, begin_loc)) {
-    Warn(begin_loc, "end_keep without a begin_keep");
+    Warn(this, begin_loc, "end_keep without a begin_keep");
     return;
   }
 
@@ -298,7 +338,7 @@ void IwyuPreprocessorInfo::HandlePragmaComment(SourceRange comment_range) {
     // 3rd token should be a quoted header.
     const string& suggested = tokens[2];
     if (!IsQuotedInclude(suggested)) {
-      Warn(begin_loc, "Suggested include must be a quoted header");
+      Warn(this, begin_loc, "Suggested include must be a quoted header");
       return;
     }
 
@@ -324,7 +364,7 @@ void IwyuPreprocessorInfo::HandlePragmaComment(SourceRange comment_range) {
     // 2nd token should be an quoted header.
     const string& inhibited = tokens[1];
     if (!IsQuotedInclude(inhibited)) {
-      Warn(begin_loc, "Inhibited include must be a quoted header");
+      Warn(this, begin_loc, "Inhibited include must be a quoted header");
       return;
     }
 
@@ -375,7 +415,7 @@ void IwyuPreprocessorInfo::HandlePragmaComment(SourceRange comment_range) {
   // "keep" and "export" are handled in MaybeProtectInclude.
   if (!MatchOneToken(tokens, "keep", 1, begin_loc)
       && !MatchOneToken(tokens, "export", 1, begin_loc)) {
-    Warn(begin_loc, "Unknown or malformed pragma (" + pragma_text + ")");
+    Warn(this, begin_loc, "Unknown or malformed pragma (" + pragma_text + ")");
     return;
   }
 }
@@ -416,7 +456,7 @@ void IwyuPreprocessorInfo::ProcessHeadernameDirectivesInFile(
                                                     DefaultDataGetter()).str();
     const string::size_type close_brace_pos = after_text.find('}');
     if (close_brace_pos == string::npos) {
-      Warn(current_loc, "@headername directive missing a closing brace");
+      Warn(this, current_loc, "@headername directive missing a closing brace");
       continue;
     }
     after_text = after_text.substr(0, close_brace_pos);
@@ -535,12 +575,16 @@ void IwyuPreprocessorInfo::MaybeProtectInclude(
       LineHasText(includer_loc, "/* IWYU pragma: keep") ||
       HasOpenBeginKeep(includer)) {
     protect_reason = "pragma_keep";
-    FileInfoFor(includer)->ReportKnownDesiredFile(includee);
+    FileInfoFor(includer)->ReportKnownDesiredFile(
+        includee, "pragma_keep",
+        "IWYU pragma keep requires this present include to remain.");
 
   } else if (ShouldKeepIncludeFor(includee)) {
     // The command line version of pragma keep.
     protect_reason = "--keep";
-    FileInfoFor(includer)->ReportKnownDesiredFile(includee);
+    FileInfoFor(includer)->ReportKnownDesiredFile(
+        includee, "command_line_keep",
+        "The --keep option requires this present include to remain.");
 
   } else if (LineHasText(includer_loc, "// IWYU pragma: export") ||
              LineHasText(includer_loc, "/* IWYU pragma: export") ||
@@ -563,16 +607,25 @@ void IwyuPreprocessorInfo::MaybeProtectInclude(
                << ")\n";
       MutableGlobalIncludePicker()->AddMapping(map_from, map_to);
     }
+    FileInfoFor(includer)->ReportProtectedFileReason(
+        includee, "pragma_export",
+        "IWYU pragma export requires this include to remain for consumers.");
 
   // We also always keep #includes of .c files: iwyu doesn't touch those.
   // TODO(csilvers): instead of IsHeaderFile, check if the file has
   // any "non-inlined" definitions.
   } else if (!IsHeaderFile(GetFilePath(includee))) {
     protect_reason = ".cc include";
+    FileInfoFor(includer)->ReportProtectedFileReason(
+        includee, "source_include",
+        "Includes of source files are outside IWYU removal semantics.");
 
   // If the includee is marked as pch-in-code, it can never be removed.
   } else if (FileInfoFor(includee)->is_pch_in_code()) {
     protect_reason = "pch in code";
+    FileInfoFor(includer)->ReportProtectedFileReason(
+        includee, "pch_in_code",
+        "The include is the in-source precompiled-header marker.");
 
     // There's a few more places where we want to keep the #include, but we need
     // to finalize all #includes before we can test them, so we do it in a
@@ -602,6 +655,9 @@ void IwyuPreprocessorInfo::FinalizeProtectedIncludes() {
         // protect the include.
         includer.ReportIncludeFileUse(include,
                                       ConvertToQuotedInclude(includee_path));
+        includer.ReportProtectedFileReason(
+            include, "reexported_include",
+            "The includer re-exports this include to its consumers.");
         ERRSYM(includer_file)
             << "Marked dep: " << includer_path << " needs to keep "
             << includee_path << " (reason: re-exports)\n";
@@ -610,7 +666,9 @@ void IwyuPreprocessorInfo::FinalizeProtectedIncludes() {
         // from removal in all includers.
         includer.ReportIncludeFileUse(include,
                                       ConvertToQuotedInclude(includee_path));
-        includer.ReportKnownDesiredFile(include);
+        includer.ReportKnownDesiredFile(
+            include, "pragma_always_keep",
+            "IWYU pragma always_keep requires this include to remain.");
         ERRSYM(includer_file)
             << "Marked dep: " << includer_path << " needs to keep "
             << includee_path << " (reason: always_keep pragma)\n";
@@ -646,7 +704,8 @@ void IwyuPreprocessorInfo::AddDirectInclude(
   ++num_includes_seen_[includer];
 
   GetFromFileInfoMap(includer)->AddInclude(
-      includee, include_name_as_written, GetLineNumber(includer_loc));
+      includee, include_name_as_written, GetLineNumber(includer_loc),
+      GetSourceLineAsWritten(includer_loc));
   // Make sure the includee has a file-info-map entry too.
   InsertIntoFileInfoMap(includee, include_name_as_written);
 
@@ -673,8 +732,31 @@ void IwyuPreprocessorInfo::AddDirectInclude(
   // iwyu_output.cc gets upset if a file is its own associated header.
   if (includer == main_file_ && includee != includer &&
       BelongsToMainCompilationUnit(includer, includee)) {
-    GetFromFileInfoMap(includer)
-        ->AddAssociatedHeader(GetFromFileInfoMap(includee));
+    IwyuFileInfo* includer_info = GetFromFileInfoMap(includer);
+    IwyuFileInfo* includee_info = GetFromFileInfoMap(includee);
+    const string includee_path = GetFilePath(includee);
+    const bool canonical_match =
+        GetCanonicalName(includee_path) ==
+        GetCanonicalName(GetFilePath(main_file_));
+    if (canonical_match && IsInlineHeaderFile(includee_path)) {
+      includer_info->AddAssociatedHeader(
+          includee_info, "inline_definitions", "canonical_inline_stem",
+          "Inline-definition header matches the translation-unit stem.");
+    } else if (canonical_match) {
+      includer_info->AddAssociatedHeader(
+          includee_info, "declarations", "canonical_stem",
+          "Declaration header matches the translation-unit stem.");
+    } else if (GlobalFlags().pch_in_code &&
+               num_includes_seen_[includer] == 2) {
+      includer_info->AddAssociatedHeader(
+          includee_info, "heuristic", "pch_following_include_basename",
+          "Include following the in-source PCH marker matches the "
+          "translation-unit basename.");
+    } else {
+      includer_info->AddAssociatedHeader(
+          includee_info, "heuristic", "first_include_basename",
+          "First include matches the translation-unit basename.");
+    }
     VERRS(4) << "Marked " << GetFilePath(includee)
              << " as associated header of " << GetFilePath(includer) << ".\n";
 
@@ -696,7 +778,8 @@ void IwyuPreprocessorInfo::AddDirectInclude(
   if (associated_pragma_location_.isValid() &&
       associated_includer == includer) {
     GetFromFileInfoMap(includer)->AddAssociatedHeader(
-        GetFromFileInfoMap(includee));
+        GetFromFileInfoMap(includee), "explicit", "pragma_associated",
+        "Header was marked by an IWYU associated pragma.");
     VERRS(4) << "Marked " << GetFilePath(includee)
              << " as associated header of " << GetFilePath(includer)
              << " due to associated pragma.\n";
@@ -1008,13 +1091,13 @@ void IwyuPreprocessorInfo::FileChanged_ExitToFile(
   ERRSYM(GetFileEntry(include_loc)) << "[ Exiting to  ] "
                                     << PrintableLoc(include_loc) << "\n";
   if (HasOpenBeginExports(exiting_from)) {
-    Warn(begin_exports_location_stack_.top(),
+    Warn(this, begin_exports_location_stack_.top(),
          "begin_exports without an end_exports");
     begin_exports_location_stack_.pop();
   }
 
   if (HasOpenBeginKeep(exiting_from)) {
-    Warn(begin_keep_location_stack_.top(),
+    Warn(this, begin_keep_location_stack_.top(),
          "begin_keep without an end_keep");
     begin_keep_location_stack_.pop();
   }

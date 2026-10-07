@@ -11,6 +11,7 @@
 #ifndef INCLUDE_WHAT_YOU_USE_IWYU_GLOBALS_H_
 #define INCLUDE_WHAT_YOU_USE_IWYU_GLOBALS_H_
 
+#include <cstdint>                      // for int64_t
 #include <set>                          // for set
 #include <string>                       // for string
 #include <vector>                       // for vector
@@ -67,6 +68,17 @@ void InitGlobals(clang::CompilerInstance& compiler);
 // will assert-fail if you call this instead of InitGlobals().
 void InitGlobalsAndFlagsForTesting();
 
+struct GlobalStructuredDiagnostic {
+  string file_path;
+  string code;
+  string message;
+};
+
+void AddGlobalStructuredDiagnostic(const string& file_path,
+                                   const string& code,
+                                   const string& message);
+const vector<GlobalStructuredDiagnostic>& GlobalStructuredDiagnostics();
+
 // TODO(csilvers): put all of these in the 'globals' namespace?
 
 // The verbose level indicates how chatty IWYU should be.  The bigger
@@ -84,6 +96,7 @@ void InitGlobalsAndFlagsForTesting();
 //  11: like 10, and add tons *more* debug info (for all header files).
 struct CommandlineFlags {
   enum PrefixHeaderIncludePolicy { kAdd, kKeep, kRemove };
+  enum OutputFormat { kTextOutput, kJsonOutput };
   CommandlineFlags();                     // sets flags to default values
   int ParseArgv(int argc, char** argv);   // parses flags from argv
   bool HasDebugFlag(const char* flag) const;
@@ -111,6 +124,15 @@ struct CommandlineFlags {
   set<string> dbg_flags; // Debug flags.
   set<string> exp_flags;       // Experimental flags.
   RegexDialect regex_dialect;  // Dialect for regular expression processing.
+  OutputFormat output_format;  // Human-readable text or JSON Lines.
+  int64_t invocation_index;
+  string invocation_id;
+  string command_digest;
+  string translation_unit;
+  bool has_invocation_index;
+  bool has_command_digest;
+  bool has_translation_unit;
+  bool has_invocation_id;
 };
 
 const CommandlineFlags& GlobalFlags();

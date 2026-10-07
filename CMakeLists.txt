@@ -246,9 +246,23 @@ if (Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   )
 
+  add_test(NAME native_json_output_test
+    COMMAND ${Python3_EXECUTABLE} tests/native_json_output_test.py
+      $<TARGET_FILE:include-what-you-use>
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  set_tests_properties(native_json_output_test PROPERTIES SKIP_RETURN_CODE 77)
+
   add_test(NAME output_schema_test
     COMMAND ${Python3_EXECUTABLE} tests/validate_output_schema.py
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   )
   set_tests_properties(output_schema_test PROPERTIES SKIP_RETURN_CODE 77)
+
+  add_test(NAME iwyu_tool_json_output_test
+    COMMAND ${Python3_EXECUTABLE} tests/iwyu_tool_json_output_test.py
+      $<TARGET_FILE:include-what-you-use>
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  set_tests_properties(iwyu_tool_json_output_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()

@@ -115,6 +115,7 @@
 #include "iwyu_use_flags.h"
 #include "iwyu_verrs.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/Support/raw_ostream.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
@@ -129,6 +130,7 @@
 #include "clang/AST/TemplateBase.h"
 #include "clang/AST/Type.h"
 #include "clang/AST/TypeLoc.h"
+#include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendAction.h"
@@ -3759,6 +3761,18 @@ class IwyuAstConsumer
     num_edits += preprocessor_info().FileInfoFor(main_file)
         ->CalculateAndReportIwyuViolations();
 
+    if (GlobalFlags().output_format == CommandlineFlags::kJsonOutput) {
+      vector<IwyuFileInfo*> records;
+      for (const FileEntry* file : *files_to_report_iwyu_violations_for)
+        records.push_back(preprocessor_info().FileInfoFor(file));
+      std::sort(records.begin(), records.end(),
+                [](const IwyuFileInfo* lhs, const IwyuFileInfo* rhs) {
+                  return lhs->file_path() < rhs->file_path();
+                });
+      for (const IwyuFileInfo* record : records)
+        record->EmitStructuredOutputRecord();
+    }
+
     int exit_code = EXIT_SUCCESS;
     if (GlobalFlags().exit_code_always) {
       // If we should always fail, use --error_always value.
@@ -3921,7 +3935,8 @@ class IwyuAstConsumer
       // should keep this forward-declaration around (and not consider
       // it for deletion if it's never used).  There are a few
       // situations we can do this, described below.
-      bool definitely_keep_fwd_decl = false;
+      string keep_reason_code;
+      string keep_reason;
 
       // (1) If the forward-decl has a linkage spec ('extern "C"')
       // then it can't be removed, since that information probably
@@ -3930,7 +3945,10 @@ class IwyuAstConsumer
       // applied to all static methods of the class.  See
       // http://msdn.microsoft.com/en-us/library/ms882260.aspx.)
       if (current_ast_node()->ParentIsA<LinkageSpecDecl>()) {
-        definitely_keep_fwd_decl = true;
+        keep_reason_code = "linkage_specification";
+        keep_reason =
+            "The declaration's linkage specification is structural source "
+            "information that cannot be regenerated safely.";
 
       // (2) GCC-style __attributes__ work the same way: we can't assume
       // that attributes are consistent between declarations, so we can't
@@ -3939,7 +3957,10 @@ class IwyuAstConsumer
       } else if (decl->hasAttrs()) {
         for (const Attr* attr : decl->getAttrs()) {
           if (!attr->isInherited()) {
-            definitely_keep_fwd_decl = true;
+            keep_reason_code = "explicit_attribute";
+            keep_reason =
+                "An explicitly written declaration attribute cannot be "
+                "regenerated safely.";
             break;
           }
         }
@@ -3961,18 +3982,27 @@ class IwyuAstConsumer
           // though, so it seems hygienic to remove all but one.
           if (const NamedDecl* first_decl = GetFirstRedecl(decl)) {
             // Check if we're the decl with the smallest line number.
-            if (decl == first_decl)
-              definitely_keep_fwd_decl = true;
+            if (decl == first_decl) {
+              keep_reason_code = "nested_declaration";
+              keep_reason =
+                  "The nested declaration is structural API of its enclosing "
+                  "class.";
+            }
           }
         }
       } else if (preprocessor_info().ForwardDeclareIsMarkedKeep(decl)) {
-        definitely_keep_fwd_decl = true;
+        keep_reason_code = "pragma_keep";
+        keep_reason =
+            "IWYU pragma keep requires this forward declaration to remain.";
       } else if (preprocessor_info().ForwardDeclareIsExported(decl)) {
-        definitely_keep_fwd_decl = true;
+        keep_reason_code = "pragma_export";
+        keep_reason =
+            "IWYU pragma export requires this forward declaration to remain "
+            "for consumers.";
       }
 
       preprocessor_info().FileInfoFor(CurrentFileEntry())->AddForwardDeclare(
-          decl_to_fwd_declare, definitely_keep_fwd_decl);
+          decl_to_fwd_declare, keep_reason_code, keep_reason);
     }
     return Base::VisitTagDecl(decl);
   }
@@ -4314,6 +4344,77 @@ class IwyuAstConsumer
   InstantiatedTemplateVisitor instantiated_template_visitor_;
 };  // class IwyuAstConsumer
 
+class StructuredDiagnosticConsumer : public clang::DiagnosticConsumer {
+ public:
+  StructuredDiagnosticConsumer(
+      std::unique_ptr<clang::DiagnosticConsumer> fallback,
+      IwyuPreprocessorInfo* preprocessor_info)
+      : fallback_(std::move(fallback)),
+        preprocessor_info_(preprocessor_info) {
+    CHECK_(fallback_);
+    CHECK_(preprocessor_info_);
+  }
+
+  void HandleDiagnostic(clang::DiagnosticsEngine::Level level,
+                        const clang::Diagnostic& diagnostic) override {
+    DiagnosticConsumer::HandleDiagnostic(level, diagnostic);
+    const bool is_warning = level == clang::DiagnosticsEngine::Warning;
+    const bool is_attached_note =
+        level == clang::DiagnosticsEngine::Note && capture_following_notes_;
+    if (is_warning || is_attached_note) {
+      if (IwyuFileInfo* file_info = TargetFileInfo(diagnostic.getLocation())) {
+        llvm::SmallString<256> message;
+        diagnostic.FormatDiagnostic(message);
+        file_info->AddStructuredDiagnostic(
+            diagnostic.getLocation(),
+            is_warning ? "clang_frontend_warning" : "clang_frontend_note",
+            message.str().str(), is_warning ? "warning" : "note");
+        if (is_warning)
+          capture_following_notes_ = true;
+        return;
+      }
+    }
+    if (level != clang::DiagnosticsEngine::Note)
+      capture_following_notes_ = false;
+    fallback_->HandleDiagnostic(level, diagnostic);
+  }
+
+  void clear() override {
+    DiagnosticConsumer::clear();
+    fallback_->clear();
+  }
+
+  void EndSourceFile() override { fallback_->EndSourceFile(); }
+  void BeginSourceFile(const clang::LangOptions& language_options,
+                       const clang::Preprocessor* preprocessor) override {
+    fallback_->BeginSourceFile(language_options, preprocessor);
+  }
+
+  void finish() override { fallback_->finish(); }
+
+  bool IncludeInDiagnosticCounts() const override {
+    return fallback_->IncludeInDiagnosticCounts();
+  }
+
+ private:
+  IwyuFileInfo* TargetFileInfo(clang::SourceLocation location) const {
+    if (location.isValid()) {
+      const FileEntry* file = GetFileEntry(location);
+      if (file && ShouldReportIWYUViolationsFor(file))
+        return preprocessor_info_->FileInfoFor(file);
+    }
+    if (preprocessor_info_->main_file()) {
+      return preprocessor_info_->FileInfoFor(
+          preprocessor_info_->main_file());
+    }
+    return nullptr;
+  }
+
+  std::unique_ptr<clang::DiagnosticConsumer> fallback_;
+  IwyuPreprocessorInfo* preprocessor_info_;
+  bool capture_following_notes_ = false;
+};
+
 // We use an ASTFrontendAction to hook up IWYU with Clang.
 class IwyuAction : public ASTFrontendAction {
  protected:
@@ -4328,6 +4429,16 @@ class IwyuAction : public ASTFrontendAction {
     compiler.getPreprocessor().addPPCallbacks(
         std::unique_ptr<PPCallbacks>(preprocessor_consumer));
     compiler.getPreprocessor().addCommentHandler(preprocessor_consumer);
+
+    if (GlobalFlags().output_format == CommandlineFlags::kJsonOutput) {
+      clang::DiagnosticsEngine& diagnostics = compiler.getDiagnostics();
+      std::unique_ptr<clang::DiagnosticConsumer> fallback =
+          diagnostics.takeClient();
+      diagnostics.setClient(
+          new StructuredDiagnosticConsumer(std::move(fallback),
+                                           preprocessor_consumer),
+          true);
+    }
 
     auto* const visitor_state =
         new VisitorState(&compiler, *preprocessor_consumer);

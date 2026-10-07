@@ -21,6 +21,7 @@
 #include <utility>                      // for pair, make_pair
 #include <vector>                       // for vector, vector<>::iterator
 
+#include "iwyu_globals.h"
 #include "iwyu_location_util.h"
 #include "iwyu_path_util.h"
 #include "iwyu_port.h"
@@ -1615,9 +1616,16 @@ vector<string> IncludePicker::GetCandidateHeadersForFilepathIncludedFrom(
         GetCandidateHeadersForFilepath(included_filepath, including_filepath);
     if (mapped_includes.size() == 1) {
       if (GetVisibility(mapped_includes[0]) == kPrivate) {
-        VERRS(0) << "Warning: "
-                 << "No public header found to replace the private header "
-                 << included_filepath << "\n";
+        const string message =
+            "No public header found to replace the private header " +
+            included_filepath;
+        if (GlobalFlags().output_format == CommandlineFlags::kJsonOutput) {
+          AddGlobalStructuredDiagnostic(
+              including_filepath, "private_provider_without_public_mapping",
+              message);
+        } else {
+          VERRS(0) << "Warning: " << message << "\n";
+        }
       }
     }
   }

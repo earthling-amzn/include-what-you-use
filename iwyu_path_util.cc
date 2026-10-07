@@ -10,6 +10,7 @@
 #include "iwyu_path_util.h"
 
 #include <algorithm>                    // for std::replace
+#include <cctype>                       // for std::tolower
 #include <cstddef>
 #include <cstring>                      // for strlen
 #include <system_error>
@@ -43,6 +44,33 @@ const char* source_extensions[] = {
   ".cp"
 };
 
+bool StripKnownHeaderExtension(string* path) {
+  static const char* const extensions[] = {".h", ".hh", ".hpp", ".hxx"};
+  string lower = *path;
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  for (const char* extension : extensions) {
+    if (EndsWith(lower, extension)) {
+      path->resize(path->size() - strlen(extension));
+      return true;
+    }
+  }
+  return false;
+}
+
+bool StripInlineMarker(string* path) {
+  string lower = *path;
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  for (const char* marker : {".inline", "-inl"}) {
+    if (EndsWith(lower, marker)) {
+      path->resize(path->size() - strlen(marker));
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // anonymous namespace
 
 void SetHeaderSearchPaths(const vector<HeaderSearchPath>& search_paths) {
@@ -75,6 +103,22 @@ bool IsHeaderFile(string path) {
   return true;
 }
 
+bool IsInlineHeaderFile(string path) {
+  if (path.size() >= 2 &&
+      ((path.front() == '"' && path.back() == '"') ||
+       (path.front() == '<' && path.back() == '>'))) {
+    path = path.substr(1, path.size() - 2);
+  }
+  path = NormalizeFilePath(path);
+  std::transform(path.begin(), path.end(), path.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+
+  if (StripRight(&path, ".inl"))
+    return true;
+
+  return StripKnownHeaderExtension(&path) && StripInlineMarker(&path);
+}
+
 string Basename(const string& path) {
   string::size_type last_slash = path.rfind('/');
   if (last_slash != string::npos) {
@@ -93,12 +137,8 @@ string GetCanonicalName(string file_path) {
 
   file_path = NormalizeFilePath(file_path);
 
-  bool stripped_ext = StripRight(&file_path, ".h")
-      || StripRight(&file_path, ".H")
-      || StripRight(&file_path, ".hpp")
-      || StripRight(&file_path, ".hxx")
-      || StripRight(&file_path, ".hh")
-      || StripRight(&file_path, ".inl");
+  bool stripped_ext = StripKnownHeaderExtension(&file_path) ||
+                      StripRight(&file_path, ".inl");
   if (!stripped_ext) {
     for (const char* source_extension : source_extensions) {
       if (StripRight(&file_path, source_extension))
@@ -110,8 +150,7 @@ string GetCanonicalName(string file_path) {
       || StripRight(&file_path, "_regtest")
       || StripRight(&file_path, "_test")
       || StripLeft(&file_path, "test_headercompile_");
-  StripRight(&file_path, ".inline")
-      || StripRight(&file_path, "-inl");
+  StripInlineMarker(&file_path);
   // .h files in /public/ match .cc files in /internal/
   const string::size_type internal_pos = file_path.find("/internal/");
   if (internal_pos != string::npos)

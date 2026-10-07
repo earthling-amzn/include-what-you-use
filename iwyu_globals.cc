@@ -10,14 +10,19 @@
 #include "iwyu_globals.h"
 
 #include <algorithm>                    // for sort, make_pair
+#include <cerrno>                       // for errno
+#include <cctype>                       // for isdigit, isxdigit
 #include <cstdio>                       // for printf
 #include <cstdlib>                      // for atoi, exit, getenv
+#include <cstring>                      // for strlen
+#include <limits>                       // for numeric_limits
 #include <map>                          // for map
 #include <set>                          // for set
 #include <string>                       // for string, operator<, etc
 #include <utility>                      // for make_pair, pair
 
 #include "iwyu_cache.h"
+#include "iwyu_driver.h"
 #include "iwyu_include_picker.h"
 #include "iwyu_getopt.h"
 #include "iwyu_lexer_utils.h"
@@ -29,10 +34,18 @@
 #include "iwyu_string_util.h"
 #include "iwyu_verrs.h"
 #include "iwyu_version.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/Option/ArgList.h"
+#include "llvm/Option/OptTable.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
 #include "clang/AST/PrettyPrinter.h"
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/Version.h"
+#include "clang/Driver/Options.h"
 #include "clang/Driver/ToolChain.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Lex/HeaderSearch.h"
@@ -48,6 +61,7 @@ using std::vector;
 namespace include_what_you_use {
 
 static CommandlineFlags* commandline_flags = nullptr;
+static bool structured_output_requested = false;
 static clang::SourceManager* source_manager = nullptr;
 static ToolChain::CXXStdlibType cxx_stdlib_type =
     ToolChain::CXXStdlibType::CST_Libstdcxx;
@@ -59,9 +73,17 @@ static FullUseCache* function_calls_full_use_cache = nullptr;
 static FullUseCache* class_members_full_use_cache = nullptr;
 static int ParseIwyuCommandlineFlags(int argc, char** argv);
 static int ParseInterceptedCommandlineFlags(int argc, char** argv);
+static vector<GlobalStructuredDiagnostic> global_structured_diagnostics;
 
 static void PrintHelp(const char* extra_msg) {
-  printf("USAGE: include-what-you-use [-Xiwyu --iwyu_opt]... <clang opts>"
+  FILE* stream = structured_output_requested ||
+                         (commandline_flags &&
+                          commandline_flags->output_format ==
+                              CommandlineFlags::kJsonOutput)
+                     ? stderr
+                     : stdout;
+  fprintf(stream,
+         "USAGE: include-what-you-use [-Xiwyu --iwyu_opt]... <clang opts>"
          " <source file>\n"
          "Here are the <iwyu_opts> you can specify (e.g. -Xiwyu --verbose=3):\n"
          "   --check_also=<glob>: tells iwyu to print iwyu-violation info\n"
@@ -114,6 +136,8 @@ static void PrintHelp(const char* extra_msg) {
          "   --error[=N]: exit with N (default: 1) for iwyu violations\n"
          "   --error_always[=N]: always exit with N (default: 1) (for use\n"
          "        with 'make -k')\n"
+         "   --output_format=<value>: output human-readable text (default)\n"
+         "        or one JSON object per analyzed file with value 'json'.\n"
          "   --debug=flag[,flag...]: debug flags (undocumented)\n"
          "   --regex=<dialect>: use specified regex dialect in IWYU:\n"
          "          llvm:       fast and simple (default)\n"
@@ -127,18 +151,21 @@ static void PrintHelp(const char* extra_msg) {
          "   --help: prints this help and exits.\n"
          "   --version: prints version and exits.\n");
   if (extra_msg)
-    printf("\n%s\n\n", extra_msg);
+    fprintf(stream, "\n%s\n\n", extra_msg);
 }
 
 static void PrintVersion() {
-  llvm::outs() << "include-what-you-use " << IWYU_VERSION_STRING;
+  llvm::raw_ostream& stream = structured_output_requested
+                                  ? llvm::errs()
+                                  : llvm::outs();
+  stream << "include-what-you-use " << IWYU_VERSION_STRING;
   // IWYU_GIT_REV should be provided by build system.
   string iwyu_rev = IWYU_GIT_REV;
   if (!iwyu_rev.empty()) {
-    llvm::outs() << " (git:" << iwyu_rev << ")";
+    stream << " (git:" << iwyu_rev << ")";
   }
-  llvm::outs() << " based on " << clang::getClangFullVersion()
-               << "\n";
+  stream << " based on " << clang::getClangFullVersion()
+         << "\n";
 }
 
 static bool ParseIntegerOptarg(const char* optarg, int* res) {
@@ -155,6 +182,205 @@ static bool ParseIntegerOptarg(const char* optarg, int* res) {
 
   *res = (int)val;
   return true;
+}
+
+[[noreturn]] static void StructuredOutputError(const char* message) {
+  llvm::errs() << "FATAL ERROR: " << message << '\n';
+  exit(EXIT_FAILURE);
+}
+
+static bool IsLowerHexString(const string& value, size_t length) {
+  if (value.size() != length)
+    return false;
+  return std::all_of(value.begin(), value.end(), [](unsigned char c) {
+    return std::isdigit(c) || (c >= 'a' && c <= 'f');
+  });
+}
+
+static bool ParseInvocationIndex(const char* value, int64_t* result) {
+  if (!value || !*value ||
+      !std::all_of(value, value + strlen(value), [](unsigned char c) {
+        return std::isdigit(c);
+      })) {
+    return false;
+  }
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long long parsed = strtoull(value, &end, 10);
+  if (errno != 0 || !end || *end != '\0' ||
+      parsed > static_cast<unsigned long long>(
+                   std::numeric_limits<int64_t>::max())) {
+    return false;
+  }
+  *result = static_cast<int64_t>(parsed);
+  return true;
+}
+
+static bool IsCommandDigest(const string& digest) {
+  return digest.size() == 71 && digest.compare(0, 7, "sha256:") == 0 &&
+         IsLowerHexString(digest.substr(7), 64);
+}
+
+static string InvocationId(int64_t index, const string& digest) {
+  char index_buffer[32];
+  snprintf(index_buffer, sizeof(index_buffer), "%06lld",
+           static_cast<long long>(index));
+  return "inv-" + string(index_buffer) + "-" + digest.substr(7, 12);
+}
+
+static string JsonString(const string& value) {
+  string result;
+  llvm::raw_string_ostream stream(result);
+  stream << llvm::json::Value(value);
+  stream.flush();
+  return result;
+}
+
+static string RealPathOrAbsolute(const string& path) {
+  llvm::SmallString<256> real_path;
+  if (!llvm::sys::fs::real_path(path, real_path))
+    return NormalizeFilePath(real_path.str().str());
+  return NormalizeFilePath(MakeAbsolutePath(path));
+}
+
+static vector<string> ExpandDirectArguments(int argc, const char** argv) {
+  vector<string> result;
+  string error;
+  if (!ExpandResponseFiles(argc, argv, &result, &error))
+    StructuredOutputError(error.c_str());
+  return result;
+}
+
+static string InferDirectTranslationUnit(const vector<string>& arguments) {
+  if (arguments.size() < 2)
+    return string();
+
+  vector<const char*> driver_arguments;
+  driver_arguments.reserve(arguments.size() - 1);
+  for (size_t index = 1; index < arguments.size(); ++index)
+    driver_arguments.push_back(arguments[index].c_str());
+
+  unsigned missing_argument_index = 0;
+  unsigned missing_argument_count = 0;
+  llvm::opt::InputArgList parsed =
+      clang::driver::getDriverOptTable().ParseArgs(
+          driver_arguments, missing_argument_index, missing_argument_count);
+  if (missing_argument_count != 0)
+    return string();
+
+  const vector<string> inputs = parsed.getAllArgValues(
+      clang::driver::options::OPT_INPUT);
+  for (const string& input : inputs) {
+    llvm::sys::fs::file_status status;
+    if (!llvm::sys::fs::status(input, status) &&
+        llvm::sys::fs::is_regular_file(status)) {
+      return RealPathOrAbsolute(input);
+    }
+  }
+  return string();
+}
+
+static string DirectCommandDigest(const vector<string>& arguments,
+                                  const string& translation_unit) {
+  llvm::SmallString<256> cwd;
+  CHECK_(!llvm::sys::fs::current_path(cwd));
+  const string directory = RealPathOrAbsolute(cwd.str().str());
+
+  string canonical = "{\"directory\":" + JsonString(directory) +
+                     ",\"file\":" + JsonString(translation_unit) +
+                     ",\"arguments\":[";
+  for (size_t i = 0; i < arguments.size(); ++i) {
+    if (i != 0)
+      canonical += ',';
+    canonical += JsonString(arguments[i]);
+  }
+  canonical += "]}";
+
+  const auto bytes = llvm::ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
+  return "sha256:" + llvm::toHex(llvm::SHA256::hash(bytes), true);
+}
+
+static void FinalizeStructuredOutputOptions(int clang_argc,
+                                            const char** clang_argv) {
+  CommandlineFlags& flags = *commandline_flags;
+  const bool has_any_driver_metadata = flags.has_invocation_index ||
+      flags.has_command_digest || flags.has_translation_unit ||
+      flags.has_invocation_id;
+
+  if (flags.output_format != CommandlineFlags::kJsonOutput) {
+    if (has_any_driver_metadata) {
+      StructuredOutputError(
+          "invocation metadata requires --output_format=json.");
+    }
+    return;
+  }
+
+  if (has_any_driver_metadata &&
+      !(flags.has_invocation_index && flags.has_command_digest &&
+        flags.has_translation_unit)) {
+    StructuredOutputError("incomplete structured-output invocation metadata.");
+  }
+
+  if (!has_any_driver_metadata) {
+    flags.invocation_index = 0;
+    flags.has_invocation_index = true;
+    if (clang_argc < 2) {
+      StructuredOutputError("JSON output requires a translation unit.");
+    }
+    const vector<string> expanded_arguments =
+        ExpandDirectArguments(clang_argc, clang_argv);
+    flags.translation_unit = InferDirectTranslationUnit(expanded_arguments);
+    if (flags.translation_unit.empty())
+      StructuredOutputError("JSON output requires a translation unit.");
+    flags.has_translation_unit = true;
+    flags.command_digest = DirectCommandDigest(
+        expanded_arguments, flags.translation_unit);
+    flags.has_command_digest = true;
+  }
+
+  if (flags.translation_unit.empty() ||
+      !IsAbsolutePath(flags.translation_unit) ||
+      NormalizeFilePath(flags.translation_unit) != flags.translation_unit ||
+      RealPathOrAbsolute(flags.translation_unit) != flags.translation_unit) {
+    StructuredOutputError(
+        "--translation_unit must be a normalized absolute real path.");
+  }
+  if (!IsCommandDigest(flags.command_digest)) {
+    StructuredOutputError(
+        "--command_digest must be sha256 followed by 64 lowercase "
+        "hexadecimal digits.");
+  }
+
+  const string expected_id = InvocationId(flags.invocation_index,
+                                          flags.command_digest);
+  if (flags.has_invocation_id && flags.invocation_id != expected_id) {
+    StructuredOutputError(
+        "--invocation_id does not match the invocation index and command "
+        "digest.");
+  }
+  flags.invocation_id = expected_id;
+  flags.has_invocation_id = true;
+}
+
+static bool RequestsStructuredOutput(int argc, char** argv) {
+  const llvm::StringRef full_option("--output_format");
+  for (int index = 1; index < argc; ++index) {
+    llvm::StringRef argument(argv[index]);
+    const size_t equals = argument.find('=');
+    const llvm::StringRef option = argument.substr(0, equals);
+    if (option.size() <= 2 || !full_option.startswith(option))
+      continue;
+    llvm::StringRef value;
+    if (equals != llvm::StringRef::npos) {
+      value = argument.substr(equals + 1);
+    } else if (index + 1 < argc) {
+      value = argv[index + 1];
+    }
+    if (value == "json")
+      return true;
+  }
+  return false;
 }
 
 OptionsParser::OptionsParser(int argc, char** argv) {
@@ -185,8 +411,11 @@ OptionsParser::OptionsParser(int argc, char** argv) {
   intercepted_argv[intercepted_argc] = nullptr;
   clang_argv_[clang_argc_] = nullptr;
 
+  structured_output_requested = RequestsStructuredOutput(iwyu_argc, iwyu_argv);
+
   ParseInterceptedCommandlineFlags(intercepted_argc, intercepted_argv);
   ParseIwyuCommandlineFlags(iwyu_argc, iwyu_argv);
+  FinalizeStructuredOutputOptions(clang_argc_, clang_argv_);
 
   delete [] iwyu_argv;
   delete [] intercepted_argv;
@@ -211,12 +440,25 @@ CommandlineFlags::CommandlineFlags()
       cxx17ns(false),
       exit_code_error(EXIT_SUCCESS),
       exit_code_always(EXIT_SUCCESS),
-      regex_dialect(RegexDialect::LLVM) {
+      regex_dialect(RegexDialect::LLVM),
+      output_format(kTextOutput),
+      invocation_index(0),
+      has_invocation_index(false),
+      has_command_digest(false),
+      has_translation_unit(false),
+      has_invocation_id(false) {
   // Always keep Qt .moc includes; its moc compiler does its own IWYU analysis.
   keep.emplace("*.moc");
 }
 
 int CommandlineFlags::ParseArgv(int argc, char** argv) {
+  enum LongOption {
+    kOutputFormat = 256,
+    kInvocationIndex,
+    kInvocationId,
+    kCommandDigest,
+    kTranslationUnit,
+  };
   static const struct option longopts[] = {
     {"check_also", required_argument, nullptr, 'c'},  // can be specified >once
     {"keep", required_argument, nullptr, 'k'},  // can be specified >once
@@ -238,6 +480,11 @@ int CommandlineFlags::ParseArgv(int argc, char** argv) {
     {"debug", required_argument, nullptr, 'd'},
     {"regex", required_argument, nullptr, 'r'},
     {"experimental", required_argument, nullptr, 'p'},
+    {"output_format", required_argument, nullptr, kOutputFormat},
+    {"invocation_index", required_argument, nullptr, kInvocationIndex},
+    {"invocation_id", required_argument, nullptr, kInvocationId},
+    {"command_digest", required_argument, nullptr, kCommandDigest},
+    {"translation_unit", required_argument, nullptr, kTranslationUnit},
     {nullptr, 0, nullptr, 0}
   };
   static const char shortopts[] = "v:c:m:d:nr";
@@ -329,6 +576,44 @@ int CommandlineFlags::ParseArgv(int argc, char** argv) {
         }
         break;
       }
+      case kOutputFormat:
+        if (strcmp(optarg, "text") == 0) {
+          output_format = kTextOutput;
+        } else if (strcmp(optarg, "json") == 0) {
+          output_format = kJsonOutput;
+        } else {
+          PrintHelp("FATAL ERROR: --output_format must be 'text' or 'json'.");
+          exit(EXIT_FAILURE);
+        }
+        break;
+      case kInvocationIndex:
+        if (has_invocation_index ||
+            !ParseInvocationIndex(optarg, &invocation_index)) {
+          StructuredOutputError("invalid or repeated --invocation_index.");
+        }
+        has_invocation_index = true;
+        break;
+      case kInvocationId:
+        if (has_invocation_id || !optarg || !*optarg) {
+          StructuredOutputError("invalid or repeated --invocation_id.");
+        }
+        invocation_id = optarg;
+        has_invocation_id = true;
+        break;
+      case kCommandDigest:
+        if (has_command_digest || !optarg) {
+          StructuredOutputError("repeated --command_digest.");
+        }
+        command_digest = optarg;
+        has_command_digest = true;
+        break;
+      case kTranslationUnit:
+        if (has_translation_unit || !optarg || !*optarg) {
+          StructuredOutputError("invalid or repeated --translation_unit.");
+        }
+        translation_unit = optarg;
+        has_translation_unit = true;
+        break;
       case -1:
         return optind;  // means 'no more input'
       default:
@@ -490,6 +775,18 @@ void InitGlobals(clang::CompilerInstance& compiler) {
 const CommandlineFlags& GlobalFlags() {
   CHECK_(commandline_flags && "Call ParseIwyuCommandlineFlags() before this");
   return *commandline_flags;
+}
+
+
+void AddGlobalStructuredDiagnostic(const string& file_path,
+                                   const string& code,
+                                   const string& message) {
+  global_structured_diagnostics.push_back(
+      {NormalizeFilePath(file_path), code, message});
+}
+
+const vector<GlobalStructuredDiagnostic>& GlobalStructuredDiagnostics() {
+  return global_structured_diagnostics;
 }
 
 CommandlineFlags* MutableGlobalFlagsForTesting() {

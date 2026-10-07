@@ -147,10 +147,14 @@ class OneIncludeOrForwardDeclareLine {
   explicit OneIncludeOrForwardDeclareLine(const clang::NamedDecl* fwd_decl);
   explicit OneIncludeOrForwardDeclareLine(clang::ElaboratedTypeLoc);
   OneIncludeOrForwardDeclareLine(const clang::FileEntry* included_file,
-                                 const string& quoted_include, int linenum);
+                                 const string& quoted_include, int linenum,
+                                 const string& source_spelling = "");
 
   const string& line() const {
     return line_;
+  }
+  const string& source_spelling() const {
+    return source_spelling_.empty() ? line_ : source_spelling_;
   }
   bool IsIncludeLine() const;           // vs forward-declare line
   string LineNumberString() const;      // <startline>-<endline>
@@ -198,9 +202,46 @@ class OneIncludeOrForwardDeclareLine {
   void set_desired() { is_desired_ = true; }
   void clear_desired() { is_desired_ = false; }
   void clear_line_numbers() { start_linenum_ = end_linenum_ = -1; }
+  void mark_restored_by_keep() { restored_by_keep_ = true; }
+  bool was_restored_by_keep() const { return restored_by_keep_; }
+  void mark_desired_by_use() { desired_by_use_ = true; }
+  bool was_desired_by_use() const { return desired_by_use_; }
+  void SetForwardDeclareKeepReason(const string& reason_code,
+                                   const string& reason) {
+    forward_declare_keep_reason_code_ = reason_code;
+    forward_declare_keep_reason_ = reason;
+  }
+  bool has_forward_declare_keep_reason() const {
+    return !forward_declare_keep_reason_code_.empty();
+  }
+  const string& forward_declare_keep_reason_code() const {
+    return forward_declare_keep_reason_code_;
+  }
+  const string& forward_declare_keep_reason() const {
+    return forward_declare_keep_reason_;
+  }
   // Another symbol we're using that's defined in this file.
   void AddSymbolUse(const string& symbol_name);
   bool HasSymbolUse(const string& symbol_name) const;
+
+  void SetStructuredDecision(const string& subject_action,
+                             const string& disposition,
+                             const string& reason_code,
+                             const string& reason) {
+    decision_subject_action_ = subject_action;
+    decision_disposition_ = disposition;
+    decision_reason_code_ = reason_code;
+    decision_reason_ = reason;
+  }
+  bool has_structured_decision() const {
+    return !decision_subject_action_.empty();
+  }
+  const string& decision_subject_action() const {
+    return decision_subject_action_;
+  }
+  const string& decision_disposition() const { return decision_disposition_; }
+  const string& decision_reason_code() const { return decision_reason_code_; }
+  const string& decision_reason() const { return decision_reason_; }
 
   bool LineNumbersMatch(const OneIncludeOrForwardDeclareLine& that) const {
     return (this->start_linenum_ == that.start_linenum_ &&
@@ -208,18 +249,27 @@ class OneIncludeOrForwardDeclareLine {
   }
 
  private:
-  string line_;  // '#include XXX' or 'class YYY;'
+  string line_;  // canonical '#include XXX' or forward declaration
+  string source_spelling_;  // exact source spelling for a present item
   int start_linenum_ = -1;
   int end_linenum_ = -1;
   bool is_desired_ = false;          // IWYU will recommend this line
   bool is_present_ = false;          // line was present before the IWYU run
   bool is_elaborated_type_ = false;  // Fwd-decl introduced by elaborated type
   map<string, int> symbol_counts_;   // how many times we referenced each symbol
+  bool restored_by_keep_ = false;    // keep policy overrode a removal
+  bool desired_by_use_ = false;      // a real OneUse requires this fwd-decl
   // Only either two following members are set for includes
   string quoted_include_;  // quoted file name we're including
   const clang::FileEntry* included_file_ = nullptr;  // the file we're including
   // ...or this member is set for the fwd-decl we're emitting.
   const clang::NamedDecl* fwd_decl_ = nullptr;
+  string forward_declare_keep_reason_code_;
+  string forward_declare_keep_reason_;
+  string decision_subject_action_;
+  string decision_disposition_;
+  string decision_reason_code_;
+  string decision_reason_;
 };
 
 // This class holds IWYU information about a single file (FileEntry)
@@ -253,17 +303,22 @@ class IwyuFileInfo {
   // associated headers.  Examples: vector has bits/stl_vector.h as an
   // associated header; foo.cc has foo.h and foo-inl.h as associated
   // headers.
-  void AddAssociatedHeader(const IwyuFileInfo* other);
+  void AddAssociatedHeader(const IwyuFileInfo* other,
+                           const string& relationship,
+                           const string& reason_code,
+                           const string& reason);
 
   // Use these to register an iwyu declaration: either an #include,
   // a forward-declaration or a using-declaration.
 
   void AddInclude(const clang::FileEntry* includee,
-                  const string& quoted_includee, int linenumber);
-  // definitely_keep_fwd_decl tells us that we should never suggest
-  // the fwd-decl be removed, even if we don't see any uses of it.
+                  const string& quoted_includee, int linenumber,
+                  const string& source_spelling);
+  // keep_reason_code identifies why a present forward declaration cannot be
+  // removed even if no real OneUse requires it. Empty means unprotected.
   void AddForwardDeclare(const clang::NamedDecl* fwd_decl,
-                         bool definitely_keep_fwd_decl);
+                         const string& keep_reason_code,
+                         const string& keep_reason);
   void AddElaboratedType(clang::ElaboratedTypeLoc);
 
   void AddUsingDecl(const clang::UsingDecl* using_decl);
@@ -313,7 +368,22 @@ class IwyuFileInfo {
   // This is used when we see a file we want to keep not due to symbol-use
   // reasons.  For example, it can be #included with an "IWYU pragma: keep"
   // comment or it can be an x-macro.
-  void ReportKnownDesiredFile(const clang::FileEntry* included_file);
+  void ReportKnownDesiredFile(
+      const clang::FileEntry* included_file,
+      const string& reason_code = "known_desired_include",
+      const string& reason = "Include is explicitly required to remain.");
+
+  // Retains why an include is protected when existing synthetic-use logic
+  // already preserves it semantically.
+  void ReportProtectedFileReason(const clang::FileEntry* included_file,
+                                 const string& reason_code,
+                                 const string& reason);
+
+  // Retains a recoverable analysis diagnostic for schema-v1 JSON output.
+  void AddStructuredDiagnostic(clang::SourceLocation location,
+                               const string& code,
+                               const string& message,
+                               const string& severity = "warning");
 
   // This is used only in iwyu_preprocessor.cc.  TODO(csilvers): revamp?
   const set<const clang::FileEntry*>& direct_includes_as_fileentries() const {
@@ -332,7 +402,28 @@ class IwyuFileInfo {
   // Reports violations on errs(), and returns the number of violations.
   size_t CalculateAndReportIwyuViolations();
 
+  // Emits one schema-v1 JSON object on stdout. Call only after analysis.
+  void EmitStructuredOutputRecord() const;
+  string file_path() const;
+
  private:
+  struct AssociatedHeader {
+    const IwyuFileInfo* file_info;
+    string relationship;
+    string reason_code;
+    string reason;
+  };
+  struct StructuredDiagnostic {
+    clang::SourceLocation location;
+    string code;
+    string message;
+    string severity;
+  };
+  struct KeepReason {
+    string reason_code;
+    string reason;
+  };
+
   const set<string>& direct_includes() const {
     return direct_includes_;
   }
@@ -388,8 +479,10 @@ class IwyuFileInfo {
 
   // associated_headers_ are the files 'associated' with this file: if
   // this file is foo.cc, associated_headers_ are the IwyuFileInfo's for
-  // foo.h and foo-inl.h, if present.
+  // foo.h and foo-inl.h, if present. Structured details are retained
+  // separately so multiple reasons do not change semantic processing.
   set<const IwyuFileInfo*> associated_headers_;
+  vector<AssociatedHeader> associated_header_details_;
 
   // Holds all the uses that are reported.
   vector<OneUse> symbol_uses_;
@@ -407,9 +500,10 @@ class IwyuFileInfo {
   set<const clang::FileEntry*> direct_includes_as_fileentries_;
   set<const clang::NamedDecl*> direct_forward_declares_;
 
-  // Holds files forced to be kept.  For example, files included with the
-  // "IWYU pragma: keep" comment and x-macros.
+  // Holds files forced to be kept and the decision that forced each one.
   set<const clang::FileEntry*> kept_includes_;
+  map<const clang::FileEntry*, KeepReason> kept_include_reasons_;
+  vector<StructuredDiagnostic> structured_diagnostics_;
 
   // Holds files using macros defined in this file.
   set<const clang::FileEntry*> macro_users_;

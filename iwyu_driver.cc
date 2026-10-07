@@ -12,20 +12,24 @@
 
 // Everything below is adapted from clang/examples/clang-interpreter/main.cpp.
 
-#include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "iwyu_globals.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/Option/ArgList.h"
+#include "llvm/Support/Allocator.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/StringSaver.h"
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
 #include "clang/Basic/DiagnosticOptions.h"
@@ -83,79 +87,88 @@ const char *SaveStringInSet(std::set<std::string> &SavedStrings, StringRef S) {
   return SavedStrings.insert(S.str()).first->c_str();
 }
 
-void ExpandArgsFromBuf(const char *Arg,
-                       SmallVectorImpl<const char*> &ArgVector,
-                       set<std::string> &SavedStrings) {
-  const char *FName = Arg + 1;
-  ErrorOr<unique_ptr<MemoryBuffer>> MemBufOrErr = MemoryBuffer::getFile(FName);
-  if (!MemBufOrErr) {
-    ArgVector.push_back(SaveStringInSet(SavedStrings, Arg));
-    return;
+bool UsesClResponseSyntax(int argc, const char** argv) {
+  bool cl_mode = false;
+  const StringRef executable = llvm::sys::path::stem(argv[0]);
+  if (executable.equals_insensitive("cl") ||
+      executable.equals_insensitive("clang-cl")) {
+    cl_mode = true;
   }
-
-  const char *Buf = MemBufOrErr.get()->getBufferStart();
-  char InQuote = ' ';
-  std::string CurArg;
-
-  for (const char *P = Buf; ; ++P) {
-    if (*P == '\0' || (isspace(*P) && InQuote == ' ')) {
-      if (!CurArg.empty()) {
-
-        if (CurArg[0] != '@') {
-          ArgVector.push_back(SaveStringInSet(SavedStrings, CurArg));
-        } else {
-          ExpandArgsFromBuf(CurArg.c_str(), ArgVector, SavedStrings);
-        }
-
-        CurArg = "";
-      }
-      if (*P == '\0')
-        break;
-      else
-        continue;
-    }
-
-    if (isspace(*P)) {
-      if (InQuote != ' ')
-        CurArg.push_back(*P);
+  for (int index = 1; index < argc; ++index) {
+    const StringRef argument(argv[index]);
+    if (!argument.startswith("--driver-mode="))
       continue;
-    }
-
-    if (*P == '"' || *P == '\'') {
-      if (InQuote == *P)
-        InQuote = ' ';
-      else if (InQuote == ' ')
-        InQuote = *P;
-      else
-        CurArg.push_back(*P);
-      continue;
-    }
-
-    if (*P == '\\') {
-      ++P;
-      if (*P != '\0')
-        CurArg.push_back(*P);
-      continue;
-    }
-    CurArg.push_back(*P);
+    cl_mode = argument.substr(strlen("--driver-mode=")) == "cl";
   }
+  return cl_mode;
 }
 
-void ExpandArgv(int argc, const char **argv,
-                SmallVectorImpl<const char*> &ArgVector,
-                set<std::string> &SavedStrings) {
-  for (int i = 0; i < argc; ++i) {
-    const char *Arg = argv[i];
-    if (Arg[0] != '@') {
-      ArgVector.push_back(SaveStringInSet(SavedStrings, std::string(Arg)));
-      continue;
-    }
+std::string AbsoluteResponsePath(StringRef path) {
+  SmallString<256> absolute(path);
+  if (llvm::sys::fs::make_absolute(absolute))
+    return path.str();
+  llvm::sys::path::remove_dots(absolute, /*remove_dot_dot=*/true);
+  return absolute.str().str();
+}
 
-    ExpandArgsFromBuf(Arg, ArgVector, SavedStrings);
+bool ExpandResponseArgument(const std::string& argument, bool cl_mode,
+                            std::vector<std::string>* expanded,
+                            std::set<std::string>* response_stack,
+                            std::string* error_message) {
+  if (argument.size() < 2 || argument[0] != '@') {
+    expanded->push_back(argument);
+    return true;
   }
+
+  ErrorOr<unique_ptr<MemoryBuffer>> buffer =
+      MemoryBuffer::getFile(argument.substr(1));
+  if (!buffer) {
+    expanded->push_back(argument);
+    return true;
+  }
+
+  const std::string response_path = AbsoluteResponsePath(argument.substr(1));
+  if (!response_stack->insert(response_path).second) {
+    *error_message = "recursive response file in direct invocation.";
+    return false;
+  }
+
+  llvm::BumpPtrAllocator allocator;
+  llvm::StringSaver saver(allocator);
+  SmallVector<const char*, 32> tokens;
+  const StringRef contents = buffer.get()->getBuffer();
+  if (cl_mode) {
+    llvm::cl::TokenizeWindowsCommandLine(contents, saver, tokens);
+  } else {
+    llvm::cl::TokenizeGNUCommandLine(contents, saver, tokens);
+  }
+  for (const char* token : tokens) {
+    if (!ExpandResponseArgument(token, cl_mode, expanded, response_stack,
+                                error_message)) {
+      return false;
+    }
+  }
+  response_stack->erase(response_path);
+  return true;
 }
 
 }  // anonymous namespace
+
+bool ExpandResponseFiles(int argc, const char** argv,
+                         std::vector<std::string>* expanded,
+                         std::string* error_message) {
+  expanded->clear();
+  error_message->clear();
+  const bool cl_mode = UsesClResponseSyntax(argc, argv);
+  std::set<std::string> response_stack;
+  for (int index = 0; index < argc; ++index) {
+    if (!ExpandResponseArgument(argv[index], cl_mode, expanded,
+                                &response_stack, error_message)) {
+      return false;
+    }
+  }
+  return true;
+}
 
 CompilerInstance* CreateCompilerInstance(int argc, const char **argv) {
   std::string path = GetExecutablePath(argv[0]);
@@ -170,11 +183,18 @@ CompilerInstance* CreateCompilerInstance(int argc, const char **argv) {
   Driver driver(path, getDefaultTargetTriple(), diagnostics);
   driver.setTitle("include what you use");
 
-  // Expand out any response files passed on the command line
+  // Expand response files with the same tokenizer used for direct command
+  // identity, so the digest describes the compiler's effective argv exactly.
+  std::vector<std::string> expanded_arguments;
+  std::string expansion_error;
+  if (!ExpandResponseFiles(argc, argv, &expanded_arguments, &expansion_error)) {
+    errs() << "FATAL ERROR: " << expansion_error << '\n';
+    return nullptr;
+  }
   set<std::string> SavedStrings;
   SmallVector<const char*, 256> args;
-
-  ExpandArgv(argc, argv, args, SavedStrings);
+  for (const std::string& argument : expanded_arguments)
+    args.push_back(SaveStringInSet(SavedStrings, argument));
 
   // Drop -save-temps arguments to avoid multiple compilation jobs.
   llvm::erase_if(args, [](const char *v) {

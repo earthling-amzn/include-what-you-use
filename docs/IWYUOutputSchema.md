@@ -1,7 +1,8 @@
 # IWYU structured output schema, version 1
 
-`output-v1.schema.json` defines one record in IWYU's planned JSON Lines output.
-Schema definition is OUTPUT-001; production emission is OUTPUT-002.
+`output-v1.schema.json` defines one record in IWYU's JSON Lines output.
+OUTPUT-001 defined the schema; OUTPUT-002 implements native and compilation-
+database production.
 
 ## Stream protocol
 
@@ -10,20 +11,20 @@ compilation command. Every non-empty line on the structured-output stream is one
 complete UTF-8 JSON object validating against `output-v1.schema.json`. There is
 no surrounding array and no multi-line record.
 
-JSON writes from concurrent children are not assumed atomic. The driver already
-captures each child's merged output in a temporary file; OUTPUT-002 must instead
-capture structured stdout and native stderr separately, parse complete child
-records, and emit them in compilation-database `invocation.index` order. Native
-Clang/IWYU startup and fatal diagnostics remain on stderr. Diagnostics belonging
-to an analysis are encoded in the record. A non-JSON stdout line in structured
-mode is a protocol error.
+JSON writes from concurrent children are not assumed atomic. In structured mode,
+the driver captures each child's stdout and stderr separately, validates complete
+child groups, and emits them in compilation-database `invocation.index` order.
+Native Clang/IWYU startup and fatal diagnostics remain on stderr. Diagnostics
+belonging to an analysis are encoded in the record. A non-JSON stdout line in
+structured mode is a protocol error.
 
 Direct IWYU invocation emits records in normalized target-file order. The driver
 buffers child results and emits invocation groups in index order, not child
 completion order. The required non-null `invocation.id` is the final tie-breaker
 for duplicate compilation commands.
 
-Human diagnostics remain the default output until OUTPUT-002 is complete.
+Human diagnostics remain the default. Direct structured output uses
+`-Xiwyu --output_format=json`; the compilation-database driver uses `-o json`.
 
 ## Record identity
 
@@ -185,6 +186,18 @@ Each association records:
 OUTPUT-002 must retain the reason at the point where `AddAssociatedHeader` is
 called; the current `set<IwyuFileInfo*>` loses it.
 
+## Duplicate occurrence fallback
+
+Schema version 1 identifies an operation by item kind and spelling, not by a
+specific source occurrence. Its desired-state invariant also forbids an applied
+remove operation for an item key that remains desired. When a file contains
+duplicate occurrences and IWYU would remove only the surplus occurrence,
+emitting `remove/apply` would therefore describe a false whole-item removal.
+The native producer emits that file as `status: "skipped"`, with no operations,
+an unavailable desired state, and a `duplicate_occurrence_unrepresentable`
+diagnostic. A later schema may add occurrence identity; version 1 deliberately
+keeps this explicit whole-file fallback.
+
 ## Multi-config provenance
 
 `multi_config` is an availability value. When known, it contains one or more
@@ -295,47 +308,39 @@ unsupported schema version.
 Reason-code additions do not require a schema bump because `reason_code` is a
 patterned string. Existing reason-code meanings must not change.
 
-## Required OUTPUT-002 native-model changes
+## OUTPUT-002 producer profile
 
-The current model cannot faithfully populate all version-1 fields. OUTPUT-002
-must retain or emit provenance at decision points:
+The native producer emits `correct` and `changes` records with complete desired
+state, plus `skipped` records when schema v1 cannot represent a duplicate
+occurrence edit without contradicting retained desired membership. It preserves
+applied add/remove operations, current keep/suppress decision reasons, exact
+physical spelling for present-item operations, grouped motivating symbol uses,
+associated-header reasons, and recoverable IWYU/Clang diagnostics. Unsupported
+provider chains, macro/condition origin details, project policy provenance,
+configuration names, and multi-configuration contributions use typed
+`unavailable` values.
 
-- `ReportMacroUse` preserves the macro name in `OneUse::symbol_name_`, but a
-  normal full-use object loses the macro-versus-AST origin tag and exact
-  definition/expansion provenance. Retain those separately.
-- `AddAssociatedHeader` stores only a file pointer; retain relationship and
-  reason at each call site.
-- `OneUse::public_headers_` already lazily retains candidate include spellings
-  separately from `suggested_header_`; expose/snapshot both at operation
-  construction and resolve each spelling to the normalized provider path stored
-  in `provider_ref`. Provider chains remain new data.
-- include/fwd lines retain line integers only; retain source ranges or emit range
-  unavailable.
-- protected-item reasons follow several storage paths: some call
-  `ReportKnownDesiredFile`, while export, `.cc`, PCH, and re-export paths create
-  synthetic empty-symbol uses through `ReportIncludeFileUse`. Retain one stable
-  reason/disposition regardless of path.
-- decisions that call `clear_desired()` for no-include, prefix-header, associated
-  suppression, surplus duplicate cleanup, and later policy currently erase why
-  the decision happened; retain operation-decision provenance before mutation.
-- stable operation IDs, subject/disposition history, and semantic operation
-  identity do not exist; assign IDs only after deterministic operation sorting.
-- diagnostics and final diffs are written directly through `ERRSYM`/`errs()`;
-  add a structured diagnostic/status sink instead of scraping stderr.
-- ASSOC-002 now retains per-file conditional stacks long enough to validate
-  dotted-inline exports, but general expression text, locations, active branches,
-  and links from conditions to symbol uses/edits do not yet exist.
-- invocation index/ID and canonical command digest must be created in direct-IWYU
-  and driver entry points using the specified golden-vector algorithm.
-- project policy provenance does not yet exist.
-- multi-config contributions are a future driver result.
-- `iwyu_tool.py` must split structured stdout from native stderr, assign the
-  specified invocation ID/index, buffer child records, reject non-JSON stdout,
-  and emit database-index order. Add a concurrent child-order contract where a
-  later database item exits first.
+Native output sorts file records and operations deterministically. The driver
+expands response files using the compiler's GNU or clang-cl tokenization,
+computes the canonical digest before adding IWYU protocol options, preserves
+original database indices and duplicate commands, rejects reserved option
+injection, validates LF-framed child output atomically, and emits child groups
+and native stderr in database-index order.
 
-Initial OUTPUT-002 may emit unavailable typed values for unimplemented
-provenance, but it must never invent values or use arbitrary payload objects.
+## Remaining native-model work
+
+The initial producer intentionally leaves these fields unavailable until later
+semantic and policy tasks retain them without inference:
+
+- exact macro-versus-AST origin and macro definition/expansion provenance;
+- normalized selected/candidate provider paths and provider chains;
+- exact source ranges for edits;
+- general preprocessor expression, location, branch, and use/edit links;
+- project-policy provenance;
+- named configuration and multi-configuration contributions.
+
+Unavailable fields use the typed wrappers defined above. Producers must never
+invent values or use arbitrary payload objects.
 
 ## Security
 

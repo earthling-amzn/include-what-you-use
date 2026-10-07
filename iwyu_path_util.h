@@ -39,6 +39,11 @@ const vector<HeaderSearchPath>& HeaderSearchPaths();
 // quotes or <>) C++ header file.
 bool IsHeaderFile(string path);
 
+// Returns true for generic inline-definition header conventions. Supports
+// .inline and -inl before any supported header extension, case-insensitively,
+// as well as the legacy .inl extension.
+bool IsInlineHeaderFile(string path);
+
 // If the path has a slash, return the part after the last slash,
 // else return the input path.
 string Basename(const string& path);
