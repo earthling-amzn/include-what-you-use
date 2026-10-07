@@ -245,4 +245,10 @@ if (Python3_Interpreter_FOUND)
     COMMAND ${Python3_EXECUTABLE} iwyu_tool_test.py
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   )
+
+  add_test(NAME output_schema_test
+    COMMAND ${Python3_EXECUTABLE} tests/validate_output_schema.py
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  set_tests_properties(output_schema_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()

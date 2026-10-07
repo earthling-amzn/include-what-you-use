@@ -1,0 +1,74 @@
+[
+  {
+    "index": 0,
+    "command": {
+      "directory": "/work/build",
+      "file": "/work/src/a.cpp",
+      "arguments": [
+        "clang++",
+        "-I../src",
+        "-c",
+        "/work/src/a.cpp"
+      ]
+    },
+    "canonical": "{\"directory\":\"/work/build\",\"file\":\"/work/src/a.cpp\",\"arguments\":[\"clang++\",\"-I../src\",\"-c\",\"/work/src/a.cpp\"]}",
+    "command_digest": "sha256:31cae2c247a99ca03f8df09b5f644e3c791e8cd8fbe2744a21020ffe588cd5b7",
+    "invocation_id": "inv-000000-31cae2c247a9"
+  },
+  {
+    "index": 1,
+    "command": {
+      "directory": "/work/build",
+      "file": "/work/src/a.cpp",
+      "arguments": [
+        "clang++",
+        "-I../src",
+        "-c",
+        "/work/src/a.cpp"
+      ]
+    },
+    "canonical": "{\"directory\":\"/work/build\",\"file\":\"/work/src/a.cpp\",\"arguments\":[\"clang++\",\"-I../src\",\"-c\",\"/work/src/a.cpp\"]}",
+    "command_digest": "sha256:31cae2c247a99ca03f8df09b5f644e3c791e8cd8fbe2744a21020ffe588cd5b7",
+    "invocation_id": "inv-000001-31cae2c247a9"
+  },
+  {
+    "index": 1000000,
+    "command": {
+      "directory": "/work/build",
+      "file": "/work/src/a.cpp",
+      "arguments": [
+        "clang++",
+        "-I../src",
+        "-c",
+        "/work/src/a.cpp"
+      ]
+    },
+    "canonical": "{\"directory\":\"/work/build\",\"file\":\"/work/src/a.cpp\",\"arguments\":[\"clang++\",\"-I../src\",\"-c\",\"/work/src/a.cpp\"]}",
+    "command_digest": "sha256:31cae2c247a99ca03f8df09b5f644e3c791e8cd8fbe2744a21020ffe588cd5b7",
+    "invocation_id": "inv-1000000-31cae2c247a9"
+  },
+  {
+    "index": 12,
+    "command": {
+      "directory": "C:/wörk/\"build\"",
+      "file": "C:/work/src/back\\slash.cpp",
+      "arguments": [
+        "clang++",
+        "-DNAME=A B",
+        "-DLINE=one\ntwo",
+        "-DTAB=\t",
+        "-DSLASH=/",
+        "-c",
+        "C:/work/src/back\\slash.cpp",
+        "-DBACK=\b",
+        "-DFORM=\f",
+        "-DRETURN=\r",
+        "-DNUL=\u0000",
+        "-DUNIT=\u001f"
+      ]
+    },
+    "canonical": "{\"directory\":\"C:/wörk/\\\"build\\\"\",\"file\":\"C:/work/src/back\\\\slash.cpp\",\"arguments\":[\"clang++\",\"-DNAME=A B\",\"-DLINE=one\\ntwo\",\"-DTAB=\\t\",\"-DSLASH=/\",\"-c\",\"C:/work/src/back\\\\slash.cpp\",\"-DBACK=\\b\",\"-DFORM=\\f\",\"-DRETURN=\\r\",\"-DNUL=\\u0000\",\"-DUNIT=\\u001f\"]}",
+    "command_digest": "sha256:d3066f28be647a7b9fab3251cfeec1019d093429ef98de785ac2876a0627908a",
+    "invocation_id": "inv-000012-d3066f28be64"
+  }
+]

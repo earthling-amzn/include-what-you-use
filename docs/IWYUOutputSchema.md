@@ -1,0 +1,359 @@
+# IWYU structured output schema, version 1
+
+`output-v1.schema.json` defines one record in IWYU's planned JSON Lines output.
+Schema definition is OUTPUT-001; production emission is OUTPUT-002.
+
+## Stream protocol
+
+Structured output uses JSON Lines because `iwyu_tool.py` runs one IWYU child per
+compilation command. Every non-empty line on the structured-output stream is one
+complete UTF-8 JSON object validating against `output-v1.schema.json`. There is
+no surrounding array and no multi-line record.
+
+JSON writes from concurrent children are not assumed atomic. The driver already
+captures each child's merged output in a temporary file; OUTPUT-002 must instead
+capture structured stdout and native stderr separately, parse complete child
+records, and emit them in compilation-database `invocation.index` order. Native
+Clang/IWYU startup and fatal diagnostics remain on stderr. Diagnostics belonging
+to an analysis are encoded in the record. A non-JSON stdout line in structured
+mode is a protocol error.
+
+Direct IWYU invocation emits records in normalized target-file order. The driver
+buffers child results and emits invocation groups in index order, not child
+completion order. The required non-null `invocation.id` is the final tie-breaker
+for duplicate compilation commands.
+
+Human diagnostics remain the default output until OUTPUT-002 is complete.
+
+## Record identity
+
+One record describes one target file observed from one translation-unit
+invocation and configuration:
+
+```text
+(schema_version, invocation.index, invocation.id,
+ invocation.translation_unit, file.path)
+```
+
+Configuration has explicit availability. Multi-config aggregation must preserve
+per-configuration contributions before producing a merged operation.
+
+The driver creates canonical command bytes as compact UTF-8 JSON with keys in
+this exact order and no insignificant whitespace:
+
+```json
+{"directory":"<realpath with / separators>","file":"<realpath with / separators>","arguments":["..."]}
+```
+
+`arguments` is the exact post-splitting, post-response-file-expansion argument
+array after compiler-wrapper removal and before IWYU-only arguments are added;
+individual argument strings are not rewritten. Including `directory` makes
+relative path-bearing arguments unambiguous. Strings use UTF-8 directly for
+non-ASCII characters, never escape `/`, escape `"` and `\\`, use the short JSON
+escapes for backspace/tab/newline/form-feed/carriage-return, and encode other
+U+0000–U+001F values as lowercase `\\u00xx`. `command_digest` is `sha256:` plus
+the 64 lowercase hexadecimal digits of SHA-256 over those bytes.
+
+The driver derives `invocation.id` as
+`inv-<database-index>-<digest-prefix>`. Database index is zero-based decimal,
+left-padded to at least six digits; `digest-prefix` is the first 12 digest hex
+digits. Direct IWYU uses index zero. Duplicate commands retain distinct database
+indices and therefore distinct IDs. The validator enforces the ID/index/digest
+relationship; golden vectors in the examples lock serialization.
+
+## Top-level fields
+
+- `schema_version`: integer `1`.
+- `record_type`: `file_analysis`.
+- `tool`: IWYU, Clang, and source-revision metadata.
+- `invocation`: stable ID/index, translation unit, configuration availability,
+  and required canonical command digest.
+- `file`: analyzed path and kind.
+- `status`: `correct`, `changes`, `skipped`, or `error`.
+- `associated_headers`: typed relationships with machine reason codes and human
+  reasons, rather than path strings alone.
+- `analyzed_configurations`: explicit available complete configuration-name set
+  against which operation contributions are checked.
+- `operations`: ordered recommendations and policy dispositions.
+- `desired_state`: explicitly known/complete or unavailable.
+- `diagnostics`: structured analysis, policy, startup, and parse diagnostics.
+
+Known-empty collections are emitted as empty arrays. Unknown data is never
+represented by omission or an ambiguous empty collection.
+
+## Operations: subject versus disposition
+
+An operation separates the underlying recommendation from what the current
+layer decided to do with it:
+
+- `subject_action`: `add`, `remove`, or `keep`.
+- `disposition`: `apply`, `keep`, `suppress`, or `report`.
+
+Examples:
+
+```text
+add/apply       add the item
+remove/apply    remove the item
+keep/keep       retain a present item
+add/suppress    policy rejected a proposed addition
+remove/report   unsafe removal is reported for a human
+```
+
+This avoids overloading a single `suppress` action without saying what was
+suppressed.
+
+Other required operation fields:
+
+- `item_kind`: `include` or `forward_declaration`.
+- `spelling`: exact source spelling.
+- `source_range`: explicit known/unknown/unavailable/not-applicable range.
+- `reason_code`: stable machine identifier.
+- `reason`: human explanation, not an API.
+- `symbols`: declarations and per-use completeness/origin/macro/condition data
+  motivating the operation.
+- `provider`: separately available selected provider, candidates, and chain.
+- `edit_condition`: condition under which an addition/removal should be applied;
+  this is distinct from each motivating use's condition.
+- `policy`: typed policy file, rule, and decision provenance.
+- `multi_config`: typed per-configuration contributions.
+
+Operation IDs (`op-1`, `op-2`, ...) are unique within a file record.
+
+## Completeness
+
+Each symbol contains one or more ordered use objects. Every use has an explicit
+`requirement`:
+
+- `full`
+- `forward_declaration`
+- `none`
+- `unknown`
+
+Each use also records `origin` (`ast`, `macro`, `heuristic`, or `unknown`) and its
+own typed condition and macro provenance. Provenance is per-use because one
+operation may be motivated by several symbols, one symbol may have mixed
+AST/macro uses, and use sites may be controlled by different conditions. Symbol
+declaration and qualified-name availability remain shared by the grouped symbol.
+
+## Typed availability
+
+Every field that may not be computable uses a typed availability wrapper:
+
+```json
+{"status": "known", "value": "server-fastdebug"}
+{"status": "unknown", "value": null}
+{"status": "unavailable", "value": null}
+{"status": "not_applicable", "value": null}
+```
+
+- `unknown`: the producer supports the field but could not determine this value.
+- `unavailable`: this producer/version does not compute the field.
+- `not_applicable`: the field has no meaning for this operation.
+
+Known values are schema-constrained by provenance class. Provider details cannot
+contain arbitrary objects:
+
+- `selected`: available provider reference with balanced quoted/angled include
+  spelling and normalized path
+- `candidates`: available unique, sorted provider-reference array
+- `chain`: available ordered normalized-path array ending at the selected path
+
+Provider paths use `/`, contain no `.` or `..` component or duplicate separator,
+and have no trailing separator except root. Selected provider, candidate set, and
+chain remain independently available; for example, selected may be known while
+chain is unavailable.
+
+A known selected provider must occur in known candidates. For an include
+operation its include token matches selected spelling. A known chain requires a
+known selected provider, starts at the analyzed file, and ends at the selected
+normalized path.
+
+Condition known value contains expression, location availability, and active
+branch. Macro known value contains name and definition/expansion availability.
+Policy known value contains policy file, rule ID, and decision. Multi-config
+known value contains at least one typed per-configuration contribution.
+
+## Associated headers
+
+Each association records:
+
+- path
+- relationship: declarations, inline definitions, explicit, or heuristic
+- reason code
+- human reason
+
+OUTPUT-002 must retain the reason at the point where `AddAssociatedHeader` is
+called; the current `set<IwyuFileInfo*>` loses it.
+
+## Multi-config provenance
+
+`multi_config` is an availability value. When known, it contains one or more
+contributions with:
+
+- configuration name
+- subject action (`add`, `remove`, `keep`, or `none`)
+- disposition (`not_applicable` exactly when subject is `none`)
+- typed condition provenance
+
+An empty array is not used for unknown or unnamed configuration state. A normal
+single-config producer emits `not_applicable` or a known single contribution,
+according to the OUTPUT-002 implementation decision. In a multi-config aggregate,
+every operation has one contribution for every name in
+`analyzed_configurations`; missing recommendations use `none/not_applicable`.
+Configuration names are unique. Every non-`none` contribution has the same
+subject action as the aggregate and exactly the same typed condition as
+`edit_condition`; `none` contributions always use a not-applicable condition.
+Apply/keep/suppress aggregates require that disposition from every contribution.
+A report aggregate requires at least one report contribution and may include
+explicit no-recommendation contributions. The multi-config driver must retain
+these conditions and must not apply an unconditional union of
+configuration-specific additions.
+
+## Ranges and columns
+
+Locations are one-based. Columns are one-based UTF-8 byte columns, matching
+Clang's presumed source-location column convention. Range end is exclusive.
+
+An added item with no selected insertion point uses `not_applicable`; version 1
+requires add subjects to use that status. Remove and keep subjects refer to
+present items and therefore may be known, unknown, or unavailable, but never
+not-applicable. Known endpoints use the same path and end must not precede start.
+A present item whose line is known but exact columns are not retained uses
+`unavailable`; it must not fabricate column 1. Current
+`OneIncludeOrForwardDeclareLine` keeps only line numbers, so OUTPUT-002 must
+retain richer locations or explicitly emit unavailable ranges.
+
+## Desired state
+
+`desired_state` has explicit status, `complete`, and items:
+
+```json
+{"status": "known", "complete": true, "items": []}
+{"status": "unavailable", "complete": false, "items": null}
+```
+
+For `correct` and `changes`, version 1 requires known, complete desired state.
+For `skipped` and `error`, unavailable state is valid. Desired items must be
+unique by `(item_kind, spelling)`.
+
+When desired state is known:
+
+- `add/apply` appears;
+- `add/suppress` and `add/report` remain absent;
+- `remove/apply` remains absent;
+- `remove/keep`, `remove/suppress`, and `remove/report` remain present;
+- `keep/keep` and `keep/report` remain present.
+
+These rules make desired state the accepted post-disposition source state, not
+the analyzer's pre-policy ideal.
+
+## Status invariants
+
+- `correct`: no applied add/remove operation; desired state known/complete.
+- `changes`: at least one applied add/remove; desired state known/complete.
+- `skipped`: no applied edits; at least one diagnostic.
+- `error`: no applied edits; at least one error diagnostic.
+
+The example validator enforces these semantic constraints in addition to JSON
+Schema.
+
+## Deterministic ordering
+
+Within a record:
+
+1. associations sort by path, relationship, reason code and are unique by that
+   tuple;
+2. operations sort by subject rank (`remove`, `add`, `keep`), disposition rank
+   (`apply`, `keep`, `suppress`, `report`), item-kind rank (`include`,
+   `forward_declaration`), full range key (availability rank, path, start
+   line/column, end line/column), spelling, then reason code;
+3. duplicate underlying operations are forbidden by `(subject_action,
+   item_kind, spelling, source_range)`, so the key above has no unresolved tie;
+4. operation IDs are assigned `op-1`, `op-2`, ... only after sorting and are not
+   themselves sort keys;
+5. desired items retain final source order and are unique by kind/spelling;
+6. symbols sort by available qualified name (or name fallback), then name, and
+   are unique by that identity;
+7. uses sort by path, line, column, origin rank (`ast`, `macro`, `heuristic`,
+   `unknown`), requirement rank (`full`, `forward_declaration`, `none`,
+   `unknown`), then canonical condition and macro values; exact duplicate use
+   identities are forbidden;
+8. provider candidates sort by normalized path then spelling; configuration
+   contributions sort by configuration name.
+
+Across records, direct IWYU sorts by file path. `iwyu_tool.py` emits compilation
+invocations in database index order and file records in child order. Consumers
+must not need to sort completion-order output.
+
+## Versioning
+
+The schema is strict (`additionalProperties: false`). Any field addition,
+removal, type change, closed-enum expansion, or semantic incompatibility creates
+a new schema version/file. Producers select one version. Consumers reject an
+unsupported schema version.
+
+Reason-code additions do not require a schema bump because `reason_code` is a
+patterned string. Existing reason-code meanings must not change.
+
+## Required OUTPUT-002 native-model changes
+
+The current model cannot faithfully populate all version-1 fields. OUTPUT-002
+must retain or emit provenance at decision points:
+
+- `ReportMacroUse` preserves the macro name in `OneUse::symbol_name_`, but a
+  normal full-use object loses the macro-versus-AST origin tag and exact
+  definition/expansion provenance. Retain those separately.
+- `AddAssociatedHeader` stores only a file pointer; retain relationship and
+  reason at each call site.
+- `OneUse::public_headers_` already lazily retains candidate include spellings
+  separately from `suggested_header_`; expose/snapshot both at operation
+  construction and resolve each spelling to the normalized provider path stored
+  in `provider_ref`. Provider chains remain new data.
+- include/fwd lines retain line integers only; retain source ranges or emit range
+  unavailable.
+- protected-item reasons follow several storage paths: some call
+  `ReportKnownDesiredFile`, while export, `.cc`, PCH, and re-export paths create
+  synthetic empty-symbol uses through `ReportIncludeFileUse`. Retain one stable
+  reason/disposition regardless of path.
+- decisions that call `clear_desired()` for no-include, prefix-header, associated
+  suppression, surplus duplicate cleanup, and later policy currently erase why
+  the decision happened; retain operation-decision provenance before mutation.
+- stable operation IDs, subject/disposition history, and semantic operation
+  identity do not exist; assign IDs only after deterministic operation sorting.
+- diagnostics and final diffs are written directly through `ERRSYM`/`errs()`;
+  add a structured diagnostic/status sink instead of scraping stderr.
+- ASSOC-002 now retains per-file conditional stacks long enough to validate
+  dotted-inline exports, but general expression text, locations, active branches,
+  and links from conditions to symbol uses/edits do not yet exist.
+- invocation index/ID and canonical command digest must be created in direct-IWYU
+  and driver entry points using the specified golden-vector algorithm.
+- project policy provenance does not yet exist.
+- multi-config contributions are a future driver result.
+- `iwyu_tool.py` must split structured stdout from native stderr, assign the
+  specified invocation ID/index, buffer child records, reject non-JSON stdout,
+  and emit database-index order. Add a concurrent child-order contract where a
+  later database item exits first.
+
+Initial OUTPUT-002 may emit unavailable typed values for unimplemented
+provenance, but it must never invent values or use arbitrary payload objects.
+
+## Security
+
+Paths, symbols, reasons, policy IDs, and diagnostics are untrusted data.
+Consumers must not interpolate them into shell commands. Structured output does
+not contain instructions to execute and should not include source snippets,
+environment variables, or full compiler commands by default. `command_digest`
+is preferred to command text.
+
+## Examples and validation
+
+- Positive JSONL: `tests/schema/output-v1/positive.jsonl`
+- Negative JSONL: `tests/schema/output-v1/negative-*.jsonl`
+- Expected negative reasons: `tests/schema/output-v1/negative-expectations.json`
+- Invocation ID vectors: `tests/schema/output-v1/invocation-id-vectors.json`
+- Validator: `tests/validate_output_schema.py`
+
+The validator checks JSON Schema, semantic invariants, ordering, uniqueness,
+operation/desired-state consistency, and that each negative fixture fails for
+its named reason. It returns CTest skip code 77 only when the optional
+`jsonschema` package is unavailable.
