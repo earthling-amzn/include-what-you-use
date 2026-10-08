@@ -1,0 +1,3 @@
+[
+  { include: ["\"tests/cxx/assoc003_pair_provider.hpp\"", public, "\"assoc003_unresolved_third.hpp\"", public] },
+]

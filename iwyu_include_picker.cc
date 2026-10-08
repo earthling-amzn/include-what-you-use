@@ -1297,6 +1297,11 @@ void IncludePicker::AddDirectInclude(const string& includer_filepath,
   quoted_includes_to_quoted_includers_[quoted_includee].insert(quoted_includer);
   const pair<string, string> key(includer_filepath, includee_filepath);
   includer_and_includee_to_include_as_written_[key] = quoted_include_as_written;
+  const pair<string, string> absolute_key(
+      NormalizeFilePath(MakeAbsolutePath(includer_filepath)),
+      NormalizeFilePath(MakeAbsolutePath(includee_filepath)));
+  includer_and_includee_to_include_as_written_[absolute_key] =
+      quoted_include_as_written;
 
   // Mark the clang fake-file "<built-in>" as private, so we never try
   // to map anything to it.
@@ -1328,6 +1333,14 @@ void IncludePicker::AddDirectInclude(const string& includer_filepath,
     VERRS(8) << "Adding dynamic mapping for <asm-*> header\n";
     AddMapping(quoted_includee, MappedInclude(public_header));
   }
+}
+
+void IncludePicker::RegisterVerifiedDottedInlineExport(
+    const string& plain_filepath, const string& inline_filepath) {
+  CHECK_(!has_called_finalize_added_include_lines_ && "Can't mutate anymore");
+  verified_dotted_inline_exports_.insert(
+      {NormalizeFilePath(MakeAbsolutePath(plain_filepath)),
+       NormalizeFilePath(MakeAbsolutePath(inline_filepath))});
 }
 
 void IncludePicker::AddMapping(const string& map_from,
@@ -1519,37 +1532,72 @@ string IncludePicker::MaybeGetIncludeNameAsWritten(
   // I want to use GetOrDefault here, but it has trouble deducing tpl args.
   const string* value = FindInMap(&includer_and_includee_to_include_as_written_,
                                   key);
+  if (!value) {
+    const pair<string, string> absolute_key(
+        NormalizeFilePath(MakeAbsolutePath(includer_filepath)),
+        NormalizeFilePath(MakeAbsolutePath(includee_filepath)));
+    value = FindInMap(&includer_and_includee_to_include_as_written_,
+                      absolute_key);
+  }
   return value ? *value : "";
+}
+
+vector<CandidateHeader> IncludePicker::BestCandidateHeaderRefsForIncluder(
+    const vector<MappedInclude>& includes,
+    const string& including_filepath) const {
+  const string including_path =
+      MakeAbsolutePath(GetParentPath(including_filepath));
+  const string absolute_including_filepath =
+      NormalizeFilePath(MakeAbsolutePath(including_filepath));
+  const auto spelling_for = [&](const MappedInclude& mapped_include) {
+    const string& quoted_include_as_written =
+        MaybeGetIncludeNameAsWritten(including_filepath, mapped_include.path);
+    if (!quoted_include_as_written.empty())
+      return quoted_include_as_written;
+    if (mapped_include.HasAbsoluteQuotedInclude() &&
+        !mapped_include.path.empty()) {
+      return ConvertToQuotedInclude(mapped_include.path, including_path);
+    }
+    return mapped_include.quoted_include;
+  };
+
+  vector<CandidateHeader> retval;
+  for (const MappedInclude& mapped_include : includes) {
+    const string spelling = spelling_for(mapped_include);
+    set<string> paths;
+    if (!mapped_include.path.empty()) {
+      paths.insert(NormalizeFilePath(MakeAbsolutePath(mapped_include.path)));
+    }
+    for (const auto& observed : includer_and_includee_to_include_as_written_) {
+      if (NormalizeFilePath(MakeAbsolutePath(observed.first.first)) ==
+              absolute_including_filepath &&
+          observed.second == spelling) {
+        paths.insert(NormalizeFilePath(
+            MakeAbsolutePath(observed.first.second)));
+      }
+    }
+    for (const auto& relationship : verified_dotted_inline_exports_) {
+      const MappedInclude plain(ConvertToQuotedInclude(relationship.first),
+                                relationship.first);
+      const MappedInclude dotted_inline(
+          ConvertToQuotedInclude(relationship.second), relationship.second);
+      if (spelling_for(plain) == spelling)
+        paths.insert(relationship.first);
+      if (spelling_for(dotted_inline) == spelling)
+        paths.insert(relationship.second);
+    }
+    retval.push_back({spelling, paths.size() == 1 ? *paths.begin() : string()});
+  }
+  return retval;
 }
 
 vector<string> IncludePicker::BestQuotedIncludesForIncluder(
     const vector<MappedInclude>& includes,
     const string& including_filepath) const {
-  // Convert each MappedInclude to a quoted include, according to the
-  // following priorities:
-  // 1. If the file is already included, use whatever name it's already
-  //    included via.  This is better to use than ConvertToQuotedInclude
-  //    because it avoids trouble when the same file is accessible via
-  //    different include search-paths, or is accessed via a symlink.
-  // 2. If the quoted include in the MappedInclude object is an absolute path,
-  //    that's unlikely to be what's wanted.  Try to convert it to a relative
-  //    include via ConvertToQuotedInclude.
-  // 3. Otherwise, use the quoted include present in the MappedInclude.
-  const string including_path =
-      MakeAbsolutePath(GetParentPath(including_filepath));
   vector<string> retval;
-  for (const MappedInclude& mapped_include : includes) {
-    const string& quoted_include_as_written =
-        MaybeGetIncludeNameAsWritten(including_filepath, mapped_include.path);
-    if (!quoted_include_as_written.empty()) {
-      retval.push_back(quoted_include_as_written);
-    } else if (mapped_include.HasAbsoluteQuotedInclude() &&
-               !mapped_include.path.empty()) {
-      retval.push_back(ConvertToQuotedInclude(mapped_include.path,
-                                              including_path));
-    } else {
-      retval.push_back(mapped_include.quoted_include);
-    }
+  for (const CandidateHeader& candidate :
+       BestCandidateHeaderRefsForIncluder(includes, including_filepath)) {
+    retval.push_back(candidate.spelling);
   }
   return retval;
 }
@@ -1560,10 +1608,20 @@ vector<MappedInclude> IncludePicker::GetCandidateHeadersForSymbol(
   return GetPublicValues(symbol_include_map_, symbol);
 }
 
+vector<CandidateHeader> IncludePicker::GetCandidateHeaderRefsForSymbolUsedFrom(
+    const string& symbol, const string& including_filepath) const {
+  return BestCandidateHeaderRefsForIncluder(
+      GetCandidateHeadersForSymbol(symbol), including_filepath);
+}
+
 vector<string> IncludePicker::GetCandidateHeadersForSymbolUsedFrom(
     const string& symbol, const string& including_filepath) const {
-  return BestQuotedIncludesForIncluder(
-      GetCandidateHeadersForSymbol(symbol), including_filepath);
+  vector<string> result;
+  for (const CandidateHeader& candidate :
+       GetCandidateHeaderRefsForSymbolUsedFrom(symbol, including_filepath)) {
+    result.push_back(candidate.spelling);
+  }
+  return result;
 }
 
 vector<MappedInclude> IncludePicker::GetCandidateHeadersForFilepath(
@@ -1593,7 +1651,8 @@ vector<MappedInclude> IncludePicker::GetCandidateHeadersForFilepath(
 // Except for the case that the includer is a 'friend' of the includee
 // (via an '// IWYU pragma: friend XXX'), the same as
 // GetCandidateHeadersForFilepath.
-vector<string> IncludePicker::GetCandidateHeadersForFilepathIncludedFrom(
+vector<CandidateHeader>
+IncludePicker::GetCandidateHeaderRefsForFilepathIncludedFrom(
     const string& included_filepath, const string& including_filepath) const {
   vector<MappedInclude> mapped_includes;
   // We pass the own files path to ConvertToQuotedInclude so the quoted include
@@ -1610,7 +1669,7 @@ vector<string> IncludePicker::GetCandidateHeadersForFilepathIncludedFrom(
   if (headers_with_includer_as_friend != nullptr &&
       ContainsKey(*headers_with_includer_as_friend, included_filepath)) {
     mapped_includes.push_back(
-        MappedInclude(quoted_includee, including_filepath));
+        MappedInclude(quoted_includee, included_filepath));
   } else {
     mapped_includes =
         GetCandidateHeadersForFilepath(included_filepath, including_filepath);
@@ -1630,7 +1689,69 @@ vector<string> IncludePicker::GetCandidateHeadersForFilepathIncludedFrom(
     }
   }
 
-  return BestQuotedIncludesForIncluder(mapped_includes, including_filepath);
+  return BestCandidateHeaderRefsForIncluder(mapped_includes,
+                                             including_filepath);
+}
+
+vector<string> IncludePicker::GetCandidateHeadersForFilepathIncludedFrom(
+    const string& included_filepath, const string& including_filepath) const {
+  vector<string> result;
+  for (const CandidateHeader& candidate :
+       GetCandidateHeaderRefsForFilepathIncludedFrom(included_filepath,
+                                                      including_filepath)) {
+    result.push_back(candidate.spelling);
+  }
+  return result;
+}
+
+bool IncludePicker::GetVerifiedDottedInlineExport(
+    const vector<string>& candidates, const string& including_filepath,
+    VerifiedDottedInlineExport* result) const {
+  CHECK_(has_called_finalize_added_include_lines_ && "Must finalize includes");
+  CHECK_(result && "Need result storage");
+
+  bool found = false;
+  VerifiedDottedInlineExport match;
+  for (const auto& relationship : verified_dotted_inline_exports_) {
+    vector<MappedInclude> endpoints;
+    endpoints.push_back(MappedInclude(
+        ConvertToQuotedInclude(relationship.first), relationship.first));
+    endpoints.push_back(MappedInclude(
+        ConvertToQuotedInclude(relationship.second), relationship.second));
+    const vector<string> spellings =
+        BestQuotedIncludesForIncluder(endpoints, including_filepath);
+    CHECK_(spellings.size() == 2);
+    if (!ContainsValue(candidates, spellings[0]) ||
+        !ContainsValue(candidates, spellings[1])) {
+      continue;
+    }
+
+    const VerifiedDottedInlineExport current = {
+        spellings[0], relationship.first, spellings[1], relationship.second};
+    if (found && (match.plain_spelling != current.plain_spelling ||
+                  match.plain_path != current.plain_path ||
+                  match.inline_spelling != current.inline_spelling ||
+                  match.inline_path != current.inline_path)) {
+      return false;
+    }
+    match = current;
+    found = true;
+  }
+  if (found)
+    *result = match;
+  return found;
+}
+
+bool IncludePicker::IsVerifiedDottedInlineEndpoint(
+    const string& filepath) const {
+  const string absolute_path =
+      NormalizeFilePath(MakeAbsolutePath(filepath));
+  return std::any_of(
+      verified_dotted_inline_exports_.begin(),
+      verified_dotted_inline_exports_.end(),
+      [&](const auto& relationship) {
+        return relationship.second == absolute_path;
+      });
 }
 
 bool IncludePicker::HasMapping(const string& map_from_filepath,

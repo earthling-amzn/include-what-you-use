@@ -547,6 +547,8 @@ void IwyuPreprocessorInfo::FinalizeDottedInlineExports() {
     VERRS(8) << "Adding dotted-inline export mapping: "
              << pending.include_name_as_written << " -> "
              << quoted_includer << "\n";
+    MutableGlobalIncludePicker()->RegisterVerifiedDottedInlineExport(
+        includee_path, includer_path);
     MutableGlobalIncludePicker()->AddMapping(
         pending.include_name_as_written, map_to);
     const string context_free_includee = ConvertToQuotedInclude(includee_path);
@@ -634,8 +636,9 @@ void IwyuPreprocessorInfo::MaybeProtectInclude(
 
   if (!protect_reason.empty()) {
     CHECK_(ContainsKey(iwyu_file_info_map_, includer));
-    GetFromFileInfoMap(includer)->ReportIncludeFileUse(includee,
-                                                       include_name_as_written);
+    GetFromFileInfoMap(includer)->ReportIncludeFileUse(
+        includee, include_name_as_written,
+        OneUse::kProtectedIncludeSynthetic);
     ERRSYM(includer) << "Marked dep: " << GetFilePath(includer)
                      << " needs to keep " << include_name_as_written
                      << " (reason: " << protect_reason << ")\n";
@@ -653,8 +656,9 @@ void IwyuPreprocessorInfo::FinalizeProtectedIncludes() {
       if (GlobalIncludePicker().HasMapping(includee_path, includer_path)) {
         // If includer re-exports includee, that counts as a "use" of it, so
         // protect the include.
-        includer.ReportIncludeFileUse(include,
-                                      ConvertToQuotedInclude(includee_path));
+        includer.ReportIncludeFileUse(
+            include, ConvertToQuotedInclude(includee_path),
+            OneUse::kProtectedIncludeSynthetic);
         includer.ReportProtectedFileReason(
             include, "reexported_include",
             "The includer re-exports this include to its consumers.");
@@ -664,8 +668,9 @@ void IwyuPreprocessorInfo::FinalizeProtectedIncludes() {
       } else if (always_keep_files_.count(include) > 0) {
         // Includee itself contains an "always_keep" pragma that protects it
         // from removal in all includers.
-        includer.ReportIncludeFileUse(include,
-                                      ConvertToQuotedInclude(includee_path));
+        includer.ReportIncludeFileUse(
+            include, ConvertToQuotedInclude(includee_path),
+            OneUse::kProtectedIncludeSynthetic);
         includer.ReportKnownDesiredFile(
             include, "pragma_always_keep",
             "IWYU pragma always_keep requires this include to remain.");

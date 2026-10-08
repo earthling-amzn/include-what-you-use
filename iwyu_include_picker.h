@@ -83,6 +83,11 @@ struct MappedInclude {
   bool HasAbsoluteQuotedInclude() const;
 };
 
+struct CandidateHeader {
+  string spelling;
+  string path;
+};
+
 class IncludePicker {
  public:
   // The keys are either symbol names or quoted includes, and the values are
@@ -109,6 +114,27 @@ class IncludePicker {
   // Add this to say "map_to re-exports everything in file map_from".
   // map_from should be a quoted include.
   void AddMapping(const string& map_from, const MappedInclude& map_to);
+
+  // Preserve a verified exact plain-header -> dotted-inline-header export.
+  // This is deliberately separate from the general mapping graph.
+  void RegisterVerifiedDottedInlineExport(
+      const string& plain_filepath, const string& inline_filepath);
+
+  // An exact verified dotted-inline relationship, spelled for one includer.
+  struct VerifiedDottedInlineExport {
+    string plain_spelling;
+    string plain_path;
+    string inline_spelling;
+    string inline_path;
+  };
+
+  // If candidates contain both endpoints of one registered exact export,
+  // return that pair with includer-adjusted spellings. Ambiguous matches fail.
+  bool GetVerifiedDottedInlineExport(
+      const vector<string>& candidates, const string& including_filepath,
+      VerifiedDottedInlineExport* result) const;
+
+  bool IsVerifiedDottedInlineEndpoint(const string& filepath) const;
 
   // Indicate that the given quoted include should be considered
   // a "private" include.  If possible, we use the include-picker
@@ -148,6 +174,8 @@ class IncludePicker {
   // the correct relative path for ""-style includes).
   vector<string> GetCandidateHeadersForSymbolUsedFrom(
       const string& symbol, const string& including_filepath) const;
+  vector<CandidateHeader> GetCandidateHeaderRefsForSymbolUsedFrom(
+      const string& symbol, const string& including_filepath) const;
 
   // Returns the set of all public header files that a given header
   // file -- specified as a full path -- would map to, as a set of
@@ -171,6 +199,8 @@ class IncludePicker {
   // Furthermore, knowing the including file allows use to convert each
   // MappedInclude in the result to a simple string (quoted include).
   vector<string> GetCandidateHeadersForFilepathIncludedFrom(
+      const string& included_filepath, const string& including_filepath) const;
+  vector<CandidateHeader> GetCandidateHeaderRefsForFilepathIncludedFrom(
       const string& included_filepath, const string& including_filepath) const;
 
   // Returns true if there is a mapping (possibly indirect) from
@@ -249,6 +279,8 @@ class IncludePicker {
   // choose the best quoted include form for each MappedInclude.
   vector<string> BestQuotedIncludesForIncluder(
       const vector<MappedInclude>&, const string& including_filepath) const;
+  vector<CandidateHeader> BestCandidateHeaderRefsForIncluder(
+      const vector<MappedInclude>&, const string& including_filepath) const;
 
   // From symbols to includes.
   IncludeMap symbol_include_map_;
@@ -282,6 +314,10 @@ class IncludePicker {
   // they were written in the source, when possible.
   map<pair<string, string>, string>
       includer_and_includee_to_include_as_written_;
+
+  // Exact dotted-inline exports verified by the preprocessor. These remain
+  // distinct from the transitively closed general include mapping graph.
+  set<pair<string, string>> verified_dotted_inline_exports_;
 
   // Maps from a quoted filepath pattern to the set of files that used
   // a pragma declaring it as a friend.  That is, if foo/bar/x.h has a

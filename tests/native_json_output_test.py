@@ -73,6 +73,12 @@ def main():
     changed_records = records(first)
     assert first.stdout == second.stdout
     changed = by_path(changed_records, "tests/cxx/ctad.cc")
+    ordinary_add = next(op for op in changed["operations"]
+                        if op["subject_action"] == "add")
+    assert ordinary_add["provider"]["selected"] == {
+        "status": "unavailable", "value": None}
+    assert ordinary_add["provider"]["candidates"] == {
+        "status": "unavailable", "value": None}
     assert changed["status"] == "changes"
     assert changed["invocation"]["index"] == 0
     assert changed["invocation"]["id"].startswith("inv-000000-")
@@ -461,7 +467,144 @@ def main():
     assert probe_result.returncode == 0, probe_result.stderr
     probe_records = records(probe_result)
     probe_header = by_path(probe_records, "probe-inl.hpp")
+
+    # Verified dotted-inline consolidation exposes the actual pair-plus-sole
+    # candidate union. Endpoint paths are anchored while include spelling is
+    # retained for the includer.
+    provider_result = run(
+        "tests/native_json/assoc003_provider.cc", "--output_format=json")
+    assert provider_result.returncode == 0, provider_result.stderr
+    provider_record = by_path(records(provider_result),
+                              "assoc003_provider.cc")
+    provider_add = next(
+        op for op in provider_record["operations"]
+        if op["subject_action"] == "add" and op["item_kind"] == "include")
+    pair_plain_path = str(
+        (ROOT / "tests/cxx/assoc003_pair_provider.hpp").resolve()).replace(
+            os.sep, "/")
+    pair_inline_path = str(
+        (ROOT / "tests/cxx/assoc003_pair_provider.inline.hpp").resolve()
+    ).replace(os.sep, "/")
+    pair_plain_ref = {
+        "path": pair_plain_path,
+        "spelling": '"tests/cxx/assoc003_pair_provider.hpp"',
+    }
+    pair_inline_ref = {
+        "path": pair_inline_path,
+        "spelling": '"tests/cxx/assoc003_pair_provider.inline.hpp"',
+    }
+    assert provider_add["provider"] == {
+        "selected": {"status": "known", "value": pair_inline_ref},
+        "candidates": {
+            "status": "known",
+            "value": [pair_plain_ref, pair_inline_ref],
+        },
+        "chain": {"status": "unavailable", "value": None},
+    }
+    provider_remove = next(
+        op for op in provider_record["operations"]
+        if op["subject_action"] == "remove")
+    assert all(value == {"status": "not_applicable", "value": None}
+               for value in provider_remove["provider"].values())
+
+    relative_provider_result = run(
+        "tests/native_json/association_a/../assoc003_provider.cc",
+        "--output_format=json")
+    assert relative_provider_result.returncode == 0, (
+        relative_provider_result.stderr)
+    relative_provider = by_path(
+        records(relative_provider_result), "assoc003_provider.cc")
+    relative_add = next(
+        op for op in relative_provider["operations"]
+        if op["subject_action"] == "add" and op["item_kind"] == "include")
+    assert relative_add["provider"] == provider_add["provider"]
     assert probe_header["file"]["kind"] == "inline_header"
+
+    sole_result = run(
+        "tests/native_json/assoc003_provider_sole.cc", "--output_format=json")
+    assert sole_result.returncode == 0, sole_result.stderr
+    sole_record = by_path(records(sole_result), "assoc003_provider_sole.cc")
+    sole_add = next(op for op in sole_record["operations"]
+                    if op["subject_action"] == "add")
+    assert sole_add["provider"]["selected"] == {
+        "status": "known", "value": pair_inline_ref}
+    assert sole_add["provider"]["candidates"] == {
+        "status": "known", "value": [pair_inline_ref]}
+
+    extra_result = run(
+        "tests/native_json/assoc003_provider_extra.cc", "--output_format=json")
+    assert extra_result.returncode == 0, extra_result.stderr
+    extra_record = by_path(records(extra_result), "assoc003_provider_extra.cc")
+    extra_add = next(op for op in extra_record["operations"]
+                     if op["subject_action"] == "add")
+    extra_ref = {
+        "path": str((ROOT / "tests/native_json/assoc003_extra_provider.hpp")
+                    .resolve()).replace(os.sep, "/"),
+        "spelling": '"tests/native_json/assoc003_extra_provider.hpp"',
+    }
+    assert extra_add["provider"]["selected"] == {
+        "status": "known", "value": pair_inline_ref}
+    assert extra_add["provider"]["candidates"] == {
+        "status": "known",
+        "value": sorted([pair_plain_ref, pair_inline_ref, extra_ref],
+                        key=lambda ref: (ref["path"], ref["spelling"])),
+    }
+
+    unresolved_result = run(
+        "tests/native_json/assoc003_provider_unresolved.cc",
+        "--output_format=json",
+        "--mapping_file=tests/native_json/assoc003_unresolved.imp")
+    assert unresolved_result.returncode == 0, unresolved_result.stderr
+    unresolved_record = by_path(
+        records(unresolved_result), "assoc003_provider_unresolved.cc")
+    unresolved_add = next(op for op in unresolved_record["operations"]
+                          if op["subject_action"] == "add")
+    assert unresolved_add["provider"]["selected"] == {
+        "status": "known", "value": pair_inline_ref}
+    assert unresolved_add["provider"]["candidates"] == {
+        "status": "unavailable", "value": None}
+
+    disagreement_result = subprocess.run(
+        [str(IWYU), "-Xiwyu", "--output_format=json", "-I", ".",
+         "-I", "tests/native_json/assoc003_disagree_a",
+         "-I", "tests/native_json/assoc003_disagree_b", "-std=c++17",
+         "tests/native_json/assoc003_provider_disagreement.cc"],
+        cwd=ROOT, text=True, capture_output=True)
+    assert disagreement_result.returncode == 0, disagreement_result.stderr
+    disagreement_record = by_path(
+        records(disagreement_result), "assoc003_provider_disagreement.cc")
+    disagreement_add = next(op for op in disagreement_record["operations"]
+                            if op["subject_action"] == "add")
+    assert disagreement_add["provider"]["selected"] == {
+        "status": "unavailable", "value": None}
+    assert disagreement_add["provider"]["candidates"] == {
+        "status": "unavailable", "value": None}
+
+    pch_result = run("tests/native_json/assoc003_pch_pair.cc",
+                     "--output_format=json", "--pch_in_code")
+    assert pch_result.returncode == 0, pch_result.stderr
+    pch_record = by_path(records(pch_result), "assoc003_pch_pair.cc")
+    pch_desired = {item["spelling"]
+                   for item in pch_record["desired_state"]["items"]}
+    assert '#include "tests/native_json/assoc003_pch_pair.hpp"' in pch_desired
+    assert ('#include "tests/native_json/assoc003_pch_pair.inline.hpp"'
+            in pch_desired)
+    assert not any(op["spelling"] ==
+                   '#include "tests/native_json/assoc003_pch_pair.hpp"'
+                   for op in pch_record["operations"])
+
+    mapped_negative_result = run(
+        "tests/native_json/assoc003_mapped_negative.cc",
+        "--output_format=json",
+        "--mapping_file=tests/native_json/assoc003_mapped_negative.imp")
+    assert mapped_negative_result.returncode == 0, (
+        mapped_negative_result.stderr)
+    mapped_negative = by_path(
+        records(mapped_negative_result), "assoc003_mapped_negative.cc")
+    mapped_desired = {item["spelling"]
+                      for item in mapped_negative["desired_state"]["items"]}
+    assert ('#include "tests/native_json/assoc003_mapped_negative.hpp"'
+            in mapped_desired)
     probe_source = by_path(probe_records, "probe.cc")
     assert any(
         association["path"].endswith("probe-inl.hpp") and

@@ -275,6 +275,7 @@ OneUse::OneUse(const NamedDecl* decl, SourceLocation use_loc,
       decl_filepath_(GetFilePath(decl_file_)),
       use_loc_(use_loc),
       use_kind_(use_kind),             // full use or fwd-declare use
+      synthetic_use_kind_(kNotSynthetic),
       use_flags_(flags),
       comment_(comment ? comment : ""),
       ignore_use_(false),
@@ -283,7 +284,8 @@ OneUse::OneUse(const NamedDecl* decl, SourceLocation use_loc,
 
 // This constructor always creates a full use.
 OneUse::OneUse(const string& symbol_name, const FileEntry* dfn_file,
-               const string& dfn_filepath, SourceLocation use_loc)
+               const string& dfn_filepath, SourceLocation use_loc,
+               SyntheticUseKind synthetic_use_kind)
     : symbol_name_(symbol_name),
       short_symbol_name_(symbol_name),
       decl_(nullptr),
@@ -291,6 +293,7 @@ OneUse::OneUse(const string& symbol_name, const FileEntry* dfn_file,
       decl_filepath_(dfn_filepath),
       use_loc_(use_loc),
       use_kind_(kFullUse),
+      synthetic_use_kind_(synthetic_use_kind),
       use_flags_(UF_None),
       ignore_use_(false),
       is_iwyu_violation_(false) {
@@ -325,13 +328,22 @@ void OneUse::SetPublicHeaders() {
   const IncludePicker& picker = GlobalIncludePicker();   // short alias
   const string use_path = GetFilePath(use_loc_);
   // If the symbol has a special mapping, use it, otherwise map its file.
-  public_headers_ = picker.GetCandidateHeadersForSymbolUsedFrom(
-      symbol_name_, use_path);
-  if (public_headers_.empty())
-    public_headers_ = picker.GetCandidateHeadersForFilepathIncludedFrom(
+  vector<CandidateHeader> candidates =
+      picker.GetCandidateHeaderRefsForSymbolUsedFrom(symbol_name_, use_path);
+  if (candidates.empty()) {
+    candidates = picker.GetCandidateHeaderRefsForFilepathIncludedFrom(
         decl_filepath(), use_path);
-  if (public_headers_.empty())
-    public_headers_.push_back(ConvertToQuotedInclude(decl_filepath()));
+  }
+  if (candidates.empty()) {
+    candidates.push_back({ConvertToQuotedInclude(decl_filepath()),
+                          NormalizeFilePath(MakeAbsolutePath(
+                              decl_filepath()))});
+  }
+  for (const CandidateHeader& candidate : candidates) {
+    public_headers_.push_back(candidate.spelling);
+    public_header_paths_.push_back(candidate.path);
+  }
+  CHECK_(public_headers_.size() == public_header_paths_.size());
 }
 
 const vector<string>& OneUse::public_headers() {
@@ -754,10 +766,11 @@ void IwyuFileInfo::ReportDefinedMacroUse(const clang::FileEntry* used_in) {
   macro_users_.insert(used_in);
 }
 
-void IwyuFileInfo::ReportIncludeFileUse(const clang::FileEntry* included_file,
-                                        const string& quoted_include) {
+void IwyuFileInfo::ReportIncludeFileUse(
+    const clang::FileEntry* included_file, const string& quoted_include,
+    OneUse::SyntheticUseKind synthetic_use_kind) {
   symbol_uses_.push_back(OneUse("", included_file, quoted_include,
-                                SourceLocation()));
+                                SourceLocation(), synthetic_use_kind));
   LogSymbolUse("Marked use of include-file", symbol_uses_.back());
 }
 
@@ -904,6 +917,7 @@ set<string> CalculateMinimalIncludes(
     const set<string>& associated_direct_includes,
     vector<OneUse>* uses) {
   set<string> desired_headers;
+  vector<const OneUse*> sole_candidate_uses;
 
   // TODO(csilvers): if a use's decl supports equivalent redecls
   // (such as a FunctionDecl or TypedefDecl), pick the redecl
@@ -935,8 +949,63 @@ set<string> CalculateMinimalIncludes(
     } else if (use.public_headers().size() == 1) {
       use.set_suggested_header(use.public_headers()[0]);
       desired_headers.insert(use.suggested_header());
+      sole_candidate_uses.push_back(&use);
       LogIncludeMapping("only candidate", use);
     }
+  }
+
+  // Consolidate a shared plain/inline provider only when a different use made
+  // the verified inline endpoint unavoidable in step 1. This pass runs before
+  // associated/direct priorities and does not alter any candidate list.
+  vector<IncludePicker::VerifiedDottedInlineExport> consolidated_exports;
+  for (OneUse& use : *uses) {
+    if (!use.NeedsSuggestedHeader())
+      continue;
+    IncludePicker::VerifiedDottedInlineExport inline_export;
+    if (!GlobalIncludePicker().GetVerifiedDottedInlineExport(
+            use.public_headers(), GetFilePath(use.use_loc()),
+            &inline_export)) {
+      continue;
+    }
+    const bool inline_endpoint_committed = std::any_of(
+        sole_candidate_uses.begin(), sole_candidate_uses.end(),
+        [&](const OneUse* sole_use) {
+          return sole_use != &use &&
+                 sole_use->computed_public_headers().size() == 1 &&
+                 sole_use->suggested_header() ==
+                     inline_export.inline_spelling &&
+                 NormalizeFilePath(MakeAbsolutePath(
+                     sole_use->decl_filepath())) == inline_export.inline_path;
+        });
+    if (inline_endpoint_committed) {
+      use.set_suggested_header(inline_export.inline_spelling);
+      desired_headers.insert(use.suggested_header());
+      consolidated_exports.push_back(inline_export);
+      LogIncludeMapping("verified dotted-inline provider already needed", use);
+    }
+  }
+
+  // Associated headers are represented by synthetic fixed uses. If the
+  // consolidation above chose an associated inline endpoint, fold its exact
+  // plain counterpart into that same provider instead of retaining both.
+  for (OneUse& use : *uses) {
+    if (!use.has_suggested_header() ||
+        use.synthetic_use_kind() != OneUse::kAssociatedHeaderSynthetic) {
+      continue;
+    }
+    for (const auto& inline_export : consolidated_exports) {
+      if (use.suggested_header() == inline_export.plain_spelling &&
+          ContainsKey(direct_includes, inline_export.plain_spelling) &&
+          ContainsKey(direct_includes, inline_export.inline_spelling)) {
+        use.set_suggested_header(inline_export.inline_spelling);
+        break;
+      }
+    }
+  }
+  desired_headers.clear();
+  for (const OneUse& use : *uses) {
+    if (!use.ignore_use() && use.is_full_use() && use.has_suggested_header())
+      desired_headers.insert(use.suggested_header());
   }
 
   // Steps (2): Go through the needed private-includes that map to
@@ -1754,7 +1823,8 @@ void IwyuFileInfo::CalculateIwyuViolations(vector<OneUse>* uses) {
   // (C1) Compute the direct includes of 'associated' files.
   set<string> associated_direct_includes;
   for (const IwyuFileInfo* associated : associated_headers_) {
-    ReportIncludeFileUse(associated->file_, associated->quoted_file_);
+    ReportIncludeFileUse(associated->file_, associated->quoted_file_,
+                         OneUse::kAssociatedHeaderSynthetic);
     InsertAllInto(associated->direct_includes(), &associated_direct_includes);
   }
   // The 'effective' direct includes are defined to be the current
@@ -2618,6 +2688,103 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
     }
     return symbols;
   };
+
+  const auto operation_provider = [&](const OperationRef& operation) {
+    llvm::json::Object provider;
+    if (operation.subject_action != "add" ||
+        operation.item_kind != "include") {
+      provider["selected"] = NotApplicableValue();
+      provider["candidates"] = NotApplicableValue();
+      provider["chain"] = NotApplicableValue();
+      return provider;
+    }
+
+    provider["selected"] = UnavailableValue();
+    provider["candidates"] = UnavailableValue();
+    provider["chain"] = UnavailableValue();
+
+    vector<const OneUse*> motivating_uses;
+    for (const OneUse& use : symbol_uses_) {
+      if (!use.ignore_use() && use.is_full_use() &&
+          use.has_suggested_header() &&
+          use.suggested_header() == operation.line->quoted_include()) {
+        motivating_uses.push_back(&use);
+      }
+    }
+    if (motivating_uses.empty())
+      return provider;
+
+    struct ProviderRef {
+      string path;
+      string spelling;
+    };
+    const auto ref_less = [](const ProviderRef& lhs, const ProviderRef& rhs) {
+      return std::tie(lhs.path, lhs.spelling) <
+             std::tie(rhs.path, rhs.spelling);
+    };
+    const auto ref_equal = [](const ProviderRef& lhs, const ProviderRef& rhs) {
+      return lhs.path == rhs.path && lhs.spelling == rhs.spelling;
+    };
+
+    vector<ProviderRef> refs;
+    set<string> selected_paths;
+    map<string, string> path_by_spelling;
+    bool candidates_available = true;
+    bool saw_candidate = false;
+    for (const OneUse* use : motivating_uses) {
+      const vector<string>& spellings = use->computed_public_headers();
+      const vector<string>& paths = use->computed_public_header_paths();
+      if (spellings.size() != paths.size()) {
+        candidates_available = false;
+        continue;
+      }
+      for (size_t index = 0; index < spellings.size(); ++index) {
+        saw_candidate = true;
+        if (paths[index].empty()) {
+          candidates_available = false;
+          continue;
+        }
+        const ProviderRef ref = {
+            NormalizeFilePath(MakeAbsolutePath(paths[index])),
+            spellings[index]};
+        const auto existing = path_by_spelling.find(ref.spelling);
+        if (existing != path_by_spelling.end() &&
+            existing->second != ref.path) {
+          candidates_available = false;
+        } else {
+          path_by_spelling[ref.spelling] = ref.path;
+        }
+        refs.push_back(ref);
+        if (ref.spelling == operation.line->quoted_include())
+          selected_paths.insert(ref.path);
+      }
+    }
+
+    if (selected_paths.size() != 1 ||
+        !GlobalIncludePicker().IsVerifiedDottedInlineEndpoint(
+            *selected_paths.begin())) {
+      return provider;
+    }
+    provider["selected"] = llvm::json::Object{
+        {"status", "known"},
+        {"value", llvm::json::Object{
+            {"spelling", operation.line->quoted_include()},
+            {"path", *selected_paths.begin()}}}};
+
+    if (!saw_candidate || !candidates_available)
+      return provider;
+
+    std::sort(refs.begin(), refs.end(), ref_less);
+    refs.erase(std::unique(refs.begin(), refs.end(), ref_equal), refs.end());
+    llvm::json::Array candidates;
+    for (const ProviderRef& ref : refs) {
+      candidates.push_back(llvm::json::Object{
+          {"spelling", ref.spelling}, {"path", ref.path}});
+    }
+    provider["candidates"] = llvm::json::Object{
+        {"status", "known"}, {"value", std::move(candidates)}};
+    return provider;
+  };
   std::sort(operations.begin(), operations.end(),
             [&](const OperationRef& lhs, const OperationRef& rhs) {
               return operation_key(lhs) < operation_key(rhs);
@@ -2626,10 +2793,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
   llvm::json::Array operation_values;
   int operation_number = 1;
   for (const OperationRef& operation : operations) {
-    llvm::json::Object provider;
-    provider["selected"] = UnavailableValue();
-    provider["candidates"] = UnavailableValue();
-    provider["chain"] = UnavailableValue();
+    llvm::json::Object provider = operation_provider(operation);
 
     llvm::json::Object value;
     value["id"] = "op-" + to_string(operation_number++);
@@ -2874,9 +3038,28 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
 
   internal::CleanupPrefixHeaderIncludes(preprocessor_info_, &lines_);
 
+  set<string> printable_associated_includes = AssociatedQuotedIncludes();
+  for (const OneIncludeOrForwardDeclareLine& desired : lines_) {
+    if (!desired.IsIncludeLine() || !desired.is_desired())
+      continue;
+    for (const OneIncludeOrForwardDeclareLine& removed : lines_) {
+      if (!removed.IsIncludeLine() || removed.is_desired())
+        continue;
+      const vector<string> pair = {removed.quoted_include(),
+                                   desired.quoted_include()};
+      IncludePicker::VerifiedDottedInlineExport inline_export;
+      if (GlobalIncludePicker().GetVerifiedDottedInlineExport(
+              pair, GetFilePath(file_), &inline_export) &&
+          removed.quoted_include() == inline_export.plain_spelling &&
+          desired.quoted_include() == inline_export.inline_spelling) {
+        printable_associated_includes.erase(desired.quoted_include());
+      }
+    }
+  }
+
   string diff_output;
   size_t num_edits = internal::PrintableDiffs(
-      GetFilePath(file_), preprocessor_info_, AssociatedQuotedIncludes(),
+      GetFilePath(file_), preprocessor_info_, printable_associated_includes,
       lines_, &diff_output);
   if (GlobalFlags().output_format == CommandlineFlags::kTextOutput)
     errs() << diff_output;

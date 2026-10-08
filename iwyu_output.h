@@ -47,6 +47,11 @@ class IwyuPreprocessorInfo;
 class OneUse {
  public:
   enum UseKind { kFullUse, kForwardDeclareUse };
+  enum SyntheticUseKind {
+    kNotSynthetic,
+    kAssociatedHeaderSynthetic,
+    kProtectedIncludeSynthetic,
+  };
 
   OneUse(const clang::NamedDecl* decl,
          clang::SourceLocation use_loc,
@@ -62,7 +67,8 @@ class OneUse {
   OneUse(const string& symbol_name,
          const clang::FileEntry* dfn_file,
          const string& dfn_filepath,
-         clang::SourceLocation use_loc);
+         clang::SourceLocation use_loc,
+         SyntheticUseKind synthetic_use_kind = kNotSynthetic);
 
   const string& symbol_name() const {
     return symbol_name_;
@@ -84,6 +90,9 @@ class OneUse {
   }
   clang::SourceLocation decl_loc() const {
     return decl_loc_;
+  }
+  SyntheticUseKind synthetic_use_kind() const {
+    return synthetic_use_kind_;
   }
   bool is_full_use() const {
     return use_kind_ == kFullUse;
@@ -119,6 +128,12 @@ class OneUse {
 
   string PrintableUseLoc() const;
   const vector<string>& public_headers();  // not const because we fill lazily
+  const vector<string>& computed_public_headers() const {
+    return public_headers_;
+  }
+  const vector<string>& computed_public_header_paths() const {
+    return public_header_paths_;
+  }
   bool PublicHeadersContain(const string& elt);
   bool NeedsSuggestedHeader() const;    // not true for fwd-declare uses, e.g.
   int UseLinenum() const;
@@ -134,9 +149,11 @@ class OneUse {
   string decl_filepath_;           // filepath where the symbol lives
   clang::SourceLocation use_loc_;  // where the symbol is used from
   UseKind use_kind_;               // kFullUse or kForwardDeclareUse
+  SyntheticUseKind synthetic_use_kind_;  // why a non-symbol use was created
   UseFlags use_flags_;             // flags describing features of the use
   string comment_;                 // If not empty, append to clang warning msg
   vector<string> public_headers_;  // header to #include if dfn hdr is private
+  vector<string> public_header_paths_;  // aligned resolved path, or empty
   string suggested_header_;        // header that allows us to satisfy use
   bool ignore_use_;                // set to true if use is discarded
   bool is_iwyu_violation_;         // set to false when we figure out it's not
@@ -363,7 +380,8 @@ class IwyuFileInfo {
   // '#include this header file as-is, without any public-header mapping.'
   // Input is the include-line as desired: '<string.h>' or '"ads/foo.h"'.
   void ReportIncludeFileUse(const clang::FileEntry* included_file,
-                            const string& quoted_include);
+                            const string& quoted_include,
+                            OneUse::SyntheticUseKind synthetic_use_kind);
 
   // This is used when we see a file we want to keep not due to symbol-use
   // reasons.  For example, it can be #included with an "IWYU pragma: keep"
