@@ -206,6 +206,16 @@ def main():
     assert clean["desired_state"] == {
         "complete": True, "items": [], "status": "known"}
 
+    configured_result = run(
+        "tests/native_json/clean.cc", "--output_format=json",
+        "--configuration=fastdebug")
+    assert configured_result.returncode == 0, configured_result.stderr
+    configured = records(configured_result)[0]
+    assert configured["invocation"]["configuration"] == {
+        "status": "known", "value": "fastdebug"}
+    assert configured["analyzed_configurations"] == {
+        "status": "known", "value": ["fastdebug"]}
+
     # Symbol-motivated additions expose known OneUse facts without inventing
     # origin, condition, or macro provenance.
     add = next(op for op in changed["operations"]

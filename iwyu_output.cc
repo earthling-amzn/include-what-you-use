@@ -24,6 +24,7 @@
 #include "iwyu_location_util.h"
 #include "iwyu_path_util.h"
 #include "iwyu_preprocessor.h"
+#include "iwyu_project_policy.h"
 #include "iwyu_stl_util.h"
 #include "iwyu_string_util.h"
 #include "iwyu_verrs.h"
@@ -2481,28 +2482,6 @@ llvm::json::Object UnavailableDesiredState() {
                             {"complete", false}, {"items", nullptr}};
 }
 
-string StructuredFileKind(const string& path) {
-  if (IsInlineHeaderFile(path))
-    return "inline_header";
-
-  string lower = path;
-  std::transform(lower.begin(), lower.end(), lower.begin(),
-                 [](unsigned char c) { return std::tolower(c); });
-  static const char* const header_extensions[] = {
-      ".h", ".hh", ".hpp", ".hxx"};
-  static const char* const source_extensions[] = {
-      ".c", ".cc", ".cxx", ".cpp", ".c++", ".cp", ".m", ".mm"};
-  for (const char* extension : header_extensions) {
-    if (EndsWith(lower, extension))
-      return "header";
-  }
-  for (const char* extension : source_extensions) {
-    if (EndsWith(lower, extension))
-      return "source";
-  }
-  return "other";
-}
-
 }  // namespace
 
 string IwyuFileInfo::file_path() const {
@@ -2935,12 +2914,13 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
   invocation["id"] = flags.invocation_id;
   invocation["index"] = flags.invocation_index;
   invocation["translation_unit"] = flags.translation_unit;
-  invocation["configuration"] = UnavailableValue();
+  invocation["configuration"] = flags.has_configuration
+      ? KnownString(flags.configuration) : UnavailableValue();
   invocation["command_digest"] = flags.command_digest;
 
   llvm::json::Object file;
   file["path"] = file_path();
-  file["kind"] = StructuredFileKind(file_path());
+  file["kind"] = ProjectPolicyFileKind(file_path());
 
   llvm::json::Object desired_state;
   if (has_duplicate_occurrence) {
@@ -2967,7 +2947,14 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
                          ? "skipped"
                          : (has_applied_edit ? "changes" : "correct");
   record["associated_headers"] = std::move(associations);
-  record["analyzed_configurations"] = UnavailableValue();
+  if (flags.has_configuration) {
+    llvm::json::Array configurations;
+    configurations.push_back(flags.configuration);
+    record["analyzed_configurations"] = llvm::json::Object{
+        {"status", "known"}, {"value", std::move(configurations)}};
+  } else {
+    record["analyzed_configurations"] = UnavailableValue();
+  }
   record["operations"] = std::move(operation_values);
   record["desired_state"] = std::move(desired_state);
   record["diagnostics"] = std::move(diagnostics);

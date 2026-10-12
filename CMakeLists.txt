@@ -111,6 +111,7 @@ add_llvm_executable(include-what-you-use
   iwyu_output.cc
   iwyu_path_util.cc
   iwyu_preprocessor.cc
+  iwyu_project_policy.cc
   iwyu_regex.cc
   iwyu_verrs.cc
 )
@@ -258,6 +259,12 @@ if (Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   )
   set_tests_properties(output_schema_test PROPERTIES SKIP_RETURN_CODE 77)
+
+  add_test(NAME project_policy_test
+    COMMAND ${Python3_EXECUTABLE} tests/project_policy_test.py
+      $<TARGET_FILE:include-what-you-use>
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
 
   add_test(NAME iwyu_tool_json_output_test
     COMMAND ${Python3_EXECUTABLE} tests/iwyu_tool_json_output_test.py

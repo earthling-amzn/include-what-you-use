@@ -17,6 +17,7 @@
 #include <cstring>                      // for strlen
 #include <limits>                       // for numeric_limits
 #include <map>                          // for map
+#include <memory>                       // for unique_ptr
 #include <set>                          // for set
 #include <string>                       // for string, operator<, etc
 #include <utility>                      // for make_pair, pair
@@ -29,6 +30,7 @@
 #include "iwyu_location_util.h"
 #include "iwyu_path_util.h"
 #include "iwyu_port.h"  // for CHECK_, etc
+#include "iwyu_project_policy.h"
 #include "iwyu_regex.h"
 #include "iwyu_stl_util.h"
 #include "iwyu_string_util.h"
@@ -66,6 +68,7 @@ static clang::SourceManager* source_manager = nullptr;
 static ToolChain::CXXStdlibType cxx_stdlib_type =
     ToolChain::CXXStdlibType::CST_Libstdcxx;
 static IncludePicker* include_picker = nullptr;
+static std::unique_ptr<ProjectPolicy> project_policy;
 static const clang::LangOptions default_lang_options;
 static const clang::PrintingPolicy default_print_policy(default_lang_options);
 static SourceManagerCharacterDataGetter* data_getter = nullptr;
@@ -95,6 +98,10 @@ static void PrintHelp(const char* extra_msg) {
          "        This flag may be specified multiple times to specify\n"
          "        multiple glob patterns.\n"
          "   --mapping_file=<filename>: gives iwyu a mapping file.\n"
+         "   --project_policy=<filename>: loads one strict versioned YAML/JSON\n"
+         "        project policy file.\n"
+         "   --configuration=<name>: labels this analysis invocation for\n"
+         "        project-policy matching and structured output.\n"
          "   --no_default_mappings: do not add iwyu's default mappings.\n"
          "   --pch_in_code: mark the first include in a translation unit as a\n"
          "        precompiled header.  Use --pch_in_code to prevent IWYU from\n"
@@ -363,6 +370,22 @@ static void FinalizeStructuredOutputOptions(int clang_argc,
   flags.has_invocation_id = true;
 }
 
+static void LoadProjectPolicy() {
+  if (!commandline_flags->has_project_policy)
+    return;
+
+  string error;
+  std::unique_ptr<ProjectPolicy> loaded = ProjectPolicy::Load(
+      commandline_flags->project_policy_file, &error);
+  if (!loaded)
+    StructuredOutputError(error.c_str());
+  if (!loaded->ValidateRuntimeCapabilities(
+          commandline_flags->has_configuration, &error)) {
+    StructuredOutputError(error.c_str());
+  }
+  project_policy = std::move(loaded);
+}
+
 static bool RequestsStructuredOutput(int argc, char** argv) {
   const llvm::StringRef full_option("--output_format");
   for (int index = 1; index < argc; ++index) {
@@ -416,6 +439,7 @@ OptionsParser::OptionsParser(int argc, char** argv) {
   ParseInterceptedCommandlineFlags(intercepted_argc, intercepted_argv);
   ParseIwyuCommandlineFlags(iwyu_argc, iwyu_argv);
   FinalizeStructuredOutputOptions(clang_argc_, clang_argv_);
+  LoadProjectPolicy();
 
   delete [] iwyu_argv;
   delete [] intercepted_argv;
@@ -446,7 +470,9 @@ CommandlineFlags::CommandlineFlags()
       has_invocation_index(false),
       has_command_digest(false),
       has_translation_unit(false),
-      has_invocation_id(false) {
+      has_invocation_id(false),
+      has_project_policy(false),
+      has_configuration(false) {
   // Always keep Qt .moc includes; its moc compiler does its own IWYU analysis.
   keep.emplace("*.moc");
 }
@@ -458,6 +484,8 @@ int CommandlineFlags::ParseArgv(int argc, char** argv) {
     kInvocationId,
     kCommandDigest,
     kTranslationUnit,
+    kProjectPolicy,
+    kConfiguration,
   };
   static const struct option longopts[] = {
     {"check_also", required_argument, nullptr, 'c'},  // can be specified >once
@@ -485,6 +513,8 @@ int CommandlineFlags::ParseArgv(int argc, char** argv) {
     {"invocation_id", required_argument, nullptr, kInvocationId},
     {"command_digest", required_argument, nullptr, kCommandDigest},
     {"translation_unit", required_argument, nullptr, kTranslationUnit},
+    {"project_policy", required_argument, nullptr, kProjectPolicy},
+    {"configuration", required_argument, nullptr, kConfiguration},
     {nullptr, 0, nullptr, 0}
   };
   static const char shortopts[] = "v:c:m:d:nr";
@@ -613,6 +643,20 @@ int CommandlineFlags::ParseArgv(int argc, char** argv) {
         }
         translation_unit = optarg;
         has_translation_unit = true;
+        break;
+      case kProjectPolicy:
+        if (has_project_policy || !optarg || !*optarg) {
+          StructuredOutputError("invalid or repeated --project_policy.");
+        }
+        project_policy_file = optarg;
+        has_project_policy = true;
+        break;
+      case kConfiguration:
+        if (has_configuration || !optarg || !*optarg) {
+          StructuredOutputError("invalid or repeated --configuration.");
+        }
+        configuration = optarg;
+        has_configuration = true;
         break;
       case -1:
         return optind;  // means 'no more input'
@@ -807,6 +851,10 @@ const IncludePicker& GlobalIncludePicker() {
 IncludePicker* MutableGlobalIncludePicker() {
   CHECK_(include_picker && "Must call InitGlobals() before calling this");
   return include_picker;
+}
+
+const ProjectPolicy* GlobalProjectPolicy() {
+  return project_policy.get();
 }
 
 const clang::PrintingPolicy& DefaultPrintPolicy() {

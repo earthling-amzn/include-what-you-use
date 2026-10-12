@@ -36,6 +36,7 @@ using std::vector;
 enum class RegexDialect;
 class FullUseCache;
 class IncludePicker;
+class ProjectPolicy;
 class SourceManagerCharacterDataGetter;
 
 // To set up the global state you need to parse options with OptionsParser when
@@ -133,6 +134,10 @@ struct CommandlineFlags {
   bool has_command_digest;
   bool has_translation_unit;
   bool has_invocation_id;
+  string project_policy_file;
+  string configuration;
+  bool has_project_policy;
+  bool has_configuration;
 };
 
 const CommandlineFlags& GlobalFlags();
@@ -143,6 +148,8 @@ clang::SourceManager* GlobalSourceManager();
 
 const IncludePicker& GlobalIncludePicker();
 IncludePicker* MutableGlobalIncludePicker();   // only use at great need!
+
+const ProjectPolicy* GlobalProjectPolicy();
 
 const clang::PrintingPolicy& DefaultPrintPolicy();
 
