@@ -32,6 +32,19 @@ def run(source, *iwyu_args):
     return subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
 
 
+def run_with_temporary_policy(source, policy_text, *iwyu_args):
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", dir=ROOT,
+                                     delete=False) as stream:
+        stream.write(policy_text)
+        policy_path = Path(stream.name).resolve()
+    try:
+        result = run(source, "--output_format=json",
+                     "--project_policy=" + str(policy_path), *iwyu_args)
+        return result, str(policy_path).replace(os.sep, "/")
+    finally:
+        policy_path.unlink()
+
+
 def records(result):
     parsed = []
     for line in result.stdout.splitlines():
@@ -745,6 +758,234 @@ def main():
     assert invalid.returncode != 0
     assert invalid.stdout == ""
     assert "does not match" in invalid.stderr
+
+    # A contextual project policy suppresses only the matching add, retains the
+    # analyzer evidence, and identifies the first matching rule.
+    policy_path = str((ROOT / "tests/native_json/policy002.yaml").resolve())
+    project_policy_arg = "--project_policy=" + policy_path
+    baseline_plain = run(
+        "tests/native_json/policy002_plain.hpp", "--output_format=json")
+    baseline_plain_record = records(baseline_plain)[0]
+    baseline_inline_add = next(
+        op for op in baseline_plain_record["operations"]
+        if op["subject_action"] == "add" and
+        "policy002_provider.inline.hpp" in op["spelling"])
+    assert baseline_inline_add["disposition"] == "apply"
+
+    plain_before = (ROOT / "tests/native_json/policy002_plain.hpp").read_bytes()
+    denied_first = run(
+        "tests/native_json/policy002_plain.hpp", "--output_format=json",
+        project_policy_arg, "--configuration=policy002")
+    denied_second = run(
+        "tests/native_json/policy002_plain.hpp", "--output_format=json",
+        project_policy_arg, "--configuration=policy002")
+    assert denied_first.returncode == denied_second.returncode == 0, (
+        denied_first.stderr + denied_second.stderr)
+    assert denied_first.stdout == denied_second.stdout
+    assert (ROOT / "tests/native_json/policy002_plain.hpp").read_bytes() == (
+        plain_before)
+    denied = records(denied_first)[0]
+    denied_add = next(
+        op for op in denied["operations"]
+        if op["subject_action"] == "add" and
+        "policy002_provider.inline.hpp" in op["spelling"])
+    assert (denied_add["disposition"], denied_add["reason_code"]) == (
+        "suppress", "project_policy_deny_add")
+    assert denied_add["policy"] == {
+        "status": "known",
+        "value": {
+            "policy_file": policy_path.replace(os.sep, "/"),
+            "rule_id": "policy002-first-inline-denial",
+            "decision": "deny",
+        },
+    }
+    assert denied_add["symbols"] == baseline_inline_add["symbols"]
+    assert denied_add["provider"] == baseline_inline_add["provider"]
+    assert "policy002_provider.inline.hpp" not in {
+        item["spelling"] for item in denied["desired_state"]["items"]}
+    assert denied["status"] == "correct"
+    policy_diagnostics = [
+        diagnostic for diagnostic in denied["diagnostics"]
+        if diagnostic["code"] == "project_policy_deny_add"]
+    assert len(policy_diagnostics) == 1
+    assert "policy002-first-inline-denial" in policy_diagnostics[0]["message"]
+    assert policy_path.replace(os.sep, "/") in policy_diagnostics[0]["message"]
+
+    denied_error = run(
+        "tests/native_json/policy002_plain.hpp", "--output_format=json",
+        project_policy_arg, "--configuration=policy002", "--error=7")
+    assert denied_error.returncode == 7, denied_error.stderr
+    records(denied_error)
+
+    baseline_text = run("tests/native_json/policy002_plain.hpp")
+    assert baseline_text.returncode == 0 and baseline_text.stdout == ""
+    text_denied = run(
+        "tests/native_json/policy002_plain.hpp", project_policy_arg,
+        "--configuration=policy002")
+    assert text_denied.returncode == 0
+    assert text_denied.stdout == ""
+    assert "project_policy_deny_add" in text_denied.stderr
+    assert "policy002-first-inline-denial" in text_denied.stderr
+    assert "should add these lines:\n#include" not in text_denied.stderr
+    baseline_fixer = subprocess.run(
+        [sys.executable, str(ROOT / "fix_includes.py"), "--dry_run"],
+        cwd=ROOT, text=True, input=baseline_text.stderr, capture_output=True)
+    denied_fixer = subprocess.run(
+        [sys.executable, str(ROOT / "fix_includes.py"), "--dry_run"],
+        cwd=ROOT, text=True, input=text_denied.stderr, capture_output=True)
+    assert baseline_fixer.returncode == denied_fixer.returncode == 0
+    assert "IWYU edited 1 files" in baseline_fixer.stdout
+    assert "policy002_provider.inline.hpp" in baseline_fixer.stdout
+    assert "IWYU edited 0 files" in denied_fixer.stdout
+    assert (ROOT / "tests/native_json/policy002_plain.hpp").read_bytes() == (
+        plain_before)
+
+    # The same provider remains an applied addition in source and inline-header
+    # contexts because the data-only policy does not match those file kinds.
+    for allowed_source, expected_kind in (
+            ("tests/native_json/policy002_source.cc", "source"),
+            ("tests/native_json/policy002_consumer.inline.hpp",
+             "inline_header")):
+        allowed_result = run(
+            allowed_source, "--output_format=json", project_policy_arg,
+            "--configuration=policy002")
+        assert allowed_result.returncode == 0, allowed_result.stderr
+        allowed = records(allowed_result)[0]
+        assert allowed["file"]["kind"] == expected_kind
+        allowed_add = next(
+            op for op in allowed["operations"]
+            if op["subject_action"] == "add" and
+            "policy002_provider.inline.hpp" in op["spelling"])
+        assert allowed_add["disposition"] == "apply"
+        assert allowed_add["policy"]["status"] == "unavailable"
+
+    def temporary_add(policy_text, *args):
+        result, temporary_path = run_with_temporary_policy(
+            "tests/native_json/policy002_plain.hpp", policy_text, *args)
+        assert result.returncode == 0, result.stderr
+        record = records(result)[0]
+        operation = next(
+            op for op in record["operations"]
+            if op["subject_action"] == "add" and
+            "policy002_provider.inline.hpp" in op["spelling"])
+        return operation, temporary_path
+
+    partial_regex, _ = temporary_add(
+        """schema_version: 1
+rules:
+  - id: partial-regex-must-not-search
+    action: deny_add
+    match: { includer: { regex: "policy002_plain[.]hpp" } }
+""")
+    assert partial_regex["disposition"] == "apply"
+
+    wrong_case, _ = temporary_add(
+        """schema_version: 1
+rules:
+  - id: matching-is-case-sensitive
+    action: deny_add
+    match: { includee: { glob: "*POLICY002_provider.inline.hpp" } }
+""")
+    assert wrong_case["disposition"] == "apply"
+
+    glob_match, glob_path = temporary_add(
+        """schema_version: 1
+rules:
+  - id: glob-crosses-slash-and-supports-classes
+    action: deny_add
+    match:
+      includer: { glob: "tests*[n]ative_json/policy002_plain.hp?" }
+      includee: { glob: "tests/native_json/policy002_provider.inline.hp?" }
+""")
+    assert glob_match["disposition"] == "suppress"
+    assert glob_match["policy"]["value"] == {
+        "policy_file": glob_path,
+        "rule_id": "glob-crosses-slash-and-supports-classes",
+        "decision": "deny",
+    }
+
+    symbol_mismatch, _ = temporary_add(
+        """schema_version: 1
+rules:
+  - id: symbol-mismatch
+    action: deny_add
+    match: { symbol: DifferentSymbol }
+""")
+    assert symbol_mismatch["disposition"] == "apply"
+
+    configuration_mismatch, _ = temporary_add(
+        """schema_version: 1
+rules:
+  - id: configuration-mismatch
+    action: deny_add
+    match: { configuration: other }
+""", "--configuration=policy002")
+    assert configuration_mismatch["disposition"] == "apply"
+
+    file_kind_policy = """schema_version: 1
+rules:
+  - id: header-kind-only
+    action: deny_add
+    match:
+      includee: { glob: "*policy002_provider.inline.hpp" }
+      file_kind: header
+"""
+    header_kind_add, _ = temporary_add(file_kind_policy)
+    assert header_kind_add["disposition"] == "suppress"
+    for nonheader_source in (
+            "tests/native_json/policy002_source.cc",
+            "tests/native_json/policy002_consumer.inline.hpp"):
+        kind_result, _ = run_with_temporary_policy(
+            nonheader_source, file_kind_policy)
+        assert kind_result.returncode == 0, kind_result.stderr
+        kind_record = records(kind_result)[0]
+        kind_add = next(
+            op for op in kind_record["operations"]
+            if op["subject_action"] == "add" and
+            "policy002_provider.inline.hpp" in op["spelling"])
+        assert kind_add["disposition"] == "apply"
+
+    precedence_policy = """schema_version: 1
+rules:
+  - id: broad-denial-must-not-replace-stronger-decisions
+    action: deny_add
+    match: { includee: { glob: "*" } }
+"""
+    pragma_result, _ = run_with_temporary_policy(
+        "tests/native_json/no_include.cc", precedence_policy)
+    assert pragma_result.returncode == 0, pragma_result.stderr
+    pragma_record = records(pragma_result)[0]
+    pragma_operation = next(
+        op for op in pragma_record["operations"]
+        if op["reason_code"] == "pragma_no_include")
+    assert pragma_operation["disposition"] == "suppress"
+    assert pragma_operation["policy"]["status"] == "unavailable"
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", dir=ROOT,
+                                     delete=False) as stream:
+        stream.write(precedence_policy)
+        precedence_path = Path(stream.name).resolve()
+    try:
+        prefix_policy_result = subprocess.run(
+            [str(IWYU), "-Xiwyu", "--output_format=json", "-Xiwyu",
+             "--project_policy=" + str(precedence_path), "-Xiwyu",
+             "--prefix_header_includes=remove", "-include",
+             "tests/cxx/prefix_header_includes-d1.h", "-include",
+             "tests/cxx/prefix_header_includes-d2.h", "-include",
+             "tests/cxx/prefix_header_includes-d3.h", "-include",
+             "tests/cxx/prefix_header_includes-d4.h", "-I", ".",
+             "-std=c++17", "tests/cxx/prefix_header_includes_remove.cc"],
+            cwd=ROOT, text=True, capture_output=True)
+    finally:
+        precedence_path.unlink()
+    assert prefix_policy_result.returncode == 0, prefix_policy_result.stderr
+    prefix_policy_record = by_path(
+        records(prefix_policy_result), "prefix_header_includes_remove.cc")
+    prefix_suppression = next(
+        op for op in prefix_policy_record["operations"]
+        if op["reason_code"] == "prefix_header_add_suppressed")
+    assert prefix_suppression["disposition"] == "suppress"
+    assert prefix_suppression["policy"]["status"] == "unavailable"
 
 
 if __name__ == "__main__":

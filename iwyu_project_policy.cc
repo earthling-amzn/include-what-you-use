@@ -595,14 +595,25 @@ std::unique_ptr<ProjectPolicy> ProjectPolicy::Load(const string& path,
   return result;
 }
 
-bool ProjectPolicy::ValidateRuntimeCapabilities(bool /*has_configuration*/,
+bool ProjectPolicy::ValidateRuntimeCapabilities(bool has_configuration,
                                                 string* error) const {
   for (size_t index = 0; index < rules_.size(); ++index) {
     const Rule& rule = *rules_[index];
     const string context = "rule " + std::to_string(index + 1) +
                            " ('" + rule.id + "')";
-    return Fail(path_, context, "action '" + ActionName(rule.action) +
-                "' is recognized but not enabled in this phase", error);
+    if (rule.action != ProjectPolicyAction::DenyAdd) {
+      return Fail(path_, context, "action '" + ActionName(rule.action) +
+                  "' is recognized but not enabled in this phase", error);
+    }
+    if (rule.active_condition) {
+      return Fail(path_, context,
+                  "active_condition is recognized but unavailable in this phase",
+                  error);
+    }
+    if (rule.configuration && !has_configuration) {
+      return Fail(path_, context,
+                  "configuration matching requires --configuration", error);
+    }
   }
   return true;
 }

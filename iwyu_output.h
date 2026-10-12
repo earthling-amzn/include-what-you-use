@@ -250,6 +250,18 @@ class OneIncludeOrForwardDeclareLine {
     decision_reason_code_ = reason_code;
     decision_reason_ = reason;
   }
+  void SetProjectPolicyDecision(const string& subject_action,
+                                const string& disposition,
+                                const string& reason_code,
+                                const string& reason,
+                                const string& policy_file,
+                                const string& rule_id,
+                                const string& policy_decision) {
+    SetStructuredDecision(subject_action, disposition, reason_code, reason);
+    decision_policy_file_ = policy_file;
+    decision_policy_rule_id_ = rule_id;
+    decision_policy_decision_ = policy_decision;
+  }
   bool has_structured_decision() const {
     return !decision_subject_action_.empty();
   }
@@ -259,6 +271,16 @@ class OneIncludeOrForwardDeclareLine {
   const string& decision_disposition() const { return decision_disposition_; }
   const string& decision_reason_code() const { return decision_reason_code_; }
   const string& decision_reason() const { return decision_reason_; }
+  bool has_project_policy_decision() const {
+    return !decision_policy_file_.empty();
+  }
+  const string& decision_policy_file() const { return decision_policy_file_; }
+  const string& decision_policy_rule_id() const {
+    return decision_policy_rule_id_;
+  }
+  const string& decision_policy_decision() const {
+    return decision_policy_decision_;
+  }
 
   bool LineNumbersMatch(const OneIncludeOrForwardDeclareLine& that) const {
     return (this->start_linenum_ == that.start_linenum_ &&
@@ -287,6 +309,9 @@ class OneIncludeOrForwardDeclareLine {
   string decision_disposition_;
   string decision_reason_code_;
   string decision_reason_;
+  string decision_policy_file_;
+  string decision_policy_rule_id_;
+  string decision_policy_decision_;
 };
 
 // This class holds IWYU information about a single file (FileEntry)

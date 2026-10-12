@@ -71,7 +71,7 @@ def main():
     expect_ok('{"schema_version":1,"rules":[]}\n')
 
     # Every currently evaluable match dimension parses transactionally.
-    expect_error(
+    expect_ok(
         """schema_version: 1
 rules:
   - id: every-supported-dimension
@@ -83,7 +83,6 @@ rules:
       symbol: "project::Type"
       configuration: fastdebug
 """,
-        "action 'deny_add' is recognized but not enabled",
         "--configuration=fastdebug")
 
     # Closed schemas reject unknown and duplicate keys at every level.
@@ -151,8 +150,7 @@ rules:
         expect_error(policy(f"symbol: {numeric}"),
                      "'symbol' must be a string scalar")
     for plain_string in ("inf", "Inf", "NAN", "+0o7", "-0x10"):
-        expect_error(policy(f"symbol: {plain_string}"),
-                     "action 'deny_add' is recognized but not enabled")
+        expect_ok(policy(f"symbol: {plain_string}"))
     expect_error(
         '{"schema_version":1,"rules":[{"id":"json-typed",'
         '"action":"deny_add","match":{"symbol":42}}]}',
@@ -168,13 +166,13 @@ rules:
     action: deny_add
     match: { file_kind: header }
 """, "'id' must be a string scalar")
-    expect_error(
+    expect_ok(
         """schema_version: 1
 rules:
   - id: "null"
     action: deny_add
     match: { symbol: "42" }
-""", "action 'deny_add' is recognized but not enabled")
+""")
     expect_error(
         'schema_version: 1\nrules:\n  - id: decoded-nul\n'
         '    action: deny_add\n    match: { symbol: "before\\0after" }\n',
@@ -235,10 +233,14 @@ rules: []
 
     # Recognized future actions and unavailable facts fail as capabilities,
     # rather than being ignored or misreported as syntax errors.
-    for action in ("deny_add", "deny_remove", "keep", "associate", "export",
+    for action in ("deny_remove", "keep", "associate", "export",
                    "prefer_provider", "report_only"):
         expect_error(policy(action=action),
                      f"action '{action}' is recognized but not enabled")
+    expect_error(policy("active_condition: 'defined(FEATURE)'"),
+                 "active_condition is recognized but unavailable")
+    expect_error(policy("configuration: fastdebug"),
+                 "requires --configuration")
 
     # File and option errors are fatal before analysis and never frame JSON.
     missing = invoke(ROOT / "tests" / "does-not-exist-policy.yaml")

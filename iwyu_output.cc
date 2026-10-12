@@ -2788,7 +2788,16 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
     value["symbols"] = operation_symbols(operation);
     value["provider"] = std::move(provider);
     value["edit_condition"] = UnavailableValue();
-    value["policy"] = UnavailableValue();
+    if (operation.line->has_project_policy_decision()) {
+      value["policy"] = llvm::json::Object{
+          {"status", "known"},
+          {"value", llvm::json::Object{
+              {"policy_file", operation.line->decision_policy_file()},
+              {"rule_id", operation.line->decision_policy_rule_id()},
+              {"decision", operation.line->decision_policy_decision()}}}};
+    } else {
+      value["policy"] = UnavailableValue();
+    }
     value["multi_config"] = UnavailableValue();
     operation_values.push_back(std::move(value));
   }
@@ -3025,6 +3034,69 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
 
   internal::CleanupPrefixHeaderIncludes(preprocessor_info_, &lines_);
 
+  size_t project_policy_violations = 0;
+  const ProjectPolicy* project_policy = GlobalProjectPolicy();
+  if (project_policy) {
+    for (OneIncludeOrForwardDeclareLine& line : lines_) {
+      if (!line.IsIncludeLine() || line.is_present() || !line.is_desired() ||
+          line.has_structured_decision()) {
+        continue;
+      }
+
+      string includee = line.quoted_include();
+      if (includee.size() >= 2 &&
+          ((includee.front() == '"' && includee.back() == '"') ||
+           (includee.front() == '<' && includee.back() == '>'))) {
+        includee = includee.substr(1, includee.size() - 2);
+      }
+      includee = NormalizeFilePath(includee);
+
+      ProjectPolicyMatchContext context;
+      context.includer = file_path();
+      context.includee = includee;
+      context.file_kind = ProjectPolicyFileKind(context.includer);
+      if (GlobalFlags().has_configuration)
+        context.configuration = GlobalFlags().configuration;
+
+      SourceLocation diagnostic_location;
+      for (const OneUse& use : symbol_uses_) {
+        if (use.ignore_use() || !use.is_full_use() ||
+            !use.has_suggested_header() ||
+            use.suggested_header() != line.quoted_include()) {
+          continue;
+        }
+        context.symbols.push_back(use.symbol_name());
+        if (diagnostic_location.isInvalid())
+          diagnostic_location = use.use_loc();
+      }
+      std::sort(context.symbols.begin(), context.symbols.end());
+      context.symbols.erase(
+          std::unique(context.symbols.begin(), context.symbols.end()),
+          context.symbols.end());
+
+      const std::optional<ProjectPolicyDecision> decision =
+          project_policy->FirstMatchingRule(ProjectPolicyAction::DenyAdd,
+                                            context);
+      if (!decision)
+        continue;
+
+      const string reason = "Project policy '" + decision->policy_file +
+          "' rule '" + decision->rule_id + "' denies adding " +
+          line.quoted_include() + " to " + context.includer + ".";
+      line.SetProjectPolicyDecision(
+          "add", "suppress", "project_policy_deny_add", reason,
+          decision->policy_file, decision->rule_id, "deny");
+      line.clear_desired();
+      AddStructuredDiagnostic(diagnostic_location,
+                              "project_policy_deny_add", reason);
+      if (GlobalFlags().output_format == CommandlineFlags::kTextOutput) {
+        errs() << context.includer
+               << ": warning: project_policy_deny_add: " << reason << '\n';
+      }
+      ++project_policy_violations;
+    }
+  }
+
   set<string> printable_associated_includes = AssociatedQuotedIncludes();
   for (const OneIncludeOrForwardDeclareLine& desired : lines_) {
     if (!desired.IsIncludeLine() || !desired.is_desired())
@@ -3051,7 +3123,7 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
   if (GlobalFlags().output_format == CommandlineFlags::kTextOutput)
     errs() << diff_output;
 
-  return num_edits;
+  return num_edits + project_policy_violations;
 }
 
 }  // namespace include_what_you_use

@@ -58,3 +58,19 @@ action or fact fails with a capability diagnostic; IWYU never silently ignores
 a safety rule. POLICY-002 enables `deny_add` with includer, includee, file kind,
 symbol, and the optional invocation configuration supplied by
 `-Xiwyu --configuration=<name>`. Active-condition facts remain unavailable.
+
+## `deny_add` runtime semantics
+
+IWYU evaluates `deny_add` after pragma and prefix-header suppressions and before
+rendering the final desired state. It considers only missing desired include
+lines that do not already carry a stronger decision. A match produces an
+`add/suppress` operation with reason code `project_policy_deny_add`, known policy
+file/rule/`deny` provenance, unchanged symbol and provider evidence, and a
+warning diagnostic naming the policy entry. The include remains absent from the
+accepted desired state. Text output emits a parse-safe warning and no fixer add.
+A suppression is a policy violation for `--error`, but it is not an applied edit
+and does not by itself change a structured record's status from `correct`.
+
+Only `deny_add` is currently enabled. The other declared actions and
+`active_condition` matches fail capability validation rather than being ignored.
+Existing source pragmas and project-side application guardrails remain in force.

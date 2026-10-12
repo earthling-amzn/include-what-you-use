@@ -1,0 +1,16 @@
+schema_version: 1
+rules:
+  - id: policy002-first-inline-denial
+    action: deny_add
+    match:
+      includer: { regex: ".*policy002_plain[.]hpp" }
+      includee: { glob: "tests/native_json/*.inline.hpp" }
+      file_kind: header
+      symbol: Policy002InlineValue
+      configuration: policy002
+  - id: policy002-later-overlap
+    action: deny_add
+    match:
+      includer: { glob: "*policy002_plain.hpp" }
+      includee: { regex: ".*[.]inline[.]hpp" }
+      file_kind: header
