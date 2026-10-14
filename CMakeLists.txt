@@ -272,4 +272,9 @@ if (Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   )
   set_tests_properties(iwyu_tool_json_output_test PROPERTIES SKIP_RETURN_CODE 77)
+
+  add_test(NAME iwyu_tool_named_databases_test
+    COMMAND ${Python3_EXECUTABLE} tests/iwyu_tool_named_databases_test.py
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
 endif()

@@ -75,14 +75,17 @@ class MockInvocation(iwyu_tool.Invocation):
 
 class MockJsonInvocation(iwyu_tool.Invocation):
     def __init__(self, database_index, block=0, stdout='', stderr='',
-                 returncode=0):
+                 returncode=0, configuration=None, database_name=None,
+                 database_local_index=None):
         digest_hex = ('%064x' % (database_index + 1))[-64:]
         digest = 'sha256:' + digest_hex
         invocation_id = 'inv-%06d-%s' % (database_index, digest_hex[:12])
         translation_unit = '/src/tu%d.cc' % database_index
         iwyu_tool.Invocation.__init__(
             self, ['iwyu'], '/build', database_index, digest, invocation_id,
-            translation_unit, structured_output=True)
+            translation_unit, structured_output=True,
+            configuration=configuration, database_name=database_name,
+            database_local_index=database_local_index)
         self._process = MockProcess(block, stdout, returncode, stderr)
 
     def start(self, verbose):
@@ -101,6 +104,12 @@ class MockJsonInvocation(iwyu_tool.Invocation):
             'file': {'path': path or self.translation_unit},
             'status': status,
         }
+        if self.configuration is not None:
+            record['invocation']['configuration'] = {
+                'status': 'known', 'value': self.configuration}
+            record['analyzed_configurations'] = {
+                'status': 'known', 'value': [self.configuration]}
+            record['operations'] = []
         return json.dumps(record, separators=(',', ':'))
 
 
@@ -447,6 +456,22 @@ class JsonProtocolTests(unittest.TestCase):
             iwyu_tool.parse_json_output(
                 invocation.record() + '\n   \n', invocation)
 
+    def test_named_configuration_mismatch_is_atomic(self):
+        invocation = MockJsonInvocation(
+            0, configuration='server', database_name='server',
+            database_local_index=0)
+        mismatched = json.loads(invocation.record())
+        mismatched['invocation']['configuration']['value'] = 'zero'
+        invocation._process.content = json.dumps(mismatched)
+
+        self.assertEqual(1, iwyu_tool.execute_json(
+            [invocation], verbose=False, jobs=1))
+        self.assertEqual('', self.stdout_stub.getvalue())
+        self.assertIn("database 'server' entry index 0",
+                      self.stderr_stub.getvalue())
+        self.assertIn('configuration does not match',
+                      self.stderr_stub.getvalue())
+
 
 class JsonCommandIdentityTests(unittest.TestCase):
     def test_invocation_id_golden_vectors_and_escaping(self):
@@ -746,6 +771,36 @@ class JsonCommandIdentityTests(unittest.TestCase):
         self.assertIn("--output_f=text", invocation.command)
         self.assertIn("--command_digest=legacy", invocation.command)
 
+    def test_named_configuration_is_driver_owned(self):
+        entry = {
+            'directory': '/build',
+            'file': '/src/a.cc',
+            'arguments': ['clang++', '-c', '/src/a.cc'],
+        }
+        for spelling in ['--configuration=forged', '--config=forged']:
+            with self.subTest(spelling=spelling):
+                with self.assertRaises(ValueError):
+                    iwyu_tool.Invocation.from_compile_command(
+                        entry, ['-Xiwyu', spelling], database_index=0,
+                        output_format='json', configuration='server')
+
+        legacy = iwyu_tool.Invocation.from_compile_command(
+            entry, ['-Xiwyu', '--configuration=caller'],
+            database_index=0, output_format='json')
+        self.assertIn('--configuration=caller', legacy.command)
+
+    def test_every_effective_configuration_abbreviation_is_reserved(self):
+        name = 'configuration'
+        for length in range(1, len(name) + 1):
+            abbreviation = '--' + name[:length]
+            if (iwyu_tool._resolve_iwyu_long_option(abbreviation) ==
+                    '--configuration'):
+                with self.subTest(abbreviation=abbreviation):
+                    with self.assertRaises(ValueError):
+                        iwyu_tool.reject_reserved_json_args(
+                            ['-Xiwyu', abbreviation + '=forged'],
+                            iwyu_tool.NAMED_DATABASE_RESERVED_JSON_OPTIONS)
+
 
 class WinSplitTests(unittest.TestCase):
     """ iwyu_tool.win_split is subtle and complex enough that it warrants a
@@ -754,7 +809,6 @@ class WinSplitTests(unittest.TestCase):
     def test_explicit_empty_quotes_are_arguments(self):
         self.assertEqual(['', '', 'value', ''],
                          iwyu_tool.win_split('"" "" value ""'))
-
 
     def assert_win_split(self, cmdstr, expected):
         self.assertEqual(expected,
@@ -869,6 +923,34 @@ class BootstrapTests(unittest.TestCase):
             iwyu_tool.sys.stderr = saved_stderr
         self.assertIn('jobs must be a positive integer', stderr_stub.getvalue())
         self.assertEqual({}, self.main.call_args)
+
+    def test_named_databases_are_repeatable_and_ordered(self):
+        argv = [
+            'iwyu_tool.py', '-o', 'json',
+            '--database', 'server=/build/server',
+            '--database', 'zero=/build/zero',
+        ]
+        iwyu_tool._bootstrap(argv)
+        self.assertIsNone(self.main.call_args['compilation_db_path'])
+        self.assertEqual(
+            [('server', '/build/server'), ('zero', '/build/zero')],
+            self.main.call_args['named_databases'])
+
+    def test_named_database_is_mutually_exclusive_with_legacy_path(self):
+        with self.assertRaises(SystemExit) as raised:
+            iwyu_tool._bootstrap([
+                'iwyu_tool.py', '-p', '.', '--database', 'server=/build'])
+        self.assertEqual(2, raised.exception.code)
+
+    def test_unsafe_or_empty_named_database_spec_is_rejected(self):
+        for specification in [
+                '', '=path', 'bad/name=path', 'name=', 'name',
+                'server\n=path']:
+            with self.subTest(specification=specification):
+                with self.assertRaises(SystemExit) as raised:
+                    iwyu_tool._bootstrap([
+                        'iwyu_tool.py', '--database', specification])
+                self.assertEqual(2, raised.exception.code)
 
 
 class JobValidationTests(unittest.TestCase):
@@ -997,6 +1079,104 @@ class CompilationDBTests(unittest.TestCase):
                              captured[1].command_digest)
             self.assertNotEqual(captured[0].invocation_id,
                                 captured[1].invocation_id)
+
+    def test_named_databases_have_global_identity_and_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, 'source.cc')
+            open(source, 'w').close()
+            entry = {
+                'directory': directory,
+                'file': source,
+                'arguments': ['clang++', '-c', source],
+            }
+            paths = []
+            for dirname in ('server', 'zero'):
+                db_dir = os.path.join(directory, dirname)
+                os.mkdir(db_dir)
+                db_path = os.path.join(db_dir, 'compile_commands.json')
+                with open(db_path, 'w') as database_file:
+                    json.dump([entry], database_file)
+                paths.append(db_path)
+
+            captured = []
+            original_execute_json = iwyu_tool.execute_json
+            original_executable = iwyu_tool.IWYU_EXECUTABLE
+            try:
+                iwyu_tool.IWYU_EXECUTABLE = 'include-what-you-use'
+
+                def capture(invocations, verbose, jobs, max_load_average):
+                    captured.extend(invocations)
+                    return 0
+
+                iwyu_tool.execute_json = capture
+                result = iwyu_tool.main(
+                    None, [], False, None, 2, 0, [], 'json',
+                    named_databases=[('server', paths[0]),
+                                     ('zero', paths[1])])
+            finally:
+                iwyu_tool.execute_json = original_execute_json
+                iwyu_tool.IWYU_EXECUTABLE = original_executable
+
+            self.assertEqual(0, result)
+            self.assertEqual([0, 1],
+                             [item.database_index for item in captured])
+            self.assertEqual([0, 0],
+                             [item.database_local_index for item in captured])
+            self.assertEqual(['server', 'zero'],
+                             [item.configuration for item in captured])
+            self.assertEqual(captured[0].command_digest,
+                             captured[1].command_digest)
+            self.assertNotEqual(captured[0].invocation_id,
+                                captured[1].invocation_id)
+            self.assertIn('--configuration=server', captured[0].command)
+            self.assertIn('--configuration=zero', captured[1].command)
+
+    def test_duplicate_named_databases_are_rejected_before_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = os.path.join(directory, 'compile_commands.json')
+            with open(database_path, 'w') as database_file:
+                json.dump([{
+                    'directory': directory,
+                    'file': os.path.join(directory, 'source.cc'),
+                    'arguments': ['clang++', 'source.cc'],
+                }], database_file)
+            alias_path = os.path.join(directory, 'alias.json')
+            os.symlink(database_path, alias_path)
+
+            original_executable = iwyu_tool.IWYU_EXECUTABLE
+            iwyu_tool.IWYU_EXECUTABLE = 'include-what-you-use'
+            try:
+                duplicate_name = iwyu_tool.main(
+                    None, [], False, None, 1, 0, [], 'json',
+                    named_databases=[('same', database_path),
+                                     ('same', alias_path)])
+                duplicate_path = iwyu_tool.main(
+                    None, [], False, None, 1, 0, [], 'json',
+                    named_databases=[('first', database_path),
+                                     ('second', alias_path)])
+            finally:
+                iwyu_tool.IWYU_EXECUTABLE = original_executable
+            self.assertEqual(1, duplicate_name)
+            self.assertEqual(1, duplicate_path)
+
+    def test_missing_and_empty_named_databases_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            empty = os.path.join(directory, 'empty.json')
+            with open(empty, 'w') as database_file:
+                database_file.write('[]')
+            missing = os.path.join(directory, 'missing.json')
+
+            original_executable = iwyu_tool.IWYU_EXECUTABLE
+            iwyu_tool.IWYU_EXECUTABLE = 'include-what-you-use'
+            try:
+                for name, path in [('empty', empty), ('missing', missing)]:
+                    with self.subTest(name=name):
+                        result = iwyu_tool.main(
+                            None, [], False, None, 1, 0, [], 'json',
+                            named_databases=[(name, path)])
+                        self.assertEqual(1, result)
+            finally:
+                iwyu_tool.IWYU_EXECUTABLE = original_executable
 
 
 if __name__ == '__main__':

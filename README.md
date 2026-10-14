@@ -181,6 +181,29 @@ or, on Windows systems:
 
 Unless a source filename is provided, all files in the project will be analyzed.
 
+Structured JSON mode can analyze several compilation databases in one command.
+Repeat `--database NAME=PATH` in the required output order instead of using
+`-p`:
+
+      iwyu_tool.py -o json -j 4 \
+        --database server=build/server \
+        --database zero=build/zero
+
+`PATH` may name a build directory or its `compile_commands.json`. Each requested
+database must exist, contain a non-empty JSON array, and have a unique safe
+`NAME` matching `[A-Za-z0-9][A-Za-z0-9_.-]*`. Different names may not resolve to
+the same canonical database path. The driver validates and prepares every
+database before launching IWYU, then emits records and native diagnostics in
+database order and original entry order even when children finish out of order.
+In JSON mode it owns and injects the exact
+`-Xiwyu --configuration=NAME` argument; callers may not pass that option or an
+effective abbreviation. Invocation indices span the ordered databases so equal
+local indices and commands cannot collide.
+
+Named mode preserves per-configuration records. It does not merge
+recommendations or apply edits. Legacy `-p` remains the single-database
+interface and retains its existing identity and output behavior.
+
 See `iwyu_tool.py --help` for more options.
 
 #### Applying fixes ####

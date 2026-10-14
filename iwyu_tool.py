@@ -26,6 +26,11 @@ Example usage with CMake:
     -G Ninja ...
   $ python3 iwyu_tool.py -p .
 
+Structured multi-configuration JSON:
+
+  $ iwyu_tool.py -o json --database server=build/server \
+      --database zero=build/zero
+
 See iwyu_tool.py -h for more details on command-line arguments.
 """
 from __future__ import print_function
@@ -50,6 +55,9 @@ RESERVED_JSON_OPTIONS = frozenset([
     '--command_digest',
     '--translation_unit',
 ])
+NAMED_DATABASE_RESERVED_JSON_OPTIONS = frozenset(
+    set(RESERVED_JSON_OPTIONS) | {'--configuration'})
+CONFIGURATION_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]*$')
 # Keep this in the same order-independent name set as CommandlineFlags::ParseArgv
 # in iwyu_globals.cc. getopt_long accepts a prefix only when it identifies one
 # option unambiguously, except that an exact match always wins.
@@ -79,6 +87,8 @@ IWYU_LONG_OPTIONS = frozenset([
     '--invocation_id',
     '--command_digest',
     '--translation_unit',
+    '--project_policy',
+    '--configuration',
 ])
 
 
@@ -340,15 +350,40 @@ def _resolve_iwyu_long_option(argument):
     return None
 
 
-def reject_reserved_json_args(arguments):
+def reject_reserved_json_args(
+        arguments, reserved_options=RESERVED_JSON_OPTIONS):
     """Reject effective -Xiwyu pairs owned by the driver JSON protocol."""
     for index, argument in enumerate(arguments[:-1]):
         if argument != '-Xiwyu':
             continue
         iwyu_argument = arguments[index + 1]
-        if _resolve_iwyu_long_option(iwyu_argument) in RESERVED_JSON_OPTIONS:
+        if _resolve_iwyu_long_option(iwyu_argument) in reserved_options:
             raise ValueError("reserved IWYU driver argument: '%s'" %
                              iwyu_argument)
+
+
+def validate_configuration_name(name):
+    """Return a safe non-empty configuration name or raise ValueError."""
+    if not isinstance(name, str) or CONFIGURATION_NAME_RE.fullmatch(name) is None:
+        raise ValueError(
+            "configuration name must match [A-Za-z0-9][A-Za-z0-9_.-]*")
+    return name
+
+
+def parse_database_spec(value):
+    """Parse one ordered NAME=PATH compilation-database specification."""
+    if '=' not in value:
+        raise argparse.ArgumentTypeError(
+            "named database must have the form NAME=PATH")
+    name, path = value.split('=', 1)
+    try:
+        validate_configuration_name(name)
+    except ValueError as why:
+        raise argparse.ArgumentTypeError(str(why))
+    if not path:
+        raise argparse.ArgumentTypeError(
+            "named database path must be non-empty")
+    return name, path
 
 
 def _unwrap_compiler_wrapper(arguments):
@@ -479,7 +514,9 @@ class Invocation(object):
     """ Holds arguments of an IWYU invocation. """
     def __init__(self, command, cwd, database_index=None,
                  command_digest=None, invocation_id=None,
-                 translation_unit=None, structured_output=False):
+                 translation_unit=None, structured_output=False,
+                 configuration=None, database_name=None,
+                 database_local_index=None):
         self.command = command
         self.cwd = cwd
         self.database_index = database_index
@@ -487,13 +524,17 @@ class Invocation(object):
         self.invocation_id = invocation_id
         self.translation_unit = translation_unit
         self.structured_output = structured_output
+        self.configuration = configuration
+        self.database_name = database_name
+        self.database_local_index = database_local_index
 
     def __str__(self):
         return ' '.join(self.command)
 
     @classmethod
     def from_compile_command(cls, entry, extra_args, database_index=None,
-                             output_format=DEFAULT_FORMAT):
+                             output_format=DEFAULT_FORMAT, configuration=None,
+                             database_name=None, database_local_index=None):
         """ Parse a JSON compilation database entry into new Invocation. """
         if 'arguments' in entry:
             # arguments is a command-line in list form.
@@ -522,7 +563,10 @@ class Invocation(object):
             return cls([IWYU_EXECUTABLE] + extra_args + command[1:],
                        entry['directory'])
 
-        reject_reserved_json_args(extra_args)
+        reserved_options = (NAMED_DATABASE_RESERVED_JSON_OPTIONS
+                            if configuration is not None
+                            else RESERVED_JSON_OPTIONS)
+        reject_reserved_json_args(extra_args, reserved_options)
 
         if database_index is None:
             database_index = 0
@@ -558,7 +602,7 @@ class Invocation(object):
                 raise ValueError(
                     'expanded compilation command contains only a wrapper')
 
-        reject_reserved_json_args(canonical_args[1:])
+        reject_reserved_json_args(canonical_args[1:], reserved_options)
         if windows_args:
             extra_args = ['--driver-mode=cl'] + extra_args
         digest, invocation_id = command_identity(
@@ -569,10 +613,16 @@ class Invocation(object):
             '-Xiwyu', '--command_digest=%s' % digest,
             '-Xiwyu', '--translation_unit=%s' % translation_unit,
         ]
+        if configuration is not None:
+            validate_configuration_name(configuration)
+            protocol_args.extend([
+                '-Xiwyu', '--configuration=%s' % configuration])
         child_command = ([IWYU_EXECUTABLE] + extra_args + protocol_args +
                          canonical_args[1:])
         return cls(child_command, entry['directory'], database_index, digest,
-                   invocation_id, translation_unit, structured_output=True)
+                   invocation_id, translation_unit, structured_output=True,
+                   configuration=configuration, database_name=database_name,
+                   database_local_index=database_local_index)
 
     def start(self, verbose):
         """ Run invocation and collect output. """
@@ -585,14 +635,68 @@ class Invocation(object):
 def fixup_compilation_db(compilation_db):
     """ Canonicalize paths in JSON compilation database. """
     for entry in compilation_db:
-        # Convert relative paths to absolute ones if possible, based on the entry's directory.
+        # Convert relative paths to absolute ones if possible, based on the
+        # entry's directory.
         if 'directory' in entry and not os.path.isabs(entry['file']):
             entry['file'] = os.path.join(entry['directory'], entry['file'])
 
-        # Expand relative paths and symlinks
+        # Expand relative paths and symlinks.
         entry['file'] = os.path.realpath(entry['file'])
 
     return compilation_db
+
+
+def canonical_compilation_db_path(path):
+    """Return the canonical compile_commands.json path for path."""
+    if os.path.isdir(path):
+        path = os.path.join(path, 'compile_commands.json')
+    return os.path.realpath(path)
+
+
+def _validate_compilation_db_entry(entry):
+    if not isinstance(entry, dict):
+        raise ValueError('compilation database entry is not an object')
+    if not isinstance(entry.get('directory'), str) or not entry['directory']:
+        raise ValueError('compilation database entry has invalid directory')
+    if not isinstance(entry.get('file'), str) or not entry['file']:
+        raise ValueError('compilation database entry has invalid file')
+    has_arguments = 'arguments' in entry
+    has_command = 'command' in entry
+    if not has_arguments and not has_command:
+        raise ValueError('compilation database entry has no command')
+    if has_arguments and (not isinstance(entry['arguments'], list) or
+                          not entry['arguments'] or
+                          not all(isinstance(arg, str)
+                                  for arg in entry['arguments'])):
+        raise ValueError('compilation database entry has invalid arguments')
+    if has_command and (not isinstance(entry['command'], str) or
+                        not entry['command']):
+        raise ValueError('compilation database entry has invalid command')
+
+
+def load_compilation_db(path, require_nonempty=False):
+    """Load and validate one compilation database from a canonical path."""
+    canonical_path = canonical_compilation_db_path(path)
+    try:
+        with open(canonical_path, 'r', encoding='utf-8') as fileobj:
+            compilation_db = json.load(
+                fileobj, object_pairs_hook=_reject_duplicate_object_keys,
+                parse_constant=_reject_nonfinite)
+    except (IOError, UnicodeError, ValueError) as why:
+        raise ValueError("failed to parse compilation database '%s': %s" %
+                         (canonical_path, why))
+    if not isinstance(compilation_db, list):
+        raise ValueError("compilation database '%s' root is not an array" %
+                         canonical_path)
+    if require_nonempty and not compilation_db:
+        raise ValueError("compilation database '%s' is empty" % canonical_path)
+    for index, entry in enumerate(compilation_db):
+        try:
+            _validate_compilation_db_entry(entry)
+        except ValueError as why:
+            raise ValueError("compilation database '%s' entry %d: %s" %
+                             (canonical_path, index, why))
+    return canonical_path, fixup_compilation_db(compilation_db)
 
 
 def slice_compilation_db(compilation_db, selection):
@@ -679,6 +783,41 @@ def _reject_nonfinite(value):
     raise ProtocolError("non-finite JSON number '%s'" % value)
 
 
+def _validate_record_configuration(record, invocation):
+    configuration = invocation.configuration
+    if configuration is None:
+        return
+
+    expected_selected = {'status': 'known', 'value': configuration}
+    metadata = record.get('invocation')
+    if metadata.get('configuration') != expected_selected:
+        raise ProtocolError(
+            'invocation.configuration does not match named database')
+
+    expected_analyzed = {'status': 'known', 'value': [configuration]}
+    if record.get('analyzed_configurations') != expected_analyzed:
+        raise ProtocolError(
+            'analyzed_configurations does not match named database')
+
+    operations = record.get('operations')
+    if not isinstance(operations, list):
+        raise ProtocolError('record operations are missing')
+    for operation in operations:
+        if not isinstance(operation, dict):
+            raise ProtocolError('record operation is not an object')
+        multi_config = operation.get('multi_config')
+        if not isinstance(multi_config, dict):
+            raise ProtocolError('operation multi_config is missing')
+        contributions = multi_config.get('value')
+        if (multi_config.get('status') != 'known' or
+                not isinstance(contributions, list) or
+                len(contributions) != 1 or
+                not isinstance(contributions[0], dict) or
+                contributions[0].get('configuration') != configuration):
+            raise ProtocolError(
+                'operation multi_config does not match named database')
+
+
 def _parse_json_object(line):
     try:
         value = json.loads(
@@ -703,6 +842,7 @@ def _validate_record(record, invocation, previous_path, identities):
     metadata = record.get('invocation')
     if not isinstance(metadata, dict):
         raise ProtocolError('record invocation metadata is missing')
+    _validate_record_configuration(record, invocation)
     expected = {
         'index': invocation.database_index,
         'id': invocation.invocation_id,
@@ -770,6 +910,14 @@ def parse_json_output(output, invocation, identities=None):
     return lines
 
 
+def _protocol_error_context(invocation):
+    if invocation.database_name is None:
+        return 'database index %d' % invocation.database_index
+    return "database '%s' entry index %d (invocation index %d)" % (
+        invocation.database_name, invocation.database_local_index,
+        invocation.database_index)
+
+
 def execute_json(invocations, verbose, jobs, max_load_average=0):
     """Run structured invocations and atomically emit validated JSON groups."""
     _validate_jobs(jobs)
@@ -822,7 +970,7 @@ def execute_json(invocations, verbose, jobs, max_load_average=0):
         child_exit = returncode if returncode >= 0 else 1
         exit_code = max(exit_code, child_exit)
         if decode_error is not None:
-            errors.append((invocation.database_index,
+            errors.append((invocation,
                            'output is not valid UTF-8: %s' % decode_error))
             groups.append([])
             continue
@@ -832,7 +980,7 @@ def execute_json(invocations, verbose, jobs, max_load_average=0):
                 raise ProtocolError('successful child produced no records')
             groups.append(lines)
         except ProtocolError as why:
-            errors.append((invocation.database_index, str(why)))
+            errors.append((invocation, str(why)))
             groups.append([])
 
     # Native diagnostics use stderr exclusively and remain grouped by DB index.
@@ -840,9 +988,9 @@ def execute_json(invocations, verbose, jobs, max_load_average=0):
         stderr = result[1]
         if stderr:
             sys.stderr.write(stderr)
-    for index, message in errors:
-        print('error: IWYU JSON protocol at database index %d: %s' %
-              (index, message), file=sys.stderr)
+    for invocation, message in errors:
+        print('error: IWYU JSON protocol at %s: %s' %
+              (_protocol_error_context(invocation), message), file=sys.stderr)
 
     if errors:
         return max(exit_code, 1)
@@ -852,9 +1000,21 @@ def execute_json(invocations, verbose, jobs, max_load_average=0):
     return exit_code
 
 
+def _deduplicate_selected_entries(compilation_db):
+    selected_ids = set()
+    unique_entries = []
+    for entry in compilation_db:
+        if id(entry) in selected_ids:
+            continue
+        selected_ids.add(id(entry))
+        unique_entries.append(entry)
+    return unique_entries
+
+
 def main(compilation_db_path, source_files, verbose, formatter, jobs,
-         max_load_average, extra_args, output_format=DEFAULT_FORMAT):
-    """ Entry point. """
+         max_load_average, extra_args, output_format=DEFAULT_FORMAT,
+         named_databases=None):
+    """Run IWYU for one legacy database or ordered named databases."""
 
     try:
         _validate_jobs(jobs)
@@ -867,45 +1027,60 @@ def main(compilation_db_path, source_files, verbose, formatter, jobs,
               file=sys.stderr)
         return 1
 
+    named_databases = list(named_databases or [])
     try:
-        if os.path.isdir(compilation_db_path):
-            compilation_db_path = os.path.join(compilation_db_path,
-                                               'compile_commands.json')
+        if named_databases:
+            names = set()
+            paths = {}
+            requested = []
+            for name, path in named_databases:
+                validate_configuration_name(name)
+                if name in names:
+                    raise ValueError("duplicate named database '%s'" % name)
+                names.add(name)
+                canonical_path = canonical_compilation_db_path(path)
+                path_key = normcase(canonical_path)
+                if path_key in paths:
+                    raise ValueError(
+                        "named databases '%s' and '%s' alias path '%s'" %
+                        (paths[path_key], name, canonical_path))
+                paths[path_key] = name
+                requested.append((name, canonical_path))
 
-        # Read compilation db from disk.
-        compilation_db_path = os.path.realpath(compilation_db_path)
-        with open(compilation_db_path, 'r') as fileobj:
-            compilation_db = json.load(fileobj)
-        if not isinstance(compilation_db, list):
-            raise ValueError('compilation database root is not an array')
-    except (IOError, ValueError) as why:
-        print('error: failed to parse compilation database: %s' % why,
-              file=sys.stderr)
+            databases = []
+            invocation_base = 0
+            for name, path in requested:
+                canonical_path, compilation_db = load_compilation_db(
+                    path, require_nonempty=True)
+                databases.append(
+                    (name, canonical_path, compilation_db, invocation_base))
+                invocation_base += len(compilation_db)
+        else:
+            canonical_path, compilation_db = load_compilation_db(
+                compilation_db_path)
+            databases = [(None, canonical_path, compilation_db, 0)]
+    except (TypeError, ValueError) as why:
+        print('error: %s' % why, file=sys.stderr)
         return 1
 
-    compilation_db = fixup_compilation_db(compilation_db)
-    original_indices = {id(entry): index
-                        for index, entry in enumerate(compilation_db)}
-    compilation_db = slice_compilation_db(compilation_db, source_files)
-    if output_format == JSON_FORMAT:
-        selected_ids = set()
-        unique_entries = []
-        for entry in compilation_db:
-            if id(entry) in selected_ids:
-                continue
-            selected_ids.add(id(entry))
-            unique_entries.append(entry)
-        compilation_db = unique_entries
-
+    invocations = []
     try:
-        # Keep each entry's position in the original, unsliced database. This
-        # deliberately preserves gaps and distinct indices for equal commands.
-        invocations = [
-            Invocation.from_compile_command(
-                entry, extra_args, original_indices[id(entry)], output_format)
-            for entry in compilation_db
-        ]
-    except ValueError as why:
+        for name, _, compilation_db, invocation_base in databases:
+            original_indices = {
+                id(entry): index for index, entry in enumerate(compilation_db)}
+            selected = slice_compilation_db(compilation_db, source_files)
+            if output_format == JSON_FORMAT:
+                selected = _deduplicate_selected_entries(selected)
+
+            # Index named invocations in database order, retaining each entry's
+            # original local position and gaps left by source selection.
+            for entry in selected:
+                local_index = original_indices[id(entry)]
+                invocations.append(Invocation.from_compile_command(
+                    entry, extra_args, invocation_base + local_index,
+                    output_format, configuration=name, database_name=name,
+                    database_local_index=local_index))
+    except (KeyError, TypeError, ValueError) as why:
         print('error: failed to prepare IWYU invocation: %s' % why,
               file=sys.stderr)
         return 1
@@ -932,10 +1107,11 @@ def _bootstrap(sys_argv):
 
         def custom_help():
             """ Customized help string, calls the adjusted format_usage. """
-            helpmsg = original_format_help()
-            helplines = helpmsg.splitlines()
-            helplines[0] = parser.format_usage().rstrip()
-            return os.linesep.join(helplines) + os.linesep
+            helplines = original_format_help().splitlines()
+            while helplines and helplines[0].strip():
+                del helplines[0]
+            return (parser.format_usage().rstrip() + os.linesep +
+                    os.linesep.join(helplines) + os.linesep)
 
         parser.format_help = custom_help
 
@@ -956,8 +1132,15 @@ def _bootstrap(sys_argv):
                         help='Number of concurrent subprocesses')
     parser.add_argument('-l', '--load', type=float, default=0,
                         help='Do not start new jobs if the 1min load average is greater than the provided value')
-    parser.add_argument('-p', metavar='<build-path>', required=True,
-                        help='Compilation database path', dest='dbpath')
+    database_group = parser.add_mutually_exclusive_group(required=True)
+    database_group.add_argument(
+        '-p', metavar='<build-path>',
+        help='Legacy single compilation database path', dest='dbpath')
+    database_group.add_argument(
+        '--database', action='append', type=parse_database_spec,
+        metavar='<name>=<build-path>', dest='databases',
+        help=('Named compilation database (repeat in analysis order; JSON '
+              'mode binds NAME to --configuration)'))
     parser.add_argument('source', nargs='*',
                         help=('Zero or more source files (or directories) to '
                               'run IWYU on. Defaults to all in compilation '
@@ -975,7 +1158,8 @@ def _bootstrap(sys_argv):
 
     return main(args.dbpath, args.source, args.verbose,
                 FORMATTERS.get(args.output_format), args.jobs, args.load,
-                extra_args, args.output_format)
+                extra_args, args.output_format,
+                named_databases=args.databases)
 
 
 if __name__ == '__main__':

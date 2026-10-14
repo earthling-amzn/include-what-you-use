@@ -23,6 +23,18 @@ buffers child results and emits invocation groups in index order, not child
 completion order. The required non-null `invocation.id` is the final tie-breaker
 for duplicate compilation commands.
 
+For one legacy `-p` database, `invocation.index` remains the original entry
+index. With repeatable `--database NAME=PATH`, indices span the complete ordered
+databases: each database starts after the full entry count of all preceding
+databases, and each command retains its original local entry offset. This makes
+identical local indices and commands from different databases distinct while
+preserving gaps left by source selection. Named JSON invocations receive the
+exact driver-owned `--configuration=NAME`; the driver validates matching
+`invocation.configuration`, `analyzed_configurations`, and operation
+contributions before emitting any stdout. Records and stderr remain grouped in
+database order, then original entry order. The driver performs no semantic
+multi-configuration aggregation.
+
 Human diagnostics remain the default. Direct structured output uses
 `-Xiwyu --output_format=json`; the compilation-database driver uses `-o json`.
 
