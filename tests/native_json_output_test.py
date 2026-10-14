@@ -229,15 +229,146 @@ def main():
     assert configured["analyzed_configurations"] == {
         "status": "known", "value": ["fastdebug"]}
 
+    configured_changed_result = run(
+        "tests/cxx/ctad.cc", "--output_format=json",
+        "--configuration=fastdebug")
+    assert configured_changed_result.returncode == 0, (
+        configured_changed_result.stderr)
+    configured_changed = by_path(records(configured_changed_result),
+                                 "tests/cxx/ctad.cc")
+    for operation in configured_changed["operations"]:
+        assert operation["multi_config"] == {
+            "status": "known",
+            "value": [{
+                "configuration": "fastdebug",
+                "subject_action": operation["subject_action"],
+                "disposition": operation["disposition"],
+                "condition": operation["edit_condition"],
+            }],
+        }
+
+    # Conditions are source-derived and configuration contributions preserve
+    # the same exact branch provenance as the motivating uses and edit.
+    condition_result = run(
+        "tests/native_json/condition_add.cc", "--output_format=json",
+        "--configuration=jit")
+    assert condition_result.returncode == 0, condition_result.stderr
+    condition_record = by_path(records(condition_result), "condition_add.cc")
+    conditional_add = next(
+        operation for operation in condition_record["operations"]
+        if operation["subject_action"] == "add")
+    expected_condition = {
+        "status": "known",
+        "value": {
+            "expression": "ENABLE_NATIVE_JSON_CONDITION",
+            "location": {
+                "status": "known",
+                "value": {
+                    "path": "tests/native_json/condition_add.cc",
+                    "line": 3,
+                    "column": 2,
+                },
+            },
+            "active_branch": True,
+        },
+    }
+    assert conditional_add["edit_condition"] == expected_condition
+    assert conditional_add["multi_config"] == {
+        "status": "known",
+        "value": [{
+            "configuration": "jit",
+            "subject_action": "add",
+            "disposition": "apply",
+            "condition": expected_condition,
+        }],
+    }
+    conditional_uses = conditional_add["symbols"][0]["uses"]
+    assert conditional_uses
+    assert all(use["condition"] == expected_condition
+               for use in conditional_uses)
+
+    nested_else_result = run(
+        "tests/native_json/condition_nested_else.cc", "--output_format=json")
+    assert nested_else_result.returncode == 0, nested_else_result.stderr
+    nested_else_record = by_path(
+        records(nested_else_result), "condition_nested_else.cc")
+    nested_else_add = next(
+        operation for operation in nested_else_record["operations"]
+        if operation["subject_action"] == "add")
+    nested_else_condition = nested_else_add["edit_condition"]
+    assert nested_else_condition == {
+        "status": "known",
+        "value": {
+            "expression": (
+                "(ENABLE_OUTER_CONDITION) && "
+                "(!(SELECT_LEFT_CONDITION))"),
+            "location": {
+                "status": "known",
+                "value": {
+                    "path": "tests/native_json/condition_nested_else.cc",
+                    "line": 6,
+                    "column": 2,
+                },
+            },
+            "active_branch": True,
+        },
+    }
+    assert all(
+        use["condition"] == nested_else_condition
+        for symbol in nested_else_add["symbols"]
+        for use in symbol["uses"])
+
+    for source, expression, line in (
+            ("tests/native_json/condition_main_guard.cc",
+             "!defined(MAIN_FILE_FEATURE_SWITCH)", 1),
+            ("tests/native_json/condition_tokens.cc",
+             "CONDITION_TOKEN_A && CONDITION_TOKEN_B", 4)):
+        condition_probe = run(
+            source, "--output_format=json", "--configuration=test")
+        assert condition_probe.returncode == 0, condition_probe.stderr
+        condition_probe_record = by_path(records(condition_probe), source)
+        condition_probe_add = next(
+            operation for operation in condition_probe_record["operations"]
+            if operation["subject_action"] == "add")
+        actual = condition_probe_add["edit_condition"]
+        assert actual["status"] == "known"
+        assert actual["value"]["expression"] == expression
+        assert actual["value"]["location"] == {
+            "status": "known",
+            "value": {"path": source, "line": line, "column": 2},
+        }
+        assert actual["value"]["active_branch"] is True
+
+    repeated_result = run(
+        "tests/native_json/repeated_condition_driver.cc",
+        "--output_format=json", "--configuration=test",
+        "--check_also=tests/native_json/repeated_condition.hpp")
+    assert repeated_result.returncode == 0, repeated_result.stderr
+    repeated_record = by_path(
+        records(repeated_result), "tests/native_json/repeated_condition.hpp")
+    repeated_add = next(
+        operation for operation in repeated_record["operations"]
+        if operation["subject_action"] == "add")
+    repeated_uses = [
+        use for symbol in repeated_add["symbols"] for use in symbol["uses"]]
+    assert len(repeated_uses) == 1
+    assert repeated_uses[0]["condition"]["status"] == "known"
+    # The two include instances have distinct internal branch identities, so an
+    # operation spanning both fails closed rather than inventing one anchor.
+    assert repeated_add["edit_condition"]["status"] == "unknown"
+
     # Symbol-motivated additions expose known OneUse facts without inventing
-    # origin, condition, or macro provenance.
+    # origin or macro provenance. Unconditional source is explicitly
+    # not-applicable rather than unavailable condition data.
     add = next(op for op in changed["operations"]
                if op["subject_action"] == "add")
     assert add["symbols"]
     use = add["symbols"][0]["uses"][0]
     assert use["requirement"] == "full"
     assert use["origin"] == "unknown"
-    assert use["condition"]["status"] == "unavailable"
+    assert use["condition"]["status"] == "not_applicable"
+    assert add["edit_condition"]["status"] == "not_applicable"
+    assert add["multi_config"]["status"] == "not_applicable"
     assert use["macro"]["status"] == "unavailable"
     assert changed["diagnostics"]
     assert first.stderr == ""

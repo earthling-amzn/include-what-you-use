@@ -184,6 +184,7 @@ class OneIncludeOrForwardDeclareLine {
   bool is_elaborated_type() const {
     return is_elaborated_type_;
   }
+  int start_linenum() const { return start_linenum_; }
   const map<string, int>& symbol_counts() const {
     return symbol_counts_;
   }

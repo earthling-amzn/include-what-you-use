@@ -32,6 +32,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/Basic/IdentifierTable.h"
 #include "clang/Lex/HeaderSearch.h"
+#include "clang/Lex/Lexer.h"
 #include "clang/Lex/MacroInfo.h"
 
 using clang::FileEntry;
@@ -702,6 +703,10 @@ void IwyuPreprocessorInfo::AddDirectInclude(
   // both forms of the includee to be specified.  For other files, we
   // don't care as much.
   const FileEntry* includer = GetFileEntry(includer_loc);
+  if (includer && includer_loc.isValid()) {
+    direct_include_conditions_.push_back(
+        {includer, include_name_as_written, includer_loc});
+  }
   if (ShouldReportIWYUViolationsFor(includer)) {
     CHECK_(includee != nullptr);
     CHECK_(!include_name_as_written.empty());
@@ -869,21 +874,200 @@ void IwyuPreprocessorInfo::MacroDefined(const Token& id,
   }
 }
 
+string IwyuPreprocessorInfo::ConditionSourceText(SourceRange range) const {
+  if (range.isInvalid())
+    return "";
+  bool invalid = false;
+  const auto& source_manager = preprocessor_->getSourceManager();
+  const StringRef source = clang::Lexer::getSourceText(
+      clang::CharSourceRange::getTokenRange(range), source_manager,
+      preprocessor_->getLangOpts(), &invalid);
+  if (invalid)
+    return "";
+
+  // Translation phase 2 removes escaped physical newlines before comments are
+  // recognized. Preserve all other bytes for the quote-aware comment pass.
+  string joined;
+  for (size_t index = 0; index < source.size(); ++index) {
+    if (source[index] == '\\' && index + 1 < source.size() &&
+        source[index + 1] == '\n') {
+      ++index;
+      continue;
+    }
+    if (source[index] == '\\' && index + 2 < source.size() &&
+        source[index + 1] == '\r' && source[index + 2] == '\n') {
+      index += 2;
+      continue;
+    }
+    joined.push_back(source[index]);
+  }
+
+  // Translation phase 3 replaces comments with whitespace. Do not interpret
+  // comment markers inside character or string literals.
+  string tokens;
+  char quote = '\0';
+  bool escaped = false;
+  for (size_t index = 0; index < joined.size(); ++index) {
+    const char ch = joined[index];
+    if (quote != '\0') {
+      tokens.push_back(ch);
+      if (escaped) {
+        escaped = false;
+      } else if (ch == '\\') {
+        escaped = true;
+      } else if (ch == quote) {
+        quote = '\0';
+      }
+      continue;
+    }
+    if (ch == '\'' || ch == '"') {
+      quote = ch;
+      tokens.push_back(ch);
+      continue;
+    }
+    if (ch == '/' && index + 1 < joined.size() && joined[index + 1] == '/') {
+      tokens.push_back(' ');
+      break;
+    }
+    if (ch == '/' && index + 1 < joined.size() && joined[index + 1] == '*') {
+      const size_t end = joined.find("*/", index + 2);
+      if (end == string::npos)
+        return "";
+      tokens.push_back(' ');
+      index = end + 1;
+      continue;
+    }
+    tokens.push_back(ch);
+  }
+  if (quote != '\0')
+    return "";
+
+  string normalized;
+  bool pending_space = false;
+  for (const unsigned char ch : tokens) {
+    if (std::isspace(ch)) {
+      pending_space = !normalized.empty();
+      continue;
+    }
+    if (pending_space)
+      normalized.push_back(' ');
+    normalized.push_back(static_cast<char>(ch));
+    pending_space = false;
+  }
+  return normalized;
+}
+
+void IwyuPreprocessorInfo::RecordConditionEvent(SourceLocation loc) {
+  const auto& source_manager = preprocessor_->getSourceManager();
+  loc = source_manager.getExpansionLoc(loc);
+  if (loc.isInvalid() || !loc.isFileID())
+    return;
+
+  const FileID file_id = source_manager.getFileID(loc);
+  if (file_id.isInvalid())
+    return;
+  const unsigned key = file_id.getHashValue();
+  condition_events_[key].push_back(
+      {key, source_manager.getFileOffset(loc), active_condition_stacks_[key]});
+}
+
+bool IwyuPreprocessorInfo::ConditionPathAt(
+    SourceLocation loc, vector<ActiveConditionalState>* path) const {
+  CHECK_(path);
+  path->clear();
+
+  const auto& source_manager = preprocessor_->getSourceManager();
+  loc = source_manager.getExpansionLoc(loc);
+  if (loc.isInvalid() || !loc.isFileID())
+    return false;
+
+  const FileID file_id = source_manager.getFileID(loc);
+  if (file_id.isInvalid())
+    return false;
+  const unsigned key = file_id.getHashValue();
+  const unsigned offset = source_manager.getFileOffset(loc);
+
+  const auto events_it = condition_events_.find(key);
+  if (events_it == condition_events_.end())
+    return true;
+  const vector<ConditionEvent>& events = events_it->second;
+  const auto after = std::upper_bound(
+      events.begin(), events.end(), offset,
+      [](unsigned value, const ConditionEvent& event) {
+        return value < event.offset;
+      });
+  if (after != events.begin())
+    *path = std::prev(after)->path;
+  return true;
+}
+
 void IwyuPreprocessorInfo::EnterConditional(
-    SourceLocation loc, const clang::IdentifierInfo* macro, bool is_ifndef) {
+    SourceLocation loc, const clang::IdentifierInfo* macro, bool is_ifndef,
+    const string& expression) {
   const FileEntry* file = GetFileEntry(loc);
   if (!file)
     return;
   conditional_stacks_[file].push_back({macro, is_ifndef, false});
+
+  const auto& source_manager = preprocessor_->getSourceManager();
+  const SourceLocation file_loc = source_manager.getExpansionLoc(loc);
+  if (file_loc.isInvalid() || !file_loc.isFileID())
+    return;
+  const FileID file_id = source_manager.getFileID(file_loc);
+  if (file_id.isInvalid())
+    return;
+  const unsigned key = file_id.getHashValue();
+  active_condition_stacks_[key].push_back(
+      {key, source_manager.getFileOffset(file_loc), 0, expression, file_loc,
+       {expression}, macro, is_ifndef});
+  RecordConditionEvent(file_loc);
 }
 
-void IwyuPreprocessorInfo::EnterAlternative(SourceLocation loc) {
+void IwyuPreprocessorInfo::EnterAlternative(
+    SourceLocation loc, const string& expression, bool is_else) {
   const FileEntry* file = GetFileEntry(loc);
   if (!file)
     return;
   vector<ConditionalState>& stack = conditional_stacks_[file];
   if (!stack.empty())
     stack.back().in_alternative = true;
+
+  const auto& source_manager = preprocessor_->getSourceManager();
+  const SourceLocation file_loc = source_manager.getExpansionLoc(loc);
+  if (file_loc.isInvalid() || !file_loc.isFileID())
+    return;
+  const FileID file_id = source_manager.getFileID(file_loc);
+  if (file_id.isInvalid())
+    return;
+  vector<ActiveConditionalState>& active_stack =
+      active_condition_stacks_[file_id.getHashValue()];
+  if (!active_stack.empty()) {
+    ActiveConditionalState& state = active_stack.back();
+    ++state.branch_index;
+    string branch_expression;
+    for (const string& prior : state.prior_branch_expressions) {
+      if (prior.empty()) {
+        branch_expression.clear();
+        break;
+      }
+      if (!branch_expression.empty())
+        branch_expression += " && ";
+      branch_expression += "!(" + prior + ")";
+    }
+    if (!is_else) {
+      if (expression.empty()) {
+        branch_expression.clear();
+      } else {
+        if (!branch_expression.empty())
+          branch_expression += " && ";
+        branch_expression += "(" + expression + ")";
+      }
+      state.prior_branch_expressions.push_back(expression);
+    }
+    state.expression = branch_expression;
+    state.directive_location = file_loc;
+    RecordConditionEvent(file_loc);
+  }
 }
 
 void IwyuPreprocessorInfo::ExitConditional(SourceLocation loc) {
@@ -893,47 +1077,61 @@ void IwyuPreprocessorInfo::ExitConditional(SourceLocation loc) {
   vector<ConditionalState>& stack = conditional_stacks_[file];
   if (!stack.empty())
     stack.pop_back();
+
+  const auto& source_manager = preprocessor_->getSourceManager();
+  const SourceLocation file_loc = source_manager.getExpansionLoc(loc);
+  if (file_loc.isInvalid() || !file_loc.isFileID())
+    return;
+  const FileID file_id = source_manager.getFileID(file_loc);
+  if (file_id.isInvalid())
+    return;
+  vector<ActiveConditionalState>& active_stack =
+      active_condition_stacks_[file_id.getHashValue()];
+  if (!active_stack.empty()) {
+    active_stack.pop_back();
+    RecordConditionEvent(file_loc);
+  }
 }
 
 void IwyuPreprocessorInfo::If(
-    SourceLocation loc, SourceRange /*condition_range*/,
+    SourceLocation loc, SourceRange condition_range,
     ConditionValueKind /*condition_value*/) {
-  EnterConditional(loc, nullptr, false);
+  EnterConditional(loc, nullptr, false, ConditionSourceText(condition_range));
 }
 
 void IwyuPreprocessorInfo::Elif(
-    SourceLocation loc, SourceRange /*condition_range*/,
+    SourceLocation loc, SourceRange condition_range,
     ConditionValueKind /*condition_value*/, SourceLocation /*if_loc*/) {
-  EnterAlternative(loc);
+  EnterAlternative(loc, ConditionSourceText(condition_range), false);
 }
 
 void IwyuPreprocessorInfo::Elifdef(
-    SourceLocation loc, const Token& /*id*/,
+    SourceLocation loc, const Token& id,
     const MacroDefinition& /*definition*/) {
-  EnterAlternative(loc);
+  EnterAlternative(loc, "defined(" + GetName(id) + ")", false);
 }
 
 void IwyuPreprocessorInfo::Elifdef(
-    SourceLocation loc, SourceRange /*condition_range*/,
+    SourceLocation loc, SourceRange condition_range,
     SourceLocation /*if_loc*/) {
-  EnterAlternative(loc);
+  EnterAlternative(loc, ConditionSourceText(condition_range), false);
 }
 
 void IwyuPreprocessorInfo::Elifndef(
-    SourceLocation loc, const Token& /*id*/,
+    SourceLocation loc, const Token& id,
     const MacroDefinition& /*definition*/) {
-  EnterAlternative(loc);
+  EnterAlternative(loc, "!defined(" + GetName(id) + ")", false);
 }
 
 void IwyuPreprocessorInfo::Elifndef(
-    SourceLocation loc, SourceRange /*condition_range*/,
+    SourceLocation loc, SourceRange condition_range,
     SourceLocation /*if_loc*/) {
-  EnterAlternative(loc);
+  EnterAlternative(loc, ConditionSourceText(condition_range), false);
 }
 
 void IwyuPreprocessorInfo::Else(
     SourceLocation loc, SourceLocation /*if_loc*/) {
-  EnterAlternative(loc);
+  EnterAlternative(loc, "", true);
 }
 
 void IwyuPreprocessorInfo::Endif(
@@ -944,7 +1142,8 @@ void IwyuPreprocessorInfo::Endif(
 void IwyuPreprocessorInfo::Ifdef(SourceLocation loc,
                                  const Token& id,
                                  const MacroDefinition& /*definition*/) {
-  EnterConditional(loc, id.getIdentifierInfo(), false);
+  EnterConditional(loc, id.getIdentifierInfo(), false,
+                   "defined(" + GetName(id) + ")");
   ERRSYM(GetFileEntry(id.getLocation()))
       << "[ #ifdef      ] " << PrintableLoc(id.getLocation())
       << ": " << GetName(id) << "\n";
@@ -954,7 +1153,8 @@ void IwyuPreprocessorInfo::Ifdef(SourceLocation loc,
 void IwyuPreprocessorInfo::Ifndef(SourceLocation loc,
                                   const Token& id,
                                   const MacroDefinition& /*definition*/) {
-  EnterConditional(loc, id.getIdentifierInfo(), true);
+  EnterConditional(loc, id.getIdentifierInfo(), true,
+                   "!defined(" + GetName(id) + ")");
   ERRSYM(GetFileEntry(id.getLocation()))
       << "[ #ifndef     ] " << PrintableLoc(id.getLocation())
       << ": " << GetName(id) << "\n";
@@ -1334,6 +1534,144 @@ bool IwyuPreprocessorInfo::BelongsToMainCompilationUnit(
 const FileEntry* IwyuPreprocessorInfo::IncludeToFileEntry(
     const string quoted_include) const {
   return GetOrDefault(include_to_fileentry_map_, quoted_include, nullptr);
+}
+
+IwyuPreprocessorInfo::ActiveCondition
+IwyuPreprocessorInfo::ActiveConditionAt(SourceLocation loc) const {
+  vector<ActiveConditionalState> path;
+  if (!ConditionPathAt(loc, &path))
+    return {};
+  if (path.empty()) {
+    ActiveCondition result;
+    result.status = ActiveCondition::Status::kNotApplicable;
+    return result;
+  }
+
+  size_t begin = 0;
+  const ActiveConditionalState& outer = path.front();
+  if (outer.branch_index == 0) {
+    const FileEntry* file = GetFileEntry(outer.directive_location);
+    if (file && file != main_file_) {
+      clang::HeaderFileInfo& info =
+          preprocessor_->getHeaderSearchInfo().getFileInfo(file);
+      const clang::IdentifierInfo* controlling_macro =
+          info.getControllingMacro(preprocessor_->getExternalSource());
+      if (controlling_macro &&
+          (!outer.macro ||
+           (outer.is_ifndef && outer.macro == controlling_macro))) {
+        begin = 1;
+      }
+    }
+  }
+  if (begin == path.size()) {
+    ActiveCondition result;
+    result.status = ActiveCondition::Status::kNotApplicable;
+    return result;
+  }
+
+  ActiveCondition result;
+  result.directive_location = path.back().directive_location;
+  result.active_branch = true;
+  for (size_t index = begin; index < path.size(); ++index) {
+    const ActiveConditionalState& branch = path[index];
+    if (branch.expression.empty())
+      return result;
+    if (!result.expression.empty())
+      result.expression += " && ";
+    if (path.size() - begin == 1) {
+      result.expression += branch.expression;
+    } else {
+      result.expression += "(" + branch.expression + ")";
+    }
+  }
+  result.status = ActiveCondition::Status::kKnown;
+  return result;
+}
+
+IwyuPreprocessorInfo::ActiveCondition
+IwyuPreprocessorInfo::DirectIncludeConditionAt(
+    const FileEntry* includer, const string& quoted_include,
+    int line_number) const {
+  SourceLocation match;
+  for (const DirectIncludeCondition& include : direct_include_conditions_) {
+    if (include.includer != includer ||
+        include.quoted_include != quoted_include ||
+        GetLineNumber(include.location) != line_number) {
+      continue;
+    }
+    if (match.isValid())
+      return {};
+    match = include.location;
+  }
+  if (match.isInvalid())
+    return {};
+  return ActiveConditionAt(match);
+}
+
+bool IwyuPreprocessorInfo::ConditionAtLocationDominates(
+    SourceLocation provider_loc, SourceLocation use_loc) const {
+  vector<ActiveConditionalState> provider_path;
+  vector<ActiveConditionalState> use_path;
+  if (!ConditionPathAt(provider_loc, &provider_path) ||
+      !ConditionPathAt(use_loc, &use_path)) {
+    return false;
+  }
+
+  const auto& source_manager = preprocessor_->getSourceManager();
+  provider_loc = source_manager.getExpansionLoc(provider_loc);
+  use_loc = source_manager.getExpansionLoc(use_loc);
+  if (source_manager.getFileID(provider_loc) !=
+      source_manager.getFileID(use_loc)) {
+    return false;
+  }
+  if (provider_path.size() > use_path.size())
+    return false;
+  return std::equal(provider_path.begin(), provider_path.end(),
+                    use_path.begin());
+}
+
+IwyuPreprocessorInfo::DirectIncludeCoverage
+IwyuPreprocessorInfo::DirectIncludeCoverageAt(
+    const FileEntry* includer, const string& quoted_include,
+    SourceLocation use_loc) const {
+  bool found = false;
+  bool unknown = false;
+  for (const DirectIncludeCondition& include : direct_include_conditions_) {
+    if (include.includer != includer ||
+        include.quoted_include != quoted_include) {
+      continue;
+    }
+    found = true;
+    vector<ActiveConditionalState> provider_path;
+    vector<ActiveConditionalState> use_path;
+    if (!ConditionPathAt(include.location, &provider_path) ||
+        !ConditionPathAt(use_loc, &use_path)) {
+      unknown = true;
+      continue;
+    }
+    const auto& source_manager = preprocessor_->getSourceManager();
+    const SourceLocation provider_loc =
+        source_manager.getExpansionLoc(include.location);
+    const SourceLocation consumer_loc = source_manager.getExpansionLoc(use_loc);
+    if (provider_loc.isInvalid() || consumer_loc.isInvalid() ||
+        !provider_loc.isFileID() || !consumer_loc.isFileID()) {
+      unknown = true;
+      continue;
+    }
+    if (source_manager.getFileID(provider_loc) !=
+            source_manager.getFileID(consumer_loc) ||
+        source_manager.getFileOffset(provider_loc) >=
+            source_manager.getFileOffset(consumer_loc)) {
+      continue;
+    }
+    if (ConditionAtLocationDominates(include.location, use_loc))
+      return DirectIncludeCoverage::kCoversUse;
+  }
+  if (!found)
+    return DirectIncludeCoverage::kNoDirectOccurrence;
+  if (unknown)
+    return DirectIncludeCoverage::kUnknown;
+  return DirectIncludeCoverage::kDoesNotCoverUse;
 }
 
 IwyuFileInfo* IwyuPreprocessorInfo::FileInfoFor(const FileEntry* file) const {

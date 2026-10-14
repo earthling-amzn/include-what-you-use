@@ -174,6 +174,24 @@ branch. Macro known value contains name and definition/expansion availability.
 Policy known value contains policy file, rule ID, and decision. Multi-config
 known value contains at least one typed per-configuration contribution.
 
+The native producer computes source-derived active conditions for AST uses and
+operations. Unconditional source emits `not_applicable`, a complete branch path
+emits `known`, and a location or expression that cannot be recovered safely
+emits `unknown`; it never treats unknown provenance as unconditional. A
+Clang-proved controlling include guard is framing and is omitted from the
+condition.
+
+Condition expressions preserve source tokens with whitespace runs collapsed;
+macros are not expanded. `#ifdef X` is rendered as `defined(X)` and `#ifndef X`
+as `!defined(X)`. An `#elif E` branch is the conjunction of the negated prior
+sibling tests and `(E)`; `#else` is the conjunction of all negated prior sibling
+tests. Nested groups are an ordered parenthesized conjunction from outermost to
+innermost. The known location identifies the active innermost branch directive,
+and `active_branch` is true because AST uses and direct includes arise only from
+the selected branch. Branch identity also includes source directive locations
+and the Clang `FileID` internally, so textually identical conditions in separate
+groups or repeated include instances are not interchangeable providers.
+
 ## Associated headers
 
 Each association records:
@@ -209,8 +227,10 @@ contributions with:
 - typed condition provenance
 
 An empty array is not used for unknown or unnamed configuration state. A normal
-single-config producer emits `not_applicable` or a known single contribution,
-according to the OUTPUT-002 implementation decision. In a multi-config aggregate,
+single-config producer emits a known singleton contribution when
+`--configuration` is supplied and `not_applicable` otherwise. The contribution
+repeats the operation's exact subject, disposition, and edit condition. In a
+multi-config aggregate,
 every operation has one contribution for every name in
 `analyzed_configurations`; missing recommendations use `none/not_applicable`.
 Configuration names are unique. Every non-`none` contribution has the same
@@ -315,10 +335,12 @@ state, plus `skipped` records when schema v1 cannot represent a duplicate
 occurrence edit without contradicting retained desired membership. It preserves
 applied add/remove operations, current keep/suppress decision reasons, exact
 physical spelling for present-item operations, grouped motivating symbol uses,
-associated-header reasons, and recoverable IWYU/Clang diagnostics. Unsupported
-provider chains, macro/condition origin details, project policy provenance,
-configuration names, and multi-configuration contributions use typed
-`unavailable` values.
+associated-header reasons, and recoverable IWYU/Clang diagnostics. It emits
+source-derived per-use and edit conditions, known policy provenance for native
+policy decisions, exact optional invocation configuration names, and known
+singleton contributions for configured runs. Unsupported provider chains,
+macro-origin details, and exact source ranges use typed unavailable values; an
+individual condition that cannot be recovered safely uses `unknown`.
 
 Native output sorts file records and operations deterministically. The driver
 expands response files using the compiler's GNU or clang-cl tokenization,
@@ -329,18 +351,21 @@ and native stderr in database-index order.
 
 ## Remaining native-model work
 
-The initial producer intentionally leaves these fields unavailable until later
-semantic and policy tasks retain them without inference:
+The producer still leaves these fields unavailable until later semantic and
+policy tasks retain them without inference:
 
 - exact macro-versus-AST origin and macro definition/expansion provenance;
-- normalized selected/candidate provider paths and provider chains;
+- normalized selected/candidate provider paths and provider chains outside the
+  currently verified dotted-inline endpoint;
 - exact source ranges for edits;
-- general preprocessor expression, location, branch, and use/edit links;
-- project-policy provenance;
-- named configuration and multi-configuration contributions.
+- active-condition project-policy matching with explicit indeterminate
+  first-match behavior;
+- native multi-database aggregation, condition-aware insertion anchors, and
+  declaration-kind conflict provenance.
 
-Unavailable fields use the typed wrappers defined above. Producers must never
-invent values or use arbitrary payload objects.
+Unavailable fields use the typed wrappers defined above. A supported fact that
+cannot be recovered for one location uses `unknown`. Producers must never invent
+values or use arbitrary payload objects.
 
 ## Security
 

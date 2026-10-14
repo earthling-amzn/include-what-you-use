@@ -888,7 +888,9 @@ bool DeclCanBeForwardDeclared(const Decl* decl) {
 // it's actually ok if the declaration follows the use, inside a
 // class.  (You can write a method using a Foo* before defining the
 // nested class Foo later in the class.)
-bool DeclIsVisibleToUseInSameFile(const Decl* decl, const OneUse& use) {
+bool DeclIsVisibleToUseInSameFile(
+    const Decl* decl, const OneUse& use,
+    const IwyuPreprocessorInfo* preprocessor_info) {
   if (GetFileEntry(decl) != GetFileEntry(use.use_loc()))
     return false;
 
@@ -898,10 +900,14 @@ bool DeclIsVisibleToUseInSameFile(const Decl* decl, const OneUse& use) {
   // )  It can even be visible if the decl comes after, if the decl
   // is inside the class definition and the use is in the body of a
   // method.
-  return (IsBeforeInSameFile(decl, use.use_loc()) ||
-          GetLocation(decl) == use.use_loc() ||
-          (DeclsAreInSameClass(decl, use.decl()) && !decl->isOutOfLine() &&
-           (use.flags() & UF_InCxxMethodBody)));
+  const bool language_visible =
+      IsBeforeInSameFile(decl, use.use_loc()) ||
+      GetLocation(decl) == use.use_loc() ||
+      (DeclsAreInSameClass(decl, use.decl()) && !decl->isOutOfLine() &&
+       (use.flags() & UF_InCxxMethodBody));
+  return language_visible && preprocessor_info &&
+         preprocessor_info->ConditionAtLocationDominates(
+             GetLocation(decl), use.use_loc());
 }
 
 // This makes a best-effort attempt to find the smallest set of
@@ -1318,7 +1324,7 @@ void ProcessForwardDeclare(OneUse* use,
     CHECK_(isa<TagDecl>(redecl) && "GetTagRedecls has redecls of wrong type");
     const SourceLocation defined_loc = GetLocation(redecl);
     if (cast<TagDecl>(redecl)->isCompleteDefinition() &&
-        DeclIsVisibleToUseInSameFile(redecl, *use)) {
+        DeclIsVisibleToUseInSameFile(redecl, *use, preprocessor_info)) {
       VERRS(6) << "Ignoring fwd-decl use of " << use->symbol_name() << " ("
                << use->PrintableUseLoc()
                << "): dfn is present: " << PrintableLoc(defined_loc) << "\n";
@@ -1407,7 +1413,8 @@ void ProcessFullUse(OneUse* use, const IwyuPreprocessorInfo* preprocessor_info,
   // we need a definition?), when in fact it's crucial.
   // For now, we assume a 'later' usage must be in the same file.
   if (GetFileEntry(use->use_loc()) == GetFileEntry(use->decl()) &&
-      !DeclIsVisibleToUseInSameFile(use->decl(), *use) &&
+      !DeclIsVisibleToUseInSameFile(
+          use->decl(), *use, preprocessor_info) &&
       DeclCanBeForwardDeclared(use->decl())) {
     if (preprocessor_info->ForwardDeclareIsInhibited(
             GetFileEntry(use->use_loc()), use->symbol_name())) {
@@ -1447,7 +1454,7 @@ void ProcessFullUse(OneUse* use, const IwyuPreprocessorInfo* preprocessor_info,
     else
       all_redecls = GetNonTagRedecls(use->decl());
     for (const NamedDecl* redecl : all_redecls) {
-      if (DeclIsVisibleToUseInSameFile(redecl, *use)) {
+      if (DeclIsVisibleToUseInSameFile(redecl, *use, preprocessor_info)) {
         VERRS(6) << "Ignoring use of " << use->symbol_name() << " ("
                  << use->PrintableUseLoc() << "): definition is present: "
                  << PrintableLoc(use->decl_loc()) << "\n";
@@ -1621,7 +1628,8 @@ void CalculateIwyuForForwardDeclareUse(
     OneUse* use,
     const set<string>& actual_includes,
     const set<string>& desired_includes,
-    const set<const FileEntry*>& associated_includes) {
+    const set<const FileEntry*>& associated_includes,
+    const IwyuPreprocessorInfo* preprocessor_info) {
   CHECK_(!use->ignore_use() && "Trying to calculate on an ignored use");
   CHECK_(use->decl() && "CalculateIwyuForForwardDeclareUse takes a fwd-decl");
   CHECK_(!use->is_full_use() && "ForwardDeclareUse are not full uses");
@@ -1637,9 +1645,23 @@ void CalculateIwyuForForwardDeclareUse(
   CHECK_(tag_decl && "Non-tag types should have been handled already");
 
   // If this tag type is defined in one of the desired_includes, mark that
-  // fact.  Also if it's defined in one of the actual_includes.
+  // fact.  Also if it's defined in one of the actual_includes. A direct
+  // include can satisfy the use only when its active branch dominates the use.
+  // Associated-header edges retain their existing conservative semantics until
+  // they carry occurrence-level condition provenance.
   bool dfn_is_in_desired_includes = false;
   bool dfn_is_in_actual_includes = false;
+  const FileEntry* use_file = GetFileEntry(use->use_loc());
+  const auto direct_include_covers_use =
+      [&](const string& header) {
+        const auto coverage = preprocessor_info->DirectIncludeCoverageAt(
+            use_file, header, use->use_loc());
+        return coverage ==
+                   IwyuPreprocessorInfo::DirectIncludeCoverage::
+                       kNoDirectOccurrence ||
+               coverage ==
+                   IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse;
+      };
 
   const NamedDecl* dfn = GetTagDefinition(use->decl());
   if (dfn) {
@@ -1647,14 +1669,18 @@ void CalculateIwyuForForwardDeclareUse(
         GlobalIncludePicker().GetCandidateHeadersForFilepathIncludedFrom(
             GetFilePath(dfn), GetFilePath(use->use_loc()));
     for (const string& header : headers) {
-      if (ContainsKey(desired_includes, header))
+      if (ContainsKey(desired_includes, header) &&
+          direct_include_covers_use(header)) {
         dfn_is_in_desired_includes = true;
-      if (ContainsKey(actual_includes, header))
+      }
+      if (ContainsKey(actual_includes, header) &&
+          direct_include_covers_use(header)) {
         dfn_is_in_actual_includes = true;
+      }
     }
     // We ourself are always a 'desired' and 'actual' include (though
     // only if the definition is visible from the use location).
-    if (DeclIsVisibleToUseInSameFile(dfn, *use)) {
+    if (DeclIsVisibleToUseInSameFile(dfn, *use, preprocessor_info)) {
       dfn_is_in_desired_includes = true;
       dfn_is_in_actual_includes = true;
     }
@@ -1664,7 +1690,7 @@ void CalculateIwyuForForwardDeclareUse(
   // in the same file as the use (and before it).
   const set<const NamedDecl*>& redecls = GetTagRedecls(tag_decl);
   for (const NamedDecl* redecl : redecls) {
-    if (DeclIsVisibleToUseInSameFile(redecl, *use)) {
+    if (DeclIsVisibleToUseInSameFile(redecl, *use, preprocessor_info)) {
       same_file_decl = redecl;
       break;
     }
@@ -1861,7 +1887,7 @@ void IwyuFileInfo::CalculateIwyuViolations(vector<OneUse>* uses) {
     } else if (!use.is_full_use()) {
       internal::CalculateIwyuForForwardDeclareUse(
           &use, effective_direct_includes, effective_desired_includes,
-          AssociatedFileEntries());
+          AssociatedFileEntries(), preprocessor_info_);
     } else {
       internal::CalculateIwyuForFullUse(
           &use, effective_direct_includes, quoted_file_);
@@ -2473,6 +2499,21 @@ llvm::json::Object AvailableLocation(SourceLocation location,
                             {"value", LocationObject(value)}};
 }
 
+llvm::json::Object ConditionObject(
+    const IwyuPreprocessorInfo::ActiveCondition& condition) {
+  using Status = IwyuPreprocessorInfo::ActiveCondition::Status;
+  if (condition.status == Status::kNotApplicable)
+    return NotApplicableValue();
+  if (condition.status == Status::kUnknown)
+    return llvm::json::Object{{"status", "unknown"}, {"value", nullptr}};
+  return llvm::json::Object{
+      {"status", "known"},
+      {"value", llvm::json::Object{
+          {"expression", condition.expression},
+          {"location", AvailableLocation(condition.directive_location, false)},
+          {"active_branch", condition.active_branch}}}};
+}
+
 llvm::json::Object KnownString(const string& value) {
   return llvm::json::Object{{"status", "known"}, {"value", value}};
 }
@@ -2572,6 +2613,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       bool has_qualified_name;
       string qualified_name;
       StructuredLocationValue location;
+      IwyuPreprocessorInfo::ActiveCondition condition;
     };
     vector<UseFact> facts;
     for (const OneUse& use : symbol_uses_) {
@@ -2595,24 +2637,27 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       const string name = use.short_symbol_name().empty()
           ? use.symbol_name() : use.short_symbol_name();
       facts.push_back({&use, name, use.decl() != nullptr,
-                       use.symbol_name(), location});
+                       use.symbol_name(), location,
+                       preprocessor_info_->ActiveConditionAt(use.use_loc())});
     }
     const auto fact_key = [](const UseFact& fact) {
       const string primary = fact.has_qualified_name
           ? fact.qualified_name : fact.name;
       const int requirement = fact.use->is_full_use() ? 0 : 1;
       const int identity_availability = fact.has_qualified_name ? 0 : 1;
-      return std::make_tuple(primary, fact.name, fact.location.path,
-                             fact.location.line, fact.location.column,
-                             requirement, identity_availability);
+      return std::make_tuple(
+          primary, fact.name, fact.location.path, fact.location.line,
+          fact.location.column, requirement, identity_availability,
+          static_cast<int>(fact.condition.status), fact.condition.expression);
     };
     const auto use_identity_key = [](const UseFact& fact) {
       const string primary = fact.has_qualified_name
           ? fact.qualified_name : fact.name;
       const int requirement = fact.use->is_full_use() ? 0 : 1;
-      return std::make_tuple(primary, fact.name, fact.location.path,
-                             fact.location.line, fact.location.column,
-                             requirement);
+      return std::make_tuple(
+          primary, fact.name, fact.location.path, fact.location.line,
+          fact.location.column, requirement,
+          static_cast<int>(fact.condition.status), fact.condition.expression);
     };
     std::sort(facts.begin(), facts.end(),
               [&](const UseFact& lhs, const UseFact& rhs) {
@@ -2643,7 +2688,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
             {"requirement", fact.use->is_full_use()
                                 ? "full" : "forward_declaration"},
             {"origin", "unknown"},
-            {"condition", UnavailableValue()},
+            {"condition", ConditionObject(fact.condition)},
             {"macro", UnavailableValue()}});
       }
       const UseFact& first = facts[begin];
@@ -2764,6 +2809,50 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
         {"status", "known"}, {"value", std::move(candidates)}};
     return provider;
   };
+
+  const auto operation_condition = [&](const OperationRef& operation) {
+    using ActiveCondition = IwyuPreprocessorInfo::ActiveCondition;
+    if (operation.line->is_present()) {
+      if (operation.line->IsIncludeLine()) {
+        return preprocessor_info_->DirectIncludeConditionAt(
+            file_, operation.line->quoted_include(),
+            operation.line->start_linenum());
+      }
+      if (operation.line->fwd_decl())
+        return preprocessor_info_->ActiveConditionAt(
+            GetLocation(operation.line->fwd_decl()));
+      return ActiveCondition{};
+    }
+
+    bool found = false;
+    ActiveCondition common;
+    for (const OneUse& use : symbol_uses_) {
+      if (use.ignore_use() || use.symbol_name().empty())
+        continue;
+      const bool motivates = operation.line->IsIncludeLine()
+          ? use.has_suggested_header() &&
+                use.suggested_header() == operation.line->quoted_include()
+          : !use.is_full_use() && !use.has_suggested_header() &&
+                use.decl() == operation.line->fwd_decl();
+      if (!motivates)
+        continue;
+      const ActiveCondition condition =
+          preprocessor_info_->ActiveConditionAt(use.use_loc());
+      if (!found) {
+        common = condition;
+        found = true;
+        continue;
+      }
+      if (common.status != condition.status ||
+          common.expression != condition.expression ||
+          common.directive_location != condition.directive_location ||
+          common.active_branch != condition.active_branch) {
+        return ActiveCondition{};
+      }
+    }
+    return found ? common : ActiveCondition{};
+  };
+
   std::sort(operations.begin(), operations.end(),
             [&](const OperationRef& lhs, const OperationRef& rhs) {
               return operation_key(lhs) < operation_key(rhs);
@@ -2773,6 +2862,8 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
   int operation_number = 1;
   for (const OperationRef& operation : operations) {
     llvm::json::Object provider = operation_provider(operation);
+    const IwyuPreprocessorInfo::ActiveCondition edit_condition =
+        operation_condition(operation);
 
     llvm::json::Object value;
     value["id"] = "op-" + to_string(operation_number++);
@@ -2787,7 +2878,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
     value["reason"] = operation.reason;
     value["symbols"] = operation_symbols(operation);
     value["provider"] = std::move(provider);
-    value["edit_condition"] = UnavailableValue();
+    value["edit_condition"] = ConditionObject(edit_condition);
     if (operation.line->has_project_policy_decision()) {
       value["policy"] = llvm::json::Object{
           {"status", "known"},
@@ -2798,7 +2889,19 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
     } else {
       value["policy"] = UnavailableValue();
     }
-    value["multi_config"] = UnavailableValue();
+    const string& configuration = GlobalFlags().configuration;
+    if (configuration.empty()) {
+      value["multi_config"] = NotApplicableValue();
+    } else {
+      llvm::json::Array contributions;
+      contributions.push_back(llvm::json::Object{
+          {"configuration", configuration},
+          {"subject_action", operation.subject_action},
+          {"disposition", operation.disposition},
+          {"condition", ConditionObject(edit_condition)}});
+      value["multi_config"] = llvm::json::Object{
+          {"status", "known"}, {"value", std::move(contributions)}};
+    }
     operation_values.push_back(std::move(value));
   }
 

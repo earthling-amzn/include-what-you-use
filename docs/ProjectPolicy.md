@@ -60,7 +60,9 @@ action or fact fails with a capability diagnostic; IWYU never silently ignores
 a safety rule. POLICY-002 enables `deny_add`; POLICY-007 enables `deny_remove`
 and `keep`. These actions match includer, includee, file kind, symbol, and the
 optional invocation configuration supplied by `-Xiwyu
---configuration=<name>`. Active-condition facts remain unavailable.
+--configuration=<name>`. Active-condition provenance is emitted in structured
+output, but `active_condition` policy matching remains unavailable until unknown
+facts can propagate as an explicit indeterminate first-match decision.
 
 ## `deny_add` runtime semantics
 

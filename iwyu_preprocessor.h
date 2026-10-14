@@ -160,6 +160,41 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
   bool FileTransitivelyIncludes(const string& quoted_includer,
                                 const clang::FileEntry* includee) const;
 
+  // Returns true when the preprocessor branch active at provider_loc is also
+  // active at use_loc. An unconditional provider dominates every use in the
+  // same include instance; a conditional provider dominates only uses in the
+  // same branch or a nested branch. Unknown locations fail closed.
+  bool ConditionAtLocationDominates(clang::SourceLocation provider_loc,
+                                    clang::SourceLocation use_loc) const;
+
+  struct ActiveCondition {
+    enum class Status { kNotApplicable, kKnown, kUnknown };
+    Status status = Status::kUnknown;
+    string expression;
+    clang::SourceLocation directive_location;
+    bool active_branch = false;
+  };
+
+  ActiveCondition ActiveConditionAt(clang::SourceLocation loc) const;
+  ActiveCondition DirectIncludeConditionAt(
+      const clang::FileEntry* includer, const string& quoted_include,
+      int line_number) const;
+
+  enum class DirectIncludeCoverage {
+    kNoDirectOccurrence,
+    kCoversUse,
+    kDoesNotCoverUse,
+    kUnknown,
+  };
+
+  // Returns condition-aware coverage for direct occurrences of quoted_include
+  // in includer. Associated-header and other effective includes are reported as
+  // kNoDirectOccurrence so callers can preserve their existing semantics until
+  // those edges carry native condition provenance too.
+  DirectIncludeCoverage DirectIncludeCoverageAt(
+      const clang::FileEntry* includer, const string& quoted_include,
+      clang::SourceLocation use_loc) const;
+
   // Return true if the given file has
   // "// IWYU pragma: no_include <other_filename>".
   bool IncludeIsInhibited(const clang::FileEntry* file,
@@ -247,6 +282,37 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
     bool in_alternative;
   };
 
+  // Source-derived branch identity for one active #if/#elif/#else group.
+  // FileID distinguishes repeated include instances of one physical file.
+  struct ActiveConditionalState {
+    unsigned file_id;
+    unsigned opening_location;
+    unsigned branch_index;
+    string expression;
+    clang::SourceLocation directive_location;
+    vector<string> prior_branch_expressions;
+    const clang::IdentifierInfo* macro;
+    bool is_ifndef;
+
+    bool operator==(const ActiveConditionalState& other) const {
+      return file_id == other.file_id &&
+             opening_location == other.opening_location &&
+             branch_index == other.branch_index;
+    }
+  };
+
+  struct ConditionEvent {
+    unsigned file_id;
+    unsigned offset;
+    vector<ActiveConditionalState> path;
+  };
+
+  struct DirectIncludeCondition {
+    const clang::FileEntry* includer;
+    string quoted_include;
+    clang::SourceLocation location;
+  };
+
   struct PendingDottedInlineExport {
     const clang::FileEntry* includer;
     const clang::FileEntry* includee;
@@ -256,9 +322,14 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
 
   void EnterConditional(clang::SourceLocation loc,
                         const clang::IdentifierInfo* macro,
-                        bool is_ifndef);
-  void EnterAlternative(clang::SourceLocation loc);
+                        bool is_ifndef, const string& expression);
+  void EnterAlternative(clang::SourceLocation loc, const string& expression,
+                        bool is_else);
   void ExitConditional(clang::SourceLocation loc);
+  string ConditionSourceText(clang::SourceRange range) const;
+  void RecordConditionEvent(clang::SourceLocation loc);
+  bool ConditionPathAt(clang::SourceLocation loc,
+                       vector<ActiveConditionalState>* path) const;
   void MaybeRecordDottedInlineExport(
       clang::SourceLocation includer_loc, const clang::FileEntry* includee,
       const string& include_name_as_written);
@@ -332,6 +403,9 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
 
   clang::Preprocessor* preprocessor_;
   map<const clang::FileEntry*, vector<ConditionalState>> conditional_stacks_;
+  map<unsigned, vector<ActiveConditionalState>> active_condition_stacks_;
+  map<unsigned, vector<ConditionEvent>> condition_events_;
+  vector<DirectIncludeCondition> direct_include_conditions_;
   vector<PendingDottedInlineExport> pending_dotted_inline_exports_;
 
   // The C++ source file passed in as an argument to the compiler (as
