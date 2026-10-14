@@ -357,6 +357,150 @@ def main():
     # operation spanning both fails closed rather than inventing one anchor.
     assert repeated_add["edit_condition"]["status"] == "unknown"
 
+    # active_condition policy matching uses exact source-derived expressions.
+    exact_condition_policy = """schema_version: 1
+rules:
+  - id: exact-condition-add
+    action: deny_add
+    match:
+      includee: { glob: "*tests/cxx/indirect.h" }
+      active_condition: ENABLE_NATIVE_JSON_CONDITION
+"""
+    exact_condition_result, exact_condition_path = run_with_temporary_policy(
+        "tests/native_json/condition_add.cc", exact_condition_policy)
+    assert exact_condition_result.returncode == 0, exact_condition_result.stderr
+    exact_condition_record = by_path(
+        records(exact_condition_result), "condition_add.cc")
+    exact_condition_add = next(
+        operation for operation in exact_condition_record["operations"]
+        if operation["subject_action"] == "add")
+    assert exact_condition_add["reason_code"] == "project_policy_deny_add"
+    assert exact_condition_add["policy"] == {
+        "status": "known",
+        "value": {
+            "policy_file": exact_condition_path,
+            "rule_id": "exact-condition-add",
+            "decision": "deny",
+        },
+    }
+
+    mismatch_condition_policy = exact_condition_policy.replace(
+        "ENABLE_NATIVE_JSON_CONDITION", "OTHER_CONDITION")
+    mismatch_condition_result, _ = run_with_temporary_policy(
+        "tests/native_json/condition_add.cc", mismatch_condition_policy)
+    assert mismatch_condition_result.returncode == 0, (
+        mismatch_condition_result.stderr)
+    mismatch_condition_record = by_path(
+        records(mismatch_condition_result), "condition_add.cc")
+    mismatch_condition_add = next(
+        operation for operation in mismatch_condition_record["operations"]
+        if operation["subject_action"] == "add")
+    assert mismatch_condition_add["disposition"] == "apply"
+    assert mismatch_condition_add["policy"]["status"] == "unavailable"
+
+    known_mismatch_order_policy = """schema_version: 1
+rules:
+  - id: known-condition-mismatch
+    action: deny_add
+    match:
+      includee: { glob: "*tests/cxx/indirect.h" }
+      active_condition: OTHER_CONDITION
+  - id: later-unconditional-after-mismatch
+    action: deny_add
+    match:
+      includee: { glob: "*tests/cxx/indirect.h" }
+"""
+    known_mismatch_order_result, _ = run_with_temporary_policy(
+        "tests/native_json/condition_add.cc", known_mismatch_order_policy)
+    assert known_mismatch_order_result.returncode == 0, (
+        known_mismatch_order_result.stderr)
+    known_mismatch_order_record = by_path(
+        records(known_mismatch_order_result), "condition_add.cc")
+    known_mismatch_order_add = next(
+        operation for operation in known_mismatch_order_record["operations"]
+        if operation["subject_action"] == "add")
+    assert known_mismatch_order_add["policy"]["value"]["rule_id"] == (
+        "later-unconditional-after-mismatch")
+
+    nested_condition_policy = """schema_version: 1
+rules:
+  - id: nested-else-condition-add
+    action: deny_add
+    match:
+      includee: { glob: "*tests/cxx/indirect.h" }
+      active_condition: "(ENABLE_OUTER_CONDITION) && (!(SELECT_LEFT_CONDITION))"
+"""
+    nested_condition_result, _ = run_with_temporary_policy(
+        "tests/native_json/condition_nested_else.cc",
+        nested_condition_policy)
+    assert nested_condition_result.returncode == 0, nested_condition_result.stderr
+    nested_condition_record = by_path(
+        records(nested_condition_result), "condition_nested_else.cc")
+    nested_condition_add = next(
+        operation for operation in nested_condition_record["operations"]
+        if operation["subject_action"] == "add")
+    assert nested_condition_add["reason_code"] == "project_policy_deny_add"
+
+    unconditional_condition_policy = exact_condition_policy.replace(
+        "*tests/cxx/indirect.h",
+        "*tests/native_json/policy002_provider.inline.hpp")
+    unconditional_condition_result, _ = run_with_temporary_policy(
+        "tests/native_json/policy002_source.cc",
+        unconditional_condition_policy)
+    assert unconditional_condition_result.returncode == 0, (
+        unconditional_condition_result.stderr)
+    unconditional_condition_record = by_path(
+        records(unconditional_condition_result), "policy002_source.cc")
+    unconditional_condition_add = next(
+        operation for operation in unconditional_condition_record["operations"]
+        if operation["subject_action"] == "add" and
+        "policy002_provider.inline.hpp" in operation["spelling"])
+    assert unconditional_condition_add["edit_condition"]["status"] == (
+        "not_applicable")
+    assert unconditional_condition_add["disposition"] == "apply"
+
+    indeterminate_policy = """schema_version: 1
+rules:
+  - id: first-condition-is-indeterminate
+    action: deny_add
+    match:
+      includee: { glob: "*tests/cxx/indirect.h" }
+      active_condition: REPEATED_CONDITION_ENABLED
+  - id: later-unconditional-must-not-win
+    action: deny_add
+    match:
+      includee: { glob: "*tests/cxx/indirect.h" }
+"""
+    indeterminate_result, _ = run_with_temporary_policy(
+        "tests/native_json/repeated_condition_driver.cc",
+        indeterminate_policy,
+        "--check_also=tests/native_json/repeated_condition.hpp")
+    assert indeterminate_result.returncode == 0, indeterminate_result.stderr
+    indeterminate_record = by_path(
+        records(indeterminate_result), "repeated_condition.hpp")
+    indeterminate_add = next(
+        operation for operation in indeterminate_record["operations"]
+        if operation["subject_action"] == "add")
+    assert (indeterminate_add["disposition"],
+            indeterminate_add["reason_code"]) == (
+                "suppress", "project_policy_active_condition_unknown")
+    assert indeterminate_add["policy"]["status"] == "unavailable"
+    indeterminate_diagnostics = [
+        diagnostic for diagnostic in indeterminate_record["diagnostics"]
+        if diagnostic["code"] == "project_policy_active_condition_unknown"]
+    assert len(indeterminate_diagnostics) == 1
+    assert "first-condition-is-indeterminate" in (
+        indeterminate_diagnostics[0]["message"])
+    assert "later-unconditional-must-not-win" not in (
+        indeterminate_diagnostics[0]["message"])
+
+    indeterminate_error, _ = run_with_temporary_policy(
+        "tests/native_json/repeated_condition_driver.cc",
+        indeterminate_policy,
+        "--check_also=tests/native_json/repeated_condition.hpp",
+        "--error=9")
+    assert indeterminate_error.returncode == 9, indeterminate_error.stderr
+    records(indeterminate_error)
     # Symbol-motivated additions expose known OneUse facts without inventing
     # origin or macro provenance. Unconditional source is explicitly
     # not-applicable rather than unavailable condition data.
@@ -1128,6 +1272,85 @@ rules:
         if op["subject_action"] == "remove" and
         "policy007_unused.hpp" in op["spelling"])
     assert baseline_remove["disposition"] == "apply"
+
+    conditional_removal_source = (
+        "tests/native_json/policy_active_condition_remove.cc")
+    exact_removal_policy = """schema_version: 1
+rules:
+  - id: exact-condition-removal
+    action: deny_remove
+    match:
+      includee: { glob: "*policy007_unused.hpp" }
+      active_condition: POLICY_ACTIVE_REMOVE
+"""
+    exact_removal_result, exact_removal_path = run_with_temporary_policy(
+        conditional_removal_source, exact_removal_policy)
+    assert exact_removal_result.returncode == 0, exact_removal_result.stderr
+    exact_removal_record = by_path(
+        records(exact_removal_result), "policy_active_condition_remove.cc")
+    exact_removal = next(
+        operation for operation in exact_removal_record["operations"]
+        if operation["subject_action"] == "remove")
+    assert exact_removal["edit_condition"]["value"]["expression"] == (
+        "POLICY_ACTIVE_REMOVE")
+    assert exact_removal["reason_code"] == "project_policy_deny_remove"
+    assert exact_removal["policy"] == {
+        "status": "known",
+        "value": {
+            "policy_file": exact_removal_path,
+            "rule_id": "exact-condition-removal",
+            "decision": "deny",
+        },
+    }
+
+    mismatch_removal_policy = exact_removal_policy.replace(
+        "POLICY_ACTIVE_REMOVE", "OTHER_REMOVE_CONDITION")
+    mismatch_removal_result, _ = run_with_temporary_policy(
+        conditional_removal_source, mismatch_removal_policy)
+    assert mismatch_removal_result.returncode == 0, (
+        mismatch_removal_result.stderr)
+    mismatch_removal_record = by_path(
+        records(mismatch_removal_result),
+        "policy_active_condition_remove.cc")
+    mismatch_removal = next(
+        operation for operation in mismatch_removal_record["operations"]
+        if operation["subject_action"] == "remove")
+    assert mismatch_removal["disposition"] == "apply"
+    assert mismatch_removal["policy"]["status"] == "unavailable"
+    indeterminate_removal_policy = """schema_version: 1
+rules:
+  - id: ambiguous-condition-removal
+    action: deny_remove
+    match:
+      includee: { glob: "*policy_active_condition_empty.hpp" }
+      active_condition: POLICY_ACTIVE_REPEATED_REMOVE
+"""
+    indeterminate_removal_result, _ = run_with_temporary_policy(
+        "tests/native_json/policy_active_condition_repeated_remove.cc",
+        indeterminate_removal_policy,
+        "--check_also=tests/native_json/"
+        "policy_active_condition_repeated_remove.hpp")
+    assert indeterminate_removal_result.returncode == 0, (
+        indeterminate_removal_result.stderr)
+    indeterminate_removal_record = by_path(
+        records(indeterminate_removal_result),
+        "policy_active_condition_repeated_remove.hpp")
+    indeterminate_removal = next(
+        operation for operation in indeterminate_removal_record["operations"]
+        if operation["subject_action"] == "remove")
+    assert (indeterminate_removal["disposition"],
+            indeterminate_removal["reason_code"]) == (
+                "suppress", "project_policy_active_condition_unknown")
+    assert indeterminate_removal["edit_condition"]["status"] == "unknown"
+    assert indeterminate_removal["policy"]["status"] == "unavailable"
+    assert indeterminate_removal["spelling"] in {
+        item["spelling"]
+        for item in indeterminate_removal_record["desired_state"]["items"]}
+    assert len([
+        diagnostic
+        for diagnostic in indeterminate_removal_record["diagnostics"]
+        if diagnostic["code"] ==
+        "project_policy_active_condition_unknown"]) == 1
 
     header_deny_policy = """schema_version: 1
 rules:

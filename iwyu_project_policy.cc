@@ -480,22 +480,36 @@ class ProjectPolicy::Rule {
   std::optional<string> symbol;
   std::optional<string> configuration;
 
-  bool Matches(const ProjectPolicyMatchContext& context) const {
+  ProjectPolicyMatchResult::Kind Matches(
+      const ProjectPolicyMatchContext& context) const {
     if (includer && !includer->Matches(context.includer))
-      return false;
+      return ProjectPolicyMatchResult::Kind::NoMatch;
     if (includee && !includee->Matches(context.includee))
-      return false;
+      return ProjectPolicyMatchResult::Kind::NoMatch;
     if (file_kind && *file_kind != context.file_kind)
-      return false;
-    if (active_condition && *active_condition != context.active_condition)
-      return false;
+      return ProjectPolicyMatchResult::Kind::NoMatch;
     if (configuration && *configuration != context.configuration)
-      return false;
+      return ProjectPolicyMatchResult::Kind::NoMatch;
     if (symbol && std::find(context.symbols.begin(), context.symbols.end(),
                             *symbol) == context.symbols.end()) {
-      return false;
+      return ProjectPolicyMatchResult::Kind::NoMatch;
     }
-    return true;
+    if (!active_condition)
+      return ProjectPolicyMatchResult::Kind::Match;
+
+    switch (context.active_condition.availability) {
+      case ProjectPolicyConditionAvailability::NotApplicable:
+        // A conditional policy rule never matches an unconditional source
+        // fact.
+        return ProjectPolicyMatchResult::Kind::NoMatch;
+      case ProjectPolicyConditionAvailability::Known:
+        return *active_condition == context.active_condition.expression
+                   ? ProjectPolicyMatchResult::Kind::Match
+                   : ProjectPolicyMatchResult::Kind::NoMatch;
+      case ProjectPolicyConditionAvailability::Unknown:
+        return ProjectPolicyMatchResult::Kind::Indeterminate;
+    }
+    return ProjectPolicyMatchResult::Kind::Indeterminate;
   }
 };
 
@@ -616,11 +630,6 @@ bool ProjectPolicy::ValidateRuntimeCapabilities(bool has_configuration,
       return Fail(path_, context, "action '" + ActionName(rule.action) +
                   "' is recognized but not enabled in this phase", error);
     }
-    if (rule.active_condition) {
-      return Fail(path_, context,
-                  "active_condition is recognized but unavailable in this phase",
-                  error);
-    }
     if (rule.configuration && !has_configuration) {
       return Fail(path_, context,
                   "configuration matching requires --configuration", error);
@@ -629,24 +638,51 @@ bool ProjectPolicy::ValidateRuntimeCapabilities(bool has_configuration,
   return true;
 }
 
-std::optional<ProjectPolicyDecision> ProjectPolicy::FirstMatchingRule(
+ProjectPolicyMatchResult ProjectPolicy::FirstMatchingRule(
     ProjectPolicyAction action,
     const ProjectPolicyMatchContext& context) const {
   for (const std::unique_ptr<Rule>& rule : rules_) {
-    if (rule->action == action && rule->Matches(context))
-      return ProjectPolicyDecision{action, path_, rule->id};
+    if (rule->action != action)
+      continue;
+    const ProjectPolicyMatchResult::Kind kind = rule->Matches(context);
+    if (kind == ProjectPolicyMatchResult::Kind::NoMatch)
+      continue;
+
+    ProjectPolicyMatchResult result;
+    result.kind = kind;
+    if (kind == ProjectPolicyMatchResult::Kind::Match) {
+      result.decision = ProjectPolicyDecision{action, path_, rule->id};
+    } else {
+      result.indeterminate_policy_file = path_;
+      result.indeterminate_rule_id = rule->id;
+    }
+    return result;
   }
-  return std::nullopt;
+  return {};
 }
 
-std::optional<ProjectPolicyDecision> ProjectPolicy::FirstMatchingRule(
+ProjectPolicyMatchResult ProjectPolicy::FirstMatchingRule(
     ProjectPolicyActionFamily family,
     const ProjectPolicyMatchContext& context) const {
   for (const std::unique_ptr<Rule>& rule : rules_) {
-    if (ActionInFamily(rule->action, family) && rule->Matches(context))
-      return ProjectPolicyDecision{rule->action, path_, rule->id};
+    if (!ActionInFamily(rule->action, family))
+      continue;
+    const ProjectPolicyMatchResult::Kind kind = rule->Matches(context);
+    if (kind == ProjectPolicyMatchResult::Kind::NoMatch)
+      continue;
+
+    ProjectPolicyMatchResult result;
+    result.kind = kind;
+    if (kind == ProjectPolicyMatchResult::Kind::Match) {
+      result.decision =
+          ProjectPolicyDecision{rule->action, path_, rule->id};
+    } else {
+      result.indeterminate_policy_file = path_;
+      result.indeterminate_rule_id = rule->id;
+    }
+    return result;
   }
-  return std::nullopt;
+  return {};
 }
 
 string ProjectPolicyFileKind(const string& path) {

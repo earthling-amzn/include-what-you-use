@@ -2514,6 +2514,26 @@ llvm::json::Object ConditionObject(
           {"active_branch", condition.active_branch}}}};
 }
 
+ProjectPolicyActiveCondition PolicyActiveCondition(
+    const IwyuPreprocessorInfo::ActiveCondition& condition) {
+  using InputStatus = IwyuPreprocessorInfo::ActiveCondition::Status;
+  ProjectPolicyActiveCondition result;
+  switch (condition.status) {
+    case InputStatus::kNotApplicable:
+      result.availability =
+          ProjectPolicyConditionAvailability::NotApplicable;
+      break;
+    case InputStatus::kKnown:
+      result.availability = ProjectPolicyConditionAvailability::Known;
+      result.expression = condition.expression;
+      break;
+    case InputStatus::kUnknown:
+      result.availability = ProjectPolicyConditionAvailability::Unknown;
+      break;
+  }
+  return result;
+}
+
 llvm::json::Object KnownString(const string& value) {
   return llvm::json::Object{{"status", "known"}, {"value", value}};
 }
@@ -3140,6 +3160,35 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
   size_t project_policy_violations = 0;
   const ProjectPolicy* project_policy = GlobalProjectPolicy();
   if (project_policy) {
+    const auto addition_active_condition =
+        [&](const OneIncludeOrForwardDeclareLine& line) {
+          using ActiveCondition = IwyuPreprocessorInfo::ActiveCondition;
+          bool found = false;
+          ActiveCondition common;
+          for (const OneUse& use : symbol_uses_) {
+            if (use.ignore_use() || !use.is_full_use() ||
+                !use.has_suggested_header() ||
+                use.suggested_header() != line.quoted_include()) {
+              continue;
+            }
+            const ActiveCondition condition =
+                preprocessor_info_->ActiveConditionAt(use.use_loc());
+            if (!found) {
+              common = condition;
+              found = true;
+              continue;
+            }
+            if (common.status != condition.status ||
+                common.expression != condition.expression ||
+                common.directive_location != condition.directive_location ||
+                common.active_branch != condition.active_branch) {
+              return ProjectPolicyActiveCondition{};
+            }
+          }
+          return found ? PolicyActiveCondition(common)
+                       : ProjectPolicyActiveCondition{};
+        };
+
     for (OneIncludeOrForwardDeclareLine& line : lines_) {
       if (!line.IsIncludeLine() || line.is_present() || !line.is_desired() ||
           line.has_structured_decision()) {
@@ -3158,6 +3207,7 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
       context.includer = file_path();
       context.includee = includee;
       context.file_kind = ProjectPolicyFileKind(context.includer);
+      context.active_condition = addition_active_condition(line);
       if (GlobalFlags().has_configuration)
         context.configuration = GlobalFlags().configuration;
 
@@ -3177,18 +3227,41 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
           std::unique(context.symbols.begin(), context.symbols.end()),
           context.symbols.end());
 
-      const std::optional<ProjectPolicyDecision> decision =
+      const ProjectPolicyMatchResult match =
           project_policy->FirstMatchingRule(ProjectPolicyAction::DenyAdd,
                                             context);
-      if (!decision)
+      if (match.kind == ProjectPolicyMatchResult::Kind::NoMatch)
         continue;
+      if (match.kind == ProjectPolicyMatchResult::Kind::Indeterminate) {
+        const string reason =
+            "Project policy '" + match.indeterminate_policy_file +
+            "' rule '" + match.indeterminate_rule_id +
+            "' could not determine whether active_condition matches while "
+            "evaluating addition of " + line.quoted_include() + " to " +
+            context.includer + "; the addition is suppressed.";
+        line.SetStructuredDecision(
+            "add", "suppress", "project_policy_active_condition_unknown",
+            reason);
+        line.clear_desired();
+        AddStructuredDiagnostic(
+            diagnostic_location, "project_policy_active_condition_unknown",
+            reason);
+        if (GlobalFlags().output_format == CommandlineFlags::kTextOutput) {
+          errs() << context.includer
+                 << ": warning: project_policy_active_condition_unknown: "
+                 << reason << '\n';
+        }
+        ++project_policy_violations;
+        continue;
+      }
 
-      const string reason = "Project policy '" + decision->policy_file +
-          "' rule '" + decision->rule_id + "' denies adding " +
+      const ProjectPolicyDecision& decision = *match.decision;
+      const string reason = "Project policy '" + decision.policy_file +
+          "' rule '" + decision.rule_id + "' denies adding " +
           line.quoted_include() + " to " + context.includer + ".";
       line.SetProjectPolicyDecision(
           "add", "suppress", "project_policy_deny_add", reason,
-          decision->policy_file, decision->rule_id, "deny");
+          decision.policy_file, decision.rule_id, "deny");
       line.clear_desired();
       AddStructuredDiagnostic(diagnostic_location,
                               "project_policy_deny_add", reason);
@@ -3217,26 +3290,52 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
       context.includer = file_path();
       context.includee = includee;
       context.file_kind = ProjectPolicyFileKind(context.includer);
+      context.active_condition = PolicyActiveCondition(
+          preprocessor_info_->DirectIncludeConditionAt(
+              file_, line.quoted_include(), line.start_linenum()));
       if (GlobalFlags().has_configuration)
         context.configuration = GlobalFlags().configuration;
 
-      const std::optional<ProjectPolicyDecision> decision =
+      const ProjectPolicyMatchResult match =
           project_policy->FirstMatchingRule(ProjectPolicyActionFamily::Removal,
                                             context);
-      if (!decision)
+      if (match.kind == ProjectPolicyMatchResult::Kind::NoMatch)
         continue;
+      if (match.kind == ProjectPolicyMatchResult::Kind::Indeterminate) {
+        const string reason =
+            "Project policy '" + match.indeterminate_policy_file +
+            "' rule '" + match.indeterminate_rule_id +
+            "' could not determine whether active_condition matches while "
+            "evaluating removal of " + line.quoted_include() + " from " +
+            context.includer + "; the removal is suppressed.";
+        line.SetStructuredDecision(
+            "remove", "suppress", "project_policy_active_condition_unknown",
+            reason);
+        line.set_desired();
+        AddStructuredDiagnostic(
+            SourceLocation(), "project_policy_active_condition_unknown",
+            reason);
+        if (GlobalFlags().output_format == CommandlineFlags::kTextOutput) {
+          errs() << context.includer
+                 << ": warning: project_policy_active_condition_unknown: "
+                 << reason << '\n';
+        }
+        ++project_policy_violations;
+        continue;
+      }
 
+      const ProjectPolicyDecision& decision = *match.decision;
       const bool denied =
-          decision->action == ProjectPolicyAction::DenyRemove;
-      const string reason = "Project policy '" + decision->policy_file +
-          "' rule '" + decision->rule_id + "' " +
+          decision.action == ProjectPolicyAction::DenyRemove;
+      const string reason = "Project policy '" + decision.policy_file +
+          "' rule '" + decision.rule_id + "' " +
           (denied ? "denies removing " : "keeps ") +
           line.quoted_include() + (denied ? " from " : " in ") +
           context.includer + ".";
       line.SetProjectPolicyDecision(
           "remove", denied ? "suppress" : "keep",
           denied ? "project_policy_deny_remove" : "project_policy_keep",
-          reason, decision->policy_file, decision->rule_id,
+          reason, decision.policy_file, decision.rule_id,
           denied ? "deny" : "keep");
       line.set_desired();
       if (denied) {

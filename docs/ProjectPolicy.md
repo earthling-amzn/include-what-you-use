@@ -39,12 +39,24 @@ dialect. Globs use LLVM `GlobPattern` semantics: `*` and `?` can match `/`,
 backslash escapes the next byte.
 
 `file_kind` is one of `source`, `header`, `inline_header`, or `other`.
-`active_condition`, `symbol`, and `configuration` are non-empty exact strings.
+`symbol` and `configuration` are non-empty exact strings.
+`active_condition` is also a non-empty exact string, but its runtime fact is
+typed as one of `known`, `not_applicable`, or `unknown`. A condition-constrained
+rule matches only a `known` fact with byte-for-byte equal source-derived
+expression text. It does not match `not_applicable`, which means the relevant
+source is unconditional after header-guard elision. IWYU does not parse,
+normalize, or prove logical equivalence between policy and source expressions.
+
 A rule matches only when every supplied dimension matches. Rules retain file
 order. The addition family is `{deny_add}` and the removal family is
 `{deny_remove, keep}`. Lookup scans once in file order while ignoring actions
-outside the requested family; the first matching family rule supplies its
-actual action and provenance.
+outside the requested family. A known condition mismatch continues the scan.
+The first definite match supplies its actual action and provenance. If every
+other dimension matches a condition-constrained rule but the condition fact is
+`unknown`, lookup returns `indeterminate` at that rule and does not consider a
+later rule. A rule without `active_condition` does not need the condition fact
+and can match known, unconditional, or unknown source, unless an earlier
+condition-constrained rule already made lookup indeterminate.
 
 Parsing is transactional and fail-closed. IWYU rejects unknown or duplicate
 keys, duplicate rule IDs, malformed node shapes, aliases, anchors, explicit
@@ -58,11 +70,18 @@ effects are enabled separately as migration phases establish the facts needed
 to apply them safely. A loaded rule that requests a recognized but unavailable
 action or fact fails with a capability diagnostic; IWYU never silently ignores
 a safety rule. POLICY-002 enables `deny_add`; POLICY-007 enables `deny_remove`
-and `keep`. These actions match includer, includee, file kind, symbol, and the
-optional invocation configuration supplied by `-Xiwyu
---configuration=<name>`. Active-condition provenance is emitted in structured
-output, but `active_condition` policy matching remains unavailable until unknown
-facts can propagate as an explicit indeterminate first-match decision.
+and `keep`. These actions match includer, includee, file kind, symbol,
+source-derived active condition, and the optional invocation configuration
+supplied by `-Xiwyu --configuration=<name>`.
+
+For a proposed include, IWYU derives the active-condition fact from all full
+symbol uses that motivate that exact provider. The fact is known only when the
+uses have the same condition status, expression, active branch, and source
+branch identity. No motivating use, unavailable source location, repeated
+include instances, or disagreement produces `unknown`. For removal, IWYU
+recovers the condition from the exact direct include occurrence by includer,
+logical include spelling, and physical line. Missing or ambiguous occurrence
+identity produces `unknown` instead of an invented unconditional fact.
 
 ## `deny_add` runtime semantics
 
@@ -91,6 +110,19 @@ counts as a policy violation for `--error`. A matching `keep` rule emits
 restores the exact physical source line, emits no warning, and does not affect
 `--error`. Non-add provider fields remain `not_applicable`.
 
+## Indeterminate condition semantics
+
+When lookup is indeterminate, IWYU preserves source safety without claiming the
+condition-constrained rule matched. A proposed addition becomes `add/suppress`;
+a proposed removal becomes `remove/suppress` and the exact source line remains
+in desired state. Both use reason code
+`project_policy_active_condition_unknown`, emit a warning diagnostic naming the
+policy file and the rule at which lookup stopped, and count as violations for
+`--error`. Their structured `policy` field remains `unavailable`; normal
+matched-rule provenance and policy decisions are emitted only for a definite
+match. Text output emits the same parse-safe warning and no corresponding fixer
+edit.
+
 Policy includee matching always uses the delimiter-free logical direct include
 token. Removal operation and desired-state spelling preserve the physical source
 line, including whitespace, a macro include operand, or a trailing comment.
@@ -98,6 +130,5 @@ line, including whitespace, a macro include operand, or a trailing comment.
 `inline_header`.
 
 Only `deny_add`, `deny_remove`, and `keep` are currently enabled. Other declared
-actions and all `active_condition` matches fail capability validation rather
-than being ignored. Existing source pragmas and project-side application
-guardrails remain in force.
+actions fail capability validation rather than being ignored. Existing source
+pragmas and project-side application guardrails remain in force.

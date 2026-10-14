@@ -40,13 +40,41 @@ struct ProjectPolicyDecision {
   string rule_id;
 };
 
+enum class ProjectPolicyConditionAvailability {
+  NotApplicable,
+  Known,
+  Unknown,
+};
+
+// Expression is populated only when availability is Known.
+struct ProjectPolicyActiveCondition {
+  ProjectPolicyConditionAvailability availability =
+      ProjectPolicyConditionAvailability::Unknown;
+  string expression;
+};
+
+// Decision is populated only for Match. The indeterminate fields identify the
+// rule where ordered lookup stopped, but do not represent a matched decision.
+struct ProjectPolicyMatchResult {
+  enum class Kind {
+    NoMatch,
+    Match,
+    Indeterminate,
+  };
+
+  Kind kind = Kind::NoMatch;
+  std::optional<ProjectPolicyDecision> decision;
+  string indeterminate_policy_file;
+  string indeterminate_rule_id;
+};
+
 // Runtime facts supplied by the analyzer. Paths use '/' separators. Includee
 // spellings do not include quote or angle-bracket delimiters.
 struct ProjectPolicyMatchContext {
   string includer;
   string includee;
   string file_kind;
-  string active_condition;
+  ProjectPolicyActiveCondition active_condition;
   vector<string> symbols;
   string configuration;
 };
@@ -65,10 +93,10 @@ class ProjectPolicy {
   bool ValidateRuntimeCapabilities(bool has_configuration,
                                    string* error) const;
 
-  std::optional<ProjectPolicyDecision> FirstMatchingRule(
+  ProjectPolicyMatchResult FirstMatchingRule(
       ProjectPolicyAction action,
       const ProjectPolicyMatchContext& context) const;
-  std::optional<ProjectPolicyDecision> FirstMatchingRule(
+  ProjectPolicyMatchResult FirstMatchingRule(
       ProjectPolicyActionFamily family,
       const ProjectPolicyMatchContext& context) const;
 

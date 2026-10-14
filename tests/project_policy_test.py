@@ -45,6 +45,23 @@ def expect_ok(data, *args):
     return records
 
 
+def with_policy_for_source(data, source, *args):
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", dir=ROOT,
+                                     delete=False) as stream:
+        stream.write(data)
+        path = Path(stream.name)
+    try:
+        command = [str(IWYU), "-Xiwyu", "--output_format=json",
+                   "-Xiwyu", f"--project_policy={path}"]
+        for arg in args:
+            command.extend(["-Xiwyu", arg])
+        command.extend(["-I", ".", "-std=c++17", source])
+        return subprocess.run(command, cwd=ROOT, text=True,
+                              capture_output=True)
+    finally:
+        path.unlink()
+
+
 def expect_error(data, fragment, *args):
     result = with_policy(data, *args)
     assert result.returncode != 0
@@ -80,6 +97,7 @@ rules:
       includer: { regex: "never[/]matches[.]cc" }
       includee: { glob: "project/*.hpp" }
       file_kind: header
+      active_condition: "defined(FEATURE)"
       symbol: "project::Type"
       configuration: fastdebug
 """,
@@ -135,10 +153,13 @@ rules:
                  "must contain exactly one of 'glob' or 'regex'")
     expect_error(policy("includer: { glob: x, regex: x }"),
                  "must contain exactly one of 'glob' or 'regex'")
-    expect_error(policy("symbol: ''"), "'symbol' must be a non-empty scalar")
+    for field in ("active_condition", "symbol"):
+        expect_error(policy(f"{field}: ''"),
+                     f"'{field}' must be a non-empty scalar")
     expect_error(policy("file_kind: |\n        header"),
                  "'file_kind' must be a scalar")
-    for field, value in (("symbol", "null"), ("configuration", "42")):
+    for field, value in (("active_condition", "true"), ("symbol", "null"),
+                         ("configuration", "42")):
         expect_error(policy(f"{field}: {value}"),
                      f"'{field}' must be a string scalar")
     expect_error(policy("includer: { glob: true }"),
@@ -236,8 +257,23 @@ rules: []
     for action in ("associate", "export", "prefer_provider", "report_only"):
         expect_error(policy(action=action),
                      f"action '{action}' is recognized but not enabled")
-    expect_error(policy("active_condition: 'defined(FEATURE)'"),
-                 "active_condition is recognized but unavailable")
+    expect_ok(policy("active_condition: 'defined(FEATURE)'"))
+
+    active_result = with_policy_for_source(
+        policy(
+            "includee: { glob: '*tests/cxx/indirect.h' }\n"
+            "      active_condition: ENABLE_NATIVE_JSON_CONDITION",
+            rule_id="active-condition-exact"),
+        "tests/native_json/condition_add.cc")
+    assert active_result.returncode == 0, active_result.stderr
+    active_records = [json.loads(line)
+                      for line in active_result.stdout.splitlines()]
+    active_add = next(
+        operation for record in active_records
+        for operation in record["operations"]
+        if operation["subject_action"] == "add" and
+        "tests/cxx/indirect.h" in operation["spelling"])
+    assert active_add["reason_code"] == "project_policy_deny_add"
     expect_error(policy("configuration: fastdebug"),
                  "requires --configuration")
 
