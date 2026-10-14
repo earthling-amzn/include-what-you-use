@@ -390,6 +390,15 @@ string ActionName(ProjectPolicyAction action) {
   return "unknown";
 }
 
+bool ActionInFamily(ProjectPolicyAction action,
+                    ProjectPolicyActionFamily family) {
+  if (family == ProjectPolicyActionFamily::Addition)
+    return action == ProjectPolicyAction::DenyAdd;
+  return action == ProjectPolicyAction::DenyRemove ||
+         action == ProjectPolicyAction::Keep;
+}
+
+
 bool ValidFileKind(const string& kind) {
   return kind == "source" || kind == "header" ||
          kind == "inline_header" || kind == "other";
@@ -601,7 +610,9 @@ bool ProjectPolicy::ValidateRuntimeCapabilities(bool has_configuration,
     const Rule& rule = *rules_[index];
     const string context = "rule " + std::to_string(index + 1) +
                            " ('" + rule.id + "')";
-    if (rule.action != ProjectPolicyAction::DenyAdd) {
+    if (rule.action != ProjectPolicyAction::DenyAdd &&
+        rule.action != ProjectPolicyAction::DenyRemove &&
+        rule.action != ProjectPolicyAction::Keep) {
       return Fail(path_, context, "action '" + ActionName(rule.action) +
                   "' is recognized but not enabled in this phase", error);
     }
@@ -624,6 +635,16 @@ std::optional<ProjectPolicyDecision> ProjectPolicy::FirstMatchingRule(
   for (const std::unique_ptr<Rule>& rule : rules_) {
     if (rule->action == action && rule->Matches(context))
       return ProjectPolicyDecision{action, path_, rule->id};
+  }
+  return std::nullopt;
+}
+
+std::optional<ProjectPolicyDecision> ProjectPolicy::FirstMatchingRule(
+    ProjectPolicyActionFamily family,
+    const ProjectPolicyMatchContext& context) const {
+  for (const std::unique_ptr<Rule>& rule : rules_) {
+    if (ActionInFamily(rule->action, family) && rule->Matches(context))
+      return ProjectPolicyDecision{rule->action, path_, rule->id};
   }
   return std::nullopt;
 }

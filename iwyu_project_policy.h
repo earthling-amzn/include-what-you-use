@@ -29,6 +29,11 @@ enum class ProjectPolicyAction {
   ReportOnly,
 };
 
+enum class ProjectPolicyActionFamily {
+  Addition,
+  Removal,
+};
+
 struct ProjectPolicyDecision {
   ProjectPolicyAction action;
   string policy_file;
@@ -62,6 +67,9 @@ class ProjectPolicy {
 
   std::optional<ProjectPolicyDecision> FirstMatchingRule(
       ProjectPolicyAction action,
+      const ProjectPolicyMatchContext& context) const;
+  std::optional<ProjectPolicyDecision> FirstMatchingRule(
+      ProjectPolicyActionFamily family,
       const ProjectPolicyMatchContext& context) const;
 
   const string& path() const { return path_; }

@@ -233,8 +233,7 @@ rules: []
 
     # Recognized future actions and unavailable facts fail as capabilities,
     # rather than being ignored or misreported as syntax errors.
-    for action in ("deny_remove", "keep", "associate", "export",
-                   "prefer_provider", "report_only"):
+    for action in ("associate", "export", "prefer_provider", "report_only"):
         expect_error(policy(action=action),
                      f"action '{action}' is recognized but not enabled")
     expect_error(policy("active_condition: 'defined(FEATURE)'"),

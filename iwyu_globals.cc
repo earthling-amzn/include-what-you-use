@@ -102,6 +102,7 @@ static void PrintHelp(const char* extra_msg) {
          "        project policy file.\n"
          "   --configuration=<name>: labels this analysis invocation for\n"
          "        project-policy matching and structured output.\n"
+         "   project-policy-enabled-actions: deny_add,deny_remove,keep\n"
          "   --no_default_mappings: do not add iwyu's default mappings.\n"
          "   --pch_in_code: mark the first include in a translation unit as a\n"
          "        precompiled header.  Use --pch_in_code to prevent IWYU from\n"

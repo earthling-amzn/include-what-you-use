@@ -41,8 +41,10 @@ backslash escapes the next byte.
 `file_kind` is one of `source`, `header`, `inline_header`, or `other`.
 `active_condition`, `symbol`, and `configuration` are non-empty exact strings.
 A rule matches only when every supplied dimension matches. Rules retain file
-order; the first matching rule in an action family supplies its decision and
-provenance.
+order. The addition family is `{deny_add}` and the removal family is
+`{deny_remove, keep}`. Lookup scans once in file order while ignoring actions
+outside the requested family; the first matching family rule supplies its
+actual action and provenance.
 
 Parsing is transactional and fail-closed. IWYU rejects unknown or duplicate
 keys, duplicate rule IDs, malformed node shapes, aliases, anchors, explicit
@@ -55,9 +57,10 @@ The parser recognizes every version-1 action and match dimension. Runtime
 effects are enabled separately as migration phases establish the facts needed
 to apply them safely. A loaded rule that requests a recognized but unavailable
 action or fact fails with a capability diagnostic; IWYU never silently ignores
-a safety rule. POLICY-002 enables `deny_add` with includer, includee, file kind,
-symbol, and the optional invocation configuration supplied by
-`-Xiwyu --configuration=<name>`. Active-condition facts remain unavailable.
+a safety rule. POLICY-002 enables `deny_add`; POLICY-007 enables `deny_remove`
+and `keep`. These actions match includer, includee, file kind, symbol, and the
+optional invocation configuration supplied by `-Xiwyu
+--configuration=<name>`. Active-condition facts remain unavailable.
 
 ## `deny_add` runtime semantics
 
@@ -71,6 +74,28 @@ accepted desired state. Text output emits a parse-safe warning and no fixer add.
 A suppression is a policy violation for `--error`, but it is not an applied edit
 and does not by itself change a structured record's status from `correct`.
 
-Only `deny_add` is currently enabled. The other declared actions and
-`active_condition` matches fail capability validation rather than being ignored.
-Existing source pragmas and project-side application guardrails remain in force.
+## Removal runtime semantics
+
+IWYU evaluates the removal family after pragma, `no_include`, and prefix-header
+decisions. It considers only direct present include lines that remain undesired
+and have no stronger structured decision. Forward declarations are never policy
+removal candidates.
+
+A matching `deny_remove` rule emits `remove/suppress` with reason code
+`project_policy_deny_remove` and known policy file/rule/`deny` provenance. It
+restores the exact physical source line to desired state, emits one warning, and
+counts as a policy violation for `--error`. A matching `keep` rule emits
+`remove/keep` with reason code `project_policy_keep` and `keep` provenance,
+restores the exact physical source line, emits no warning, and does not affect
+`--error`. Non-add provider fields remain `not_applicable`.
+
+Policy includee matching always uses the delimiter-free logical direct include
+token. Removal operation and desired-state spelling preserve the physical source
+line, including whitespace, a macro include operand, or a trailing comment.
+`file_kind: header` excludes dotted inline headers, which have kind
+`inline_header`.
+
+Only `deny_add`, `deny_remove`, and `keep` are currently enabled. Other declared
+actions and all `active_condition` matches fail capability validation rather
+than being ignored. Existing source pragmas and project-side application
+guardrails remain in force.

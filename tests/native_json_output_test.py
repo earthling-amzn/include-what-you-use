@@ -987,6 +987,113 @@ rules:
     assert prefix_suppression["disposition"] == "suppress"
     assert prefix_suppression["policy"]["status"] == "unavailable"
 
+    # POLICY-007 removal-family decisions retain residual ordinary removals.
+    removal_header = "tests/native_json/policy007_header.hpp"
+    removal_inline = "tests/native_json/policy007_inline.inline.hpp"
+    removal_source = "tests/native_json/policy007_source.cc"
+    baseline_removal = records(run(removal_header, "--output_format=json"))[0]
+    baseline_remove = next(
+        op for op in baseline_removal["operations"]
+        if op["subject_action"] == "remove" and
+        "policy007_unused.hpp" in op["spelling"])
+    assert baseline_remove["disposition"] == "apply"
+
+    header_deny_policy = """schema_version: 1
+rules:
+  - id: deny-plain-header-removal
+    action: deny_remove
+    match:
+      includee: { regex: ".*policy007_unused[.]hpp" }
+      file_kind: header
+"""
+    deny_result, deny_path = run_with_temporary_policy(
+        removal_header, header_deny_policy)
+    assert deny_result.returncode == 0, deny_result.stderr
+    denied_record = records(deny_result)[0]
+    denied_remove = next(
+        op for op in denied_record["operations"]
+        if op["reason_code"] == "project_policy_deny_remove")
+    assert (denied_remove["subject_action"], denied_remove["disposition"]) == (
+        "remove", "suppress")
+    assert denied_remove["spelling"] == (
+        '  #  include   "tests/native_json/policy007_unused.hpp"  '
+        '// physical spelling')
+    assert denied_remove["policy"] == {
+        "status": "known", "value": {
+            "policy_file": deny_path,
+            "rule_id": "deny-plain-header-removal", "decision": "deny"}}
+    assert all(value["status"] == "not_applicable"
+               for value in denied_remove["provider"].values())
+    assert denied_remove["spelling"] in {
+        item["spelling"] for item in denied_record["desired_state"]["items"]}
+    assert denied_record["status"] == "correct"
+    assert len([diagnostic for diagnostic in denied_record["diagnostics"]
+                if diagnostic["code"] == "project_policy_deny_remove"]) == 1
+
+    deny_error, _ = run_with_temporary_policy(
+        removal_header, header_deny_policy, "--error=7")
+    assert deny_error.returncode == 7
+    records(deny_error)
+
+    keep_policy = """schema_version: 1
+rules:
+  - id: keep-source-include
+    action: keep
+    match: { includee: { glob: "*policy007_unused.hpp" } }
+"""
+    keep_result, keep_path = run_with_temporary_policy(
+        removal_source, keep_policy)
+    assert keep_result.returncode == 0, keep_result.stderr
+    kept_record = records(keep_result)[0]
+    kept_remove = next(op for op in kept_record["operations"]
+                       if op["reason_code"] == "project_policy_keep")
+    assert (kept_remove["subject_action"], kept_remove["disposition"]) == (
+        "remove", "keep")
+    assert kept_remove["policy"]["value"] == {
+        "policy_file": keep_path, "rule_id": "keep-source-include",
+        "decision": "keep"}
+    assert not any(diagnostic["code"] == "project_policy_keep"
+                   for diagnostic in kept_record["diagnostics"])
+
+    keep_first_policy = """schema_version: 1
+rules:
+  - id: first-keep
+    action: keep
+    match: { includee: { glob: "*policy007_unused.hpp" } }
+  - id: unrelated-add-family
+    action: deny_add
+    match: { includee: { glob: "*policy007_unused.hpp" } }
+  - id: later-deny
+    action: deny_remove
+    match: { includee: { glob: "*policy007_unused.hpp" } }
+"""
+    keep_first, _ = run_with_temporary_policy(removal_source, keep_first_policy)
+    keep_first_op = next(op for op in records(keep_first)[0]["operations"]
+                         if "project_policy_" in op["reason_code"])
+    assert keep_first_op["reason_code"] == "project_policy_keep"
+
+    deny_first_policy = """schema_version: 1
+rules:
+  - id: first-deny
+    action: deny_remove
+    match: { includee: { glob: "*policy007_unused.hpp" } }
+  - id: later-keep
+    action: keep
+    match: { includee: { glob: "*policy007_unused.hpp" } }
+"""
+    deny_first, _ = run_with_temporary_policy(removal_source, deny_first_policy)
+    deny_first_op = next(op for op in records(deny_first)[0]["operations"]
+                         if "project_policy_" in op["reason_code"])
+    assert deny_first_op["reason_code"] == "project_policy_deny_remove"
+
+    # A plain-header-only rule does not affect source or inline-header removal.
+    for unaffected in (removal_source, removal_inline):
+        result, _ = run_with_temporary_policy(unaffected, header_deny_policy)
+        operation = next(op for op in records(result)[0]["operations"]
+                         if op["subject_action"] == "remove")
+        assert operation["disposition"] == "apply"
+        assert operation["policy"]["status"] == "unavailable"
+
 
 if __name__ == "__main__":
     main()

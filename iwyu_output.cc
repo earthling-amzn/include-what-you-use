@@ -3095,6 +3095,58 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
       }
       ++project_policy_violations;
     }
+
+    for (OneIncludeOrForwardDeclareLine& line : lines_) {
+      if (!line.IsIncludeLine() || !line.is_present() || line.is_desired() ||
+          line.has_structured_decision()) {
+        continue;
+      }
+
+      string includee = line.quoted_include();
+      if (includee.size() >= 2 &&
+          ((includee.front() == '"' && includee.back() == '"') ||
+           (includee.front() == '<' && includee.back() == '>'))) {
+        includee = includee.substr(1, includee.size() - 2);
+      }
+      includee = NormalizeFilePath(includee);
+
+      ProjectPolicyMatchContext context;
+      context.includer = file_path();
+      context.includee = includee;
+      context.file_kind = ProjectPolicyFileKind(context.includer);
+      if (GlobalFlags().has_configuration)
+        context.configuration = GlobalFlags().configuration;
+
+      const std::optional<ProjectPolicyDecision> decision =
+          project_policy->FirstMatchingRule(ProjectPolicyActionFamily::Removal,
+                                            context);
+      if (!decision)
+        continue;
+
+      const bool denied =
+          decision->action == ProjectPolicyAction::DenyRemove;
+      const string reason = "Project policy '" + decision->policy_file +
+          "' rule '" + decision->rule_id + "' " +
+          (denied ? "denies removing " : "keeps ") +
+          line.quoted_include() + (denied ? " from " : " in ") +
+          context.includer + ".";
+      line.SetProjectPolicyDecision(
+          "remove", denied ? "suppress" : "keep",
+          denied ? "project_policy_deny_remove" : "project_policy_keep",
+          reason, decision->policy_file, decision->rule_id,
+          denied ? "deny" : "keep");
+      line.set_desired();
+      if (denied) {
+        AddStructuredDiagnostic(SourceLocation(),
+                                "project_policy_deny_remove", reason);
+        if (GlobalFlags().output_format == CommandlineFlags::kTextOutput) {
+          errs() << context.includer
+                 << ": warning: project_policy_deny_remove: " << reason
+                 << '\n';
+        }
+        ++project_policy_violations;
+      }
+    }
   }
 
   set<string> printable_associated_includes = AssociatedQuotedIncludes();
