@@ -1664,20 +1664,21 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
   }
 
   // If we're a declared (not defined) function, all our types --
-  // return type and argument types -- are forward-declarable.  The
-  // one exception required by the language is the throw types, which
-  // we clean up in VisitType().
-  // There are two more exceptions that iwyu imposes:
-  // (1) iwyu asks the function author to provide the full type
+  // return type and argument types -- are forward-declarable. The exception
+  // types require full definitions; we clean those up in VisitType().
+  // There are three additional cases where iwyu requires a full definition:
+  // (1) A directly provided definition for a by-value parameter or return type
+  //     must not be weakened to a forward declaration.
+  // (2) iwyu asks the function author to provide the full type
   //     information for the return type.  That way the user doesn't
   //     have to.
-  // (2) If any of our function parameters have a type with a
+  // (3) If any of our function parameters have a type with a
   //     non-explicit, one-arg constructor, or is a const reference to
   //     such a type, mark that type as not forward declarable.  The
   //     worry is that people might need the full type for the
   //     implicit conversion (the 'autocast'), for instance, passing
   //     in a char* to Fn(const StringPiece& foo) { ... }
-  // Both of these iwyu requirements can be overridden by the function
+  // The latter two iwyu requirements can be overridden by the function
   // author; for details, see CodeAuthorWantsJustAForwardDeclare.
   bool VisitFunctionDecl(clang::FunctionDecl* decl) {
     if (CanIgnoreCurrentASTNode())
@@ -2448,6 +2449,39 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
   // encode the logic of whether a particular type of object
   // can be forward-declared or not.
 
+  // A function declaration makes its type subtree forward-declarable, but an
+  // existing direct definition for a by-value parameter or return type must not
+  // be replaced with a forward declaration. Keep nested template arguments
+  // under their own rules: in Box<T*> value, T remains forward-declarable.
+  bool IsDirectlyProvidedByValueFunctionType(const ASTNode* ast_node) const {
+    CHECK_(ast_node->IsA<Type>());
+
+    ast_node = MostElaboratedAncestor(ast_node);
+    if (ast_node->HasAncestorOfType<TemplateArgument>())
+      return false;
+
+    bool is_by_value_function_type = false;
+    if (const auto* param = ast_node->GetAncestorAs<ParmVarDecl>()) {
+      is_by_value_function_type =
+          !IsPointerOrReferenceAsWritten(GetTypeOf(param));
+    } else if (const auto* function =
+                   ast_node->GetAncestorAs<FunctionDecl>()) {
+      const Type* return_type = function->getReturnType().getTypePtr();
+      is_by_value_function_type =
+          ast_node->StackContainsContent(return_type) &&
+          !IsPointerOrReferenceAsWritten(return_type);
+    }
+
+    if (!is_by_value_function_type)
+      return false;
+
+    const NamedDecl* type_decl = TypeToDeclAsWritten(ast_node->GetAs<Type>());
+    const NamedDecl* definition = GetTagDefinition(type_decl);
+    return definition && preprocessor_info().PublicHeaderIntendsToProvide(
+                             GetFileEntry(ast_node->GetLocation()),
+                             GetFileEntry(definition));
+  }
+
   // TODO(csilvers): get rid of in_forward_declare_context() and make
   // this the canonical place to figure out if we can forward-declare.
   bool CanForwardDeclareType(const ASTNode* ast_node) const {
@@ -2457,6 +2491,8 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
         return CanBeOpaqueDeclared(enum_type);
       }
     }
+    if (IsDirectlyProvidedByValueFunctionType(ast_node))
+      return false;
     // If we're in a forward-declare context, well then, there you have it.
     if (ast_node->in_forward_declare_context())
       return true;

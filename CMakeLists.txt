@@ -247,6 +247,12 @@ if (Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   )
 
+  add_test(NAME complete_use_test
+    COMMAND ${Python3_EXECUTABLE} tests/complete_use_test.py
+      $<TARGET_FILE:include-what-you-use> ${CMAKE_CXX_COMPILER}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
   add_test(NAME native_json_output_test
     COMMAND ${Python3_EXECUTABLE} tests/native_json_output_test.py
       $<TARGET_FILE:include-what-you-use>
