@@ -29,7 +29,10 @@
 #include "iwyu_string_util.h"
 #include "iwyu_verrs.h"
 #include "llvm/Support/raw_ostream.h"
+#include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/DeclCXX.h"
+#include "clang/AST/DeclTemplate.h"
 #include "clang/Basic/IdentifierTable.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/Lexer.h"
@@ -866,12 +869,40 @@ void IwyuPreprocessorInfo::MacroDefined(const Token& id,
   // #undefs and re-defines a macro, but should work fine in practice.)
   if (macro_loc.isValid())
     macros_definition_loc_[GetName(id)] = macro_loc;
+
+  const string macro_name = GetName(id);
+  macro_body_dependencies_.erase(macro_name);
+  if (macro_loc.isValid() && macro->isFunctionLike()) {
+    set<const clang::IdentifierInfo*> parameters(macro->param_begin(),
+                                                  macro->param_end());
+    set<const clang::IdentifierInfo*> seen;
+    MacroBodyDependency body{macro_loc, {}};
+    for (const Token& token_in_macro : macro->tokens()) {
+      if (token_in_macro.getKind() != clang::tok::identifier)
+        continue;
+      const clang::IdentifierInfo* identifier =
+          token_in_macro.getIdentifierInfo();
+      if (!identifier || ContainsKey(parameters, identifier) ||
+          !seen.insert(identifier).second) {
+        continue;
+      }
+      body.identifiers.push_back(identifier);
+    }
+    macro_body_dependencies_.insert({macro_name, std::move(body)});
+  }
+
   for (const Token& token_in_macro : macro->tokens()) {
     if (token_in_macro.getKind() == clang::tok::identifier &&
         token_in_macro.getIdentifierInfo()->hasMacroDefinition()) {
       macros_called_from_macros_.push_back(token_in_macro);
     }
   }
+}
+
+void IwyuPreprocessorInfo::MacroUndefined(
+    const Token& id, const MacroDefinition& /*definition*/,
+    const MacroDirective* /*directive*/) {
+  macro_body_dependencies_.erase(GetName(id));
 }
 
 string IwyuPreprocessorInfo::ConditionSourceText(SourceRange range) const {
@@ -1361,6 +1392,98 @@ void IwyuPreprocessorInfo::FindAndReportMacroUse(const string& name,
 
 //------------------------------------------------------------
 // Post-processing functions (done after all source is read).
+
+namespace {
+
+bool IsMacroBodyDependencyDecl(const NamedDecl* decl) {
+  if (!decl || decl->isImplicit() || !decl->getIdentifier())
+    return false;
+
+  if (clang::isa<clang::TypeDecl, clang::TemplateDecl, clang::FunctionDecl,
+                 clang::FieldDecl, clang::IndirectFieldDecl,
+                 clang::EnumConstantDecl>(decl)) {
+    return true;
+  }
+
+  const auto* variable = clang::dyn_cast<clang::VarDecl>(decl);
+  return variable &&
+         (variable->isFileVarDecl() || variable->isStaticDataMember());
+}
+
+void IndexMacroBodyDeclarations(
+    const clang::DeclContext* context,
+    map<const clang::IdentifierInfo*, set<const FileEntry*>>* declarations) {
+  for (const clang::Decl* decl : context->decls()) {
+    if (const auto* named = clang::dyn_cast<NamedDecl>(decl)) {
+      if (IsMacroBodyDependencyDecl(named)) {
+        if (const FileEntry* file = GetFileEntry(named))
+          (*declarations)[named->getIdentifier()].insert(file);
+      }
+    }
+
+    // Function bodies can contain arbitrary local names that cannot be
+    // dependencies of an unexpanded macro body. Record and namespace contexts
+    // do contain member and qualified declaration names, so recurse into them.
+    if (clang::isa<clang::FunctionDecl>(decl))
+      continue;
+    if (const auto* child = clang::dyn_cast<clang::DeclContext>(decl))
+      IndexMacroBodyDeclarations(child, declarations);
+  }
+}
+
+}  // namespace
+
+void IwyuPreprocessorInfo::ResolveMacroBodyDependencies(
+    clang::ASTContext& context) {
+  map<const clang::IdentifierInfo*, set<const FileEntry*>> declarations;
+  IndexMacroBodyDeclarations(context.getTranslationUnitDecl(), &declarations);
+
+  for (const auto& macro_entry : macro_body_dependencies_) {
+    const string& macro_name = macro_entry.first;
+    const MacroBodyDependency& body = macro_entry.second;
+    const FileEntry* macro_file = GetFileEntry(body.definition_location);
+    if (!macro_file)
+      continue;
+
+    IwyuFileInfo* macro_file_info = GetFromFileInfoMap(macro_file);
+    const set<const FileEntry*>& direct_includes =
+        macro_file_info->direct_includes_as_fileentries();
+    if (direct_includes.empty())
+      continue;
+
+    for (const clang::IdentifierInfo* identifier : body.identifiers) {
+      // A live macro name in another macro body denotes a nested expansion,
+      // not a C++ declaration. Its own MacroInfo body is resolved separately.
+      if (preprocessor_->getMacroDefinition(identifier).getMacroInfo())
+        continue;
+
+      const auto declarations_it = declarations.find(identifier);
+      if (declarations_it == declarations.end())
+        continue;
+
+      set<const FileEntry*> direct_providers;
+      std::set_intersection(
+          declarations_it->second.begin(), declarations_it->second.end(),
+          direct_includes.begin(), direct_includes.end(),
+          std::inserter(direct_providers, direct_providers.end()));
+      if (direct_providers.size() != 1)
+        continue;
+
+      const FileEntry* provider = *direct_providers.begin();
+      const string token_name = identifier->getName().str();
+      macro_file_info->ReportKnownDesiredFile(
+          provider, "macro_body_dependency",
+          "Function-like macro " + macro_name + " contains identifier token " +
+              token_name +
+              ", uniquely declared among its direct providers by this include.");
+      ERRSYM(macro_file)
+          << "Keep #include " << provider->getName() << " in "
+          << macro_file->getName() << " because function-like macro "
+          << macro_name << " contains identifier token " << token_name
+          << ", uniquely declared by that direct provider.\n";
+    }
+  }
+}
 
 // Adds of includer's includes, direct or indirect, into retval.
 void IwyuPreprocessorInfo::AddAllIncludesAsFileEntries(

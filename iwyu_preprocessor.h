@@ -77,7 +77,9 @@
 #include "clang/Lex/Token.h"
 
 namespace clang {
+class ASTContext;
 class FileEntry;
+class IdentifierInfo;
 class MacroInfo;
 class NamedDecl;
 }  // namespace clang
@@ -100,6 +102,12 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
 
   // The client *must* call this from the beginning of HandleTranslationUnit()
   void HandlePreprocessingDone();
+
+  // Resolve declaration tokens in live function-like macro bodies after Clang
+  // has built the AST. A direct include that uniquely provides such a token is
+  // retained for future consumers even if this translation unit never expands
+  // the macro.
+  void ResolveMacroBodyDependencies(clang::ASTContext& context);
 
   // More direct ways of getting at this information
   const clang::FileEntry* main_file() const {
@@ -219,8 +227,9 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
                     const clang::MacroArgs* args) override;
   void MacroDefined(const clang::Token& id,
                     const clang::MacroDirective* directive) override;
-  // Not needed for iwyu:
-  // virtual void MacroUndefined(const clang::Token&, const clang::MacroInfo*);
+  void MacroUndefined(const clang::Token& id,
+                      const clang::MacroDefinition& definition,
+                      const clang::MacroDirective* directive) override;
 
   void Ifdef(clang::SourceLocation loc, const clang::Token& id,
              const clang::MacroDefinition& definition) override;
@@ -424,6 +433,16 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
   // -- like we do template bodies -- but macros don't give us enough
   // context to know how to interpret the tokens we see, in general).
   map<string, clang::SourceLocation> macros_definition_loc_;  // key: macro name
+
+  struct MacroBodyDependency {
+    clang::SourceLocation definition_location;
+    vector<const clang::IdentifierInfo*> identifiers;
+  };
+
+  // MacroInfo token provenance for the currently live function-like macro
+  // definition of each name. Disabled preprocessor branches never produce a
+  // callback, and MacroUndefined removes stale definitions.
+  map<string, MacroBodyDependency> macro_body_dependencies_;
 
   // This should logically be a set, but set<> needs Token::operator<
   // which we don't have.  Luckily, a vector works just as well.

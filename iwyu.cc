@@ -3839,6 +3839,13 @@ class IwyuAstConsumer
     // force all the lazy evaluation to happen here.
     InstantiateImplicitMethods(sema, tu_decl);
 
+    // Function-like macro bodies are not represented in the AST unless they
+    // are expanded. Resolve their MacroInfo identifier tokens against the
+    // completed AST so headers keep direct declaration providers needed by
+    // future consumers.
+    const_cast<IwyuPreprocessorInfo*>(&preprocessor_info())
+        ->ResolveMacroBodyDependencies(context);
+
     // Run IWYU analysis.
     TraverseDecl(tu_decl);
 
