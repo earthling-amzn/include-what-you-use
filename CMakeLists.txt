@@ -254,6 +254,12 @@ if (Python3_Interpreter_FOUND)
   )
   set_tests_properties(native_json_output_test PROPERTIES SKIP_RETURN_CODE 77)
 
+  add_test(NAME fwd_opaque_semantics_test
+    COMMAND ${Python3_EXECUTABLE} tests/fwd_opaque_semantics_test.py
+      $<TARGET_FILE:include-what-you-use>
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
   add_test(NAME output_schema_test
     COMMAND ${Python3_EXECUTABLE} tests/validate_output_schema.py
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

@@ -1585,10 +1585,40 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
   //------------------------------------------------------------
   // Visitors of types derived from clang::Decl.
 
-  // Friend declarations only need their types forward-declared.
+  // A friend type declaration does not make its name visible to ordinary
+  // namespace lookup. Preserve an earlier namespace-scope declaration that
+  // the friend found. A selected definition can still satisfy this use later
+  // in output analysis, making the earlier declaration removable.
   bool VisitFriendDecl(clang::FriendDecl* decl) {
     if (CanIgnoreCurrentASTNode())
       return true;
+
+    const NamedDecl* befriended = decl->getFriendDecl();
+    if (!befriended) {
+      if (const clang::TypeSourceInfo* friend_type = decl->getFriendType()) {
+        befriended = TypeToDeclAsWritten(friend_type->getType().getTypePtr());
+      }
+    }
+
+    const NamedDecl* first_namespace_decl = nullptr;
+    for (const NamedDecl* redecl : GetTagRedecls(befriended)) {
+      const DeclContext* context = redecl->getDeclContext();
+      if (!IsForwardDecl(redecl) ||
+          (!context->isTranslationUnit() && !context->isNamespace()) ||
+          !IsBeforeInSameFile(redecl, decl->getFriendLoc())) {
+        continue;
+      }
+      if (!first_namespace_decl ||
+          IsBeforeInTranslationUnit(GetLocation(redecl),
+                                    GetLocation(first_namespace_decl))) {
+        first_namespace_decl = redecl;
+      }
+    }
+    if (first_namespace_decl) {
+      ReportDeclForwardDeclareUse(decl->getFriendLoc(),
+                                  first_namespace_decl);
+    }
+
     current_ast_node()->set_in_forward_declare_context(true);
     return true;
   }
