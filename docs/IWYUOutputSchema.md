@@ -13,12 +13,13 @@ The record-level `conditional_regions` array lists every `#if`/`#ifdef`/
 `#ifndef`/`#elif`/`#else` branch found by raw lexing, including branches Clang
 did not enter. Per-FileID instances classify each existing branch as `active`,
 `inactive`, or `unknown`, and include exact body boundaries for an independent
-applier to verify. Each region also carries `lexical_scope`: `file` is proved
-from Clang's final macro-expanded token stream, while function, class,
-namespace-block, macro-expanded, malformed, and otherwise uncertain positions
-are `non_file` or `unknown`. Comments, ordinary strings, and raw strings cannot
-forge that fact. Schema v1 has none of these fields and cannot authorize a
-conditional edit.
+applier to verify. Each region also carries `lexical_scope`: `file` requires
+both zero scope depth in Clang's final macro-expanded token stream and absence
+from every completed AST declaration, statement, type, and declarator source
+range. Function, class, namespace-block, macro-expanded, declaration-embedded,
+malformed, and otherwise uncertain positions are `non_file` or `unknown`.
+Comments, ordinary strings, and raw strings cannot forge that fact. Schema v1
+has none of these fields and cannot authorize a conditional edit.
 
 ## Stream protocol
 

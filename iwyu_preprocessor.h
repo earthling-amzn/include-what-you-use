@@ -102,10 +102,11 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
         expanded_scope_unknown_(false), main_file_(nullptr),
         empty_file_info_(nullptr, this, "") {}
 
-  // Observe Clang's final macro-expanded token stream. Conditional callbacks
-  // snapshot this parser-visible brace depth so consumers never infer legal
-  // include scope from raw source text, comments, literals, or macro bodies.
+  // Observe Clang's final macro-expanded token stream. This supplies an early
+  // non-file classification for braced scopes; the completed AST independently
+  // rejects directives inside declarations, statements, types, or declarators.
   void ObserveExpandedToken(const clang::Token& token);
+  void ClassifyConditionalRegionScopes(clang::ASTContext& context);
 
   // The client *must* call this from the beginning of HandleTranslationUnit()
   void HandlePreprocessingDone();

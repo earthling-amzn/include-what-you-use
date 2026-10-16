@@ -4047,6 +4047,13 @@ class IwyuAstConsumer
     // force all the lazy evaluation to happen here.
     InstantiateImplicitMethods(sema, tu_decl);
 
+    // A zero expanded-brace depth is insufficient: preprocessor directives can
+    // split an alias, parameter, template, linkage declaration, or initializer.
+    // The completed AST rejects every directive inside a declaration, statement,
+    // type, or declarator source range before structured output is calculated.
+    const_cast<IwyuPreprocessorInfo*>(&preprocessor_info())
+        ->ClassifyConditionalRegionScopes(context);
+
     // Function-like macro bodies are not represented in the AST unless they
     // are expanded. Resolve their MacroInfo identifier tokens against the
     // completed AST so headers keep direct declaration providers needed by

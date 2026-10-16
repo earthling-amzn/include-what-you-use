@@ -35,6 +35,9 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclTemplate.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/Stmt.h"
+#include "clang/AST/TypeLoc.h"
 #include "clang/Basic/IdentifierTable.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/Lexer.h"
@@ -1137,6 +1140,90 @@ void IwyuPreprocessorInfo::ObserveExpandedToken(const Token& token) {
       expanded_scope_unknown_ = true;
     } else {
       --expanded_brace_depth_;
+    }
+  }
+}
+
+void IwyuPreprocessorInfo::ClassifyConditionalRegionScopes(
+    clang::ASTContext& context) {
+  struct FileRange {
+    unsigned file_id;
+    unsigned begin_offset;
+    unsigned end_offset;
+  };
+
+  class ScopeRangeVisitor
+      : public clang::RecursiveASTVisitor<ScopeRangeVisitor> {
+   public:
+    ScopeRangeVisitor(clang::SourceManager& source_manager,
+                      const clang::LangOptions& language_options,
+                      vector<FileRange>* ranges)
+        : source_manager_(source_manager),
+          language_options_(language_options), ranges_(ranges) {}
+
+    bool VisitDecl(clang::Decl* declaration) {
+      if (declaration && !llvm::isa<clang::TranslationUnitDecl>(declaration))
+        AddRange(declaration->getSourceRange());
+      return true;
+    }
+
+    bool VisitStmt(clang::Stmt* statement) {
+      if (statement)
+        AddRange(statement->getSourceRange());
+      return true;
+    }
+
+    bool VisitTypeLoc(clang::TypeLoc type_location) {
+      if (!type_location.isNull())
+        AddRange(type_location.getSourceRange());
+      return true;
+    }
+
+   private:
+    void AddRange(SourceRange range) {
+      SourceLocation begin = source_manager_.getExpansionLoc(range.getBegin());
+      SourceLocation end = source_manager_.getExpansionLoc(range.getEnd());
+      if (begin.isInvalid() || end.isInvalid() || !begin.isFileID() ||
+          !end.isFileID()) {
+        return;
+      }
+      const FileID begin_file = source_manager_.getFileID(begin);
+      if (begin_file.isInvalid() || begin_file != source_manager_.getFileID(end))
+        return;
+      SourceLocation after_end = clang::Lexer::getLocForEndOfToken(
+          end, 0, source_manager_, language_options_);
+      if (after_end.isInvalid() || !after_end.isFileID() ||
+          source_manager_.getFileID(after_end) != begin_file) {
+        return;
+      }
+      const unsigned begin_offset = source_manager_.getFileOffset(begin);
+      const unsigned end_offset = source_manager_.getFileOffset(after_end);
+      if (begin_offset < end_offset) {
+        ranges_->push_back(
+            {begin_file.getHashValue(), begin_offset, end_offset});
+      }
+    }
+
+    clang::SourceManager& source_manager_;
+    const clang::LangOptions& language_options_;
+    vector<FileRange>* ranges_;
+  };
+
+  vector<FileRange> ranges;
+  ScopeRangeVisitor visitor(context.getSourceManager(), context.getLangOpts(),
+                            &ranges);
+  visitor.TraverseDecl(context.getTranslationUnitDecl());
+
+  for (ConditionalRegion& region : conditional_regions_) {
+    if (region.lexical_scope != LexicalScope::kFile)
+      continue;
+    for (const FileRange& range : ranges) {
+      if (range.file_id == region.file_id &&
+          range.begin_offset <= region.directive_offset &&
+          region.directive_offset < range.end_offset) {
+        region.lexical_scope = LexicalScope::kNonFile;
+        break;
+      }
     }
   }
 }

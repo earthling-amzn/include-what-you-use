@@ -102,16 +102,18 @@ def main():
     assert arch["edit_condition"]["value"]["source_region_path"] == [
         "branch-310-0-310", "branch-333-0-333"]
 
-    # Clang's final macro-expanded token stream, rather than a raw brace scan,
-    # proves legal include scope. Comments, normal strings, and raw strings do
-    # not create scope; function/class/namespace braces and macro-expanded
-    # namespace braces do.
-    scope_flags = ["-DFUNCTION_REGION", "-DCLASS_REGION",
-                   "-DNAMESPACE_REGION", "-DMACRO_REGION", "-DFILE_REGION"]
+    # Expanded braces reject ordinary and macro-created scopes. The completed
+    # AST additionally rejects brace-depth-zero directives embedded in the
+    # exact alias repro and in parameter, template, linkage, and initializer
+    # ranges. Only the normal top-of-file branch is include-capable.
+    scope_flags = ["-DFILE_REGION", "-DFUNCTION_REGION", "-DCLASS_REGION",
+                   "-DNAMESPACE_REGION", "-DMACRO_REGION"]
     scope = analyze("scope", scope_flags, SCOPE_SOURCE)
     scope_regions = scope["conditional_regions"]
     assert [region["lexical_scope"] for region in scope_regions] == [
-        "non_file", "non_file", "non_file", "non_file", "file"]
+        "file", "non_file", "non_file", "non_file", "non_file",
+        "non_file", "non_file", "non_file", "non_file", "non_file",
+        "non_file", "non_file", "non_file", "non_file", "non_file"]
     scope_compile = subprocess.run(
         [CXX, "-std=c++17", "-I", str(ROOT), *scope_flags,
          "-fsyntax-only", str(ROOT / SCOPE_SOURCE)],
