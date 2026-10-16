@@ -1,0 +1,3 @@
+[
+  { include: ["\"tests/fwd_order/fwd004_mapped_deep_private.hpp\"", private, "\"tests/fwd_order/fwd004_mapped_deep_public.hpp\"", public] },
+]

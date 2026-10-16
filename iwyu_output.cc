@@ -1638,6 +1638,7 @@ void CalculateIwyuForForwardDeclareUse(
     OneUse* use,
     const set<string>& actual_includes,
     const set<string>& desired_includes,
+    const set<string>& direct_desired_includes,
     const set<const FileEntry*>& associated_includes,
     const IwyuPreprocessorInfo* preprocessor_info) {
   CHECK_(!use->ignore_use() && "Trying to calculate on an ignored use");
@@ -1654,37 +1655,66 @@ void CalculateIwyuForForwardDeclareUse(
     tag_decl = tpl_decl->getTemplatedDecl();
   CHECK_(tag_decl && "Non-tag types should have been handled already");
 
-  // If this tag type is defined in one of the desired_includes, mark that
-  // fact.  Also if it's defined in one of the actual_includes. A direct
-  // include can satisfy the use only when its active branch dominates the use.
-  // Associated-header edges retain their existing conservative semantics until
-  // they carry occurrence-level condition provenance.
+  // If this tag type is defined in one of the desired or actual providers,
+  // mark that fact. Direct, mapped, and associated edges must bind the selected
+  // provider spelling and path to an exact entered FileID that dominates the
+  // use. Missing, ambiguous, conditional, different-instance, and deeper facts
+  // fail closed.
   bool dfn_is_in_desired_includes = false;
   bool dfn_is_in_actual_includes = false;
+  string desired_provider;
   const FileEntry* use_file = GetFileEntry(use->use_loc());
-  const auto direct_include_covers_use =
-      [&](const string& header) {
-        const auto coverage = preprocessor_info->DirectIncludeCoverageAt(
-            use_file, header, use->use_loc());
-        return coverage ==
-                   IwyuPreprocessorInfo::DirectIncludeCoverage::
-                       kNoDirectOccurrence ||
-               coverage ==
-                   IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse;
+  const auto associated_provider_covers_use =
+      [&](const CandidateHeader& candidate, SourceLocation declaration_loc) {
+        for (const FileEntry* associated : associated_includes) {
+          if (preprocessor_info->AssociatedProviderCoverageAt(
+                  use_file, associated, candidate.spelling, candidate.path,
+                  declaration_loc, use->use_loc()) ==
+              IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse) {
+            return true;
+          }
+        }
+        return false;
       };
 
   const NamedDecl* dfn = GetTagDefinition(use->decl());
   if (dfn) {
-    vector<string> headers =
-        GlobalIncludePicker().GetCandidateHeadersForFilepathIncludedFrom(
+    vector<CandidateHeader> headers =
+        GlobalIncludePicker().GetCandidateHeaderRefsForFilepathIncludedFrom(
             GetFilePath(dfn), GetFilePath(use->use_loc()));
-    for (const string& header : headers) {
-      if (ContainsKey(desired_includes, header) &&
-          direct_include_covers_use(header)) {
+    const string definition_path = GetFilePath(dfn);
+    const CandidateHeader physical_header{
+        ConvertToQuotedInclude(definition_path), definition_path};
+    if (std::none_of(headers.begin(), headers.end(),
+                     [&](const CandidateHeader& header) {
+                       return header.spelling == physical_header.spelling &&
+                              header.path == physical_header.path;
+                     })) {
+      headers.push_back(physical_header);
+    }
+    for (const CandidateHeader& header : headers) {
+      const auto direct_coverage =
+          preprocessor_info->DirectProviderCoverageAt(
+              use_file, header.spelling, header.path, GetLocation(dfn),
+              use->use_loc());
+      const bool present_provider_covers =
+          direct_coverage ==
+              IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse ||
+          associated_provider_covers_use(header, GetLocation(dfn));
+      const bool new_direct_provider_covers =
+          direct_coverage ==
+              IwyuPreprocessorInfo::DirectIncludeCoverage::
+                  kNoDirectOccurrence &&
+          !header.path.empty() &&
+          ContainsKey(direct_desired_includes, header.spelling);
+      if (ContainsKey(desired_includes, header.spelling) &&
+          (present_provider_covers || new_direct_provider_covers)) {
         dfn_is_in_desired_includes = true;
+        if (desired_provider.empty())
+          desired_provider = header.spelling;
       }
-      if (ContainsKey(actual_includes, header) &&
-          direct_include_covers_use(header)) {
+      if (ContainsKey(actual_includes, header.spelling) &&
+          present_provider_covers) {
         dfn_is_in_actual_includes = true;
       }
     }
@@ -1705,12 +1735,16 @@ void CalculateIwyuForForwardDeclareUse(
       break;
     }
   }
-  // If there's no redecl in the .cc file, we'll accept a redecl in
-  // an associated .h file.  Since associated .h files are always
-  // desired includes, we don't need to check for that.
+  // If there's no redecl in the .cc file, accept one in an associated header
+  // only when the exact entered associated instance dominates this use.
   if (!same_file_decl) {
     for (const NamedDecl* redecl : redecls) {
-      if (ContainsKey(associated_includes, GetFileEntry(redecl))) {
+      const FileEntry* associated = GetFileEntry(redecl);
+      if (!ContainsKey(associated_includes, associated))
+        continue;
+      if (preprocessor_info->AssociatedDeclarationCoverageAt(
+              use_file, associated, GetLocation(redecl), use->use_loc()) ==
+          IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse) {
         same_file_decl = redecl;
         break;
       }
@@ -1724,10 +1758,12 @@ void CalculateIwyuForForwardDeclareUse(
     VERRS(6) << "Noting fwd-decl use of " << use->symbol_name()
              << " (" << use->PrintableUseLoc() << ") is satisfied by dfn in "
              << PrintableLoc(GetLocation(providing_decl)) << "\n";
-    // Mark that this use is another reason we want this header.
-    const string file = GetFilePath(dfn);
-    const string quoted_hdr = ConvertToQuotedInclude(file);
-    use->set_suggested_header(quoted_hdr);
+    // Mark that this use is another reason we want this exact selected header.
+    // Same-file definitions retain the historical fallback spelling.
+    use->set_suggested_header(
+        desired_provider.empty()
+            ? ConvertToQuotedInclude(GetFilePath(dfn))
+            : desired_provider);
   } else if (same_file_decl) {
     providing_decl = same_file_decl;
     VERRS(6) << "Noting fwd-decl use of " << use->symbol_name()
@@ -1897,7 +1933,7 @@ void IwyuFileInfo::CalculateIwyuViolations(vector<OneUse>* uses) {
     } else if (!use.is_full_use()) {
       internal::CalculateIwyuForForwardDeclareUse(
           &use, effective_direct_includes, effective_desired_includes,
-          AssociatedFileEntries(), preprocessor_info_);
+          desired_includes(), AssociatedFileEntries(), preprocessor_info_);
     } else {
       internal::CalculateIwyuForFullUse(
           &use, effective_direct_includes, quoted_file_);

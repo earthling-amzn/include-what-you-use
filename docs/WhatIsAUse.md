@@ -173,3 +173,26 @@ The rule here applies even to const references (which can also be automatically 
 
     #include "foo.h"
     void Func1(const Foo& foo);   // IWYU says you intend to re-export Foo
+
+## Forward declarations and provider occurrence order ##
+
+A definition makes an earlier forward declaration redundant only when IWYU can
+bind the selected provider to an exact preprocessor occurrence. The occurrence
+must precede the use in the same entered `FileID`, and its active condition must
+dominate the use condition. The entered provider `FileID` must contain the
+definition. A mapped public header may instead have one exact, unconditional
+direct include whose entered `FileID` contains the definition.
+
+Associated headers use the same proof from the source file into the exact
+associated-header instance. Their selected provider must be a direct,
+unconditional occurrence in that instance. The established dotted-inline case
+also accepts the selected inline header's exact plain counterpart. It does not
+infer a general transitive provider graph.
+
+IWYU keeps or reports the declaration when a selected path is unresolved or
+ambiguous, an occurrence is conditional or follows the use, a definition came
+from a different entered instance, or the provider is deeper than these direct
+edges. A skipped exact dotted-inline self-include is the narrow exception: Clang
+source locations must prove that the plain definition was entered earlier in
+the translation unit. Other guarded re-entry fails closed, because a definition
+later in the re-entered header is not available at the use.

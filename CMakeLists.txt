@@ -287,6 +287,12 @@ if (Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   )
 
+  add_test(NAME fwd_order_semantics_test
+    COMMAND ${Python3_EXECUTABLE} tests/fwd_order_semantics_test.py
+      $<TARGET_FILE:include-what-you-use> ${CMAKE_CXX_COMPILER}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
   add_test(NAME output_schema_test
     COMMAND ${Python3_EXECUTABLE} tests/validate_output_schema.py
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

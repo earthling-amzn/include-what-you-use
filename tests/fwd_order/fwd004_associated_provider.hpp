@@ -1,0 +1,4 @@
+#ifndef IWYU_TESTS_FWD_ORDER_ASSOC_PROVIDER_HPP_
+#define IWYU_TESTS_FWD_ORDER_ASSOC_PROVIDER_HPP_
+class Fwd004Associated {};
+#endif

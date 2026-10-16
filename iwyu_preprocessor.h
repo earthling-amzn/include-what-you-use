@@ -221,6 +221,36 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
       const clang::FileEntry* includer, const string& quoted_include,
       clang::SourceLocation use_loc) const;
 
+  // Proves that an exact selected direct include occurrence makes declaration
+  // available at use_loc. The selected path must resolve unambiguously. The
+  // declaration may live in the selected provider itself or in one
+  // unconditional header directly included by that exact provider instance.
+  // Skipped re-entry, a different entered instance, deeper providers, and
+  // unknown source facts fail closed.
+  DirectIncludeCoverage DirectProviderCoverageAt(
+      const clang::FileEntry* includer, const string& selected_spelling,
+      const string& selected_path, clang::SourceLocation declaration_loc,
+      clang::SourceLocation use_loc) const;
+
+  // As above for a provider reached through an exact associated-header
+  // occurrence. The declaration may live in the associated header itself or
+  // in the exact selected header directly included by that associated
+  // instance. No transitive provider graph is inferred.
+  DirectIncludeCoverage AssociatedProviderCoverageAt(
+      const clang::FileEntry* includer,
+      const clang::FileEntry* associated_header,
+      const string& selected_spelling, const string& selected_path,
+      clang::SourceLocation declaration_loc,
+      clang::SourceLocation use_loc) const;
+
+  // Proves only the root associated-header occurrence and declaration
+  // instance, for forward declarations supplied by the associated header.
+  DirectIncludeCoverage AssociatedDeclarationCoverageAt(
+      const clang::FileEntry* includer,
+      const clang::FileEntry* associated_header,
+      clang::SourceLocation declaration_loc,
+      clang::SourceLocation use_loc) const;
+
   // Return true if the given file has
   // "// IWYU pragma: no_include <other_filename>".
   bool IncludeIsInhibited(const clang::FileEntry* file,
@@ -341,6 +371,16 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
     clang::SourceLocation location;
     clang::FileID includee_file_id;
   };
+
+  DirectIncludeCoverage DirectOccurrenceCoverageAt(
+      const DirectIncludeCondition& include,
+      clang::SourceLocation use_loc) const;
+  bool DirectOccurrenceIsUnconditional(
+      const DirectIncludeCondition& include, bool* unknown) const;
+  bool SkippedDottedInlineOccurrenceProvides(
+      const DirectIncludeCondition& include,
+      clang::SourceLocation declaration_loc,
+      clang::SourceLocation use_loc) const;
 
   struct PendingDottedInlineExport {
     const clang::FileEntry* includer;
