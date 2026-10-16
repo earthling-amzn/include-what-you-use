@@ -60,6 +60,7 @@
 #ifndef INCLUDE_WHAT_YOU_USE_IWYU_PREPROCESSOR_H_
 #define INCLUDE_WHAT_YOU_USE_IWYU_PREPROCESSOR_H_
 
+#include <cstddef>                      // for size_t
 #include <map>                          // for map
 #include <set>                          // for set
 #include <stack>                        // for stack
@@ -193,15 +194,40 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
   bool ConditionAtLocationDominates(clang::SourceLocation provider_loc,
                                     clang::SourceLocation use_loc) const;
 
+  enum class BranchActivity { kActive, kInactive, kUnknown };
+
   struct ActiveCondition {
     enum class Status { kNotApplicable, kKnown, kUnknown };
     Status status = Status::kUnknown;
     string expression;
     clang::SourceLocation directive_location;
     bool active_branch = false;
+    // Source-derived identity. Unlike expression text, this binds a condition
+    // to exact directive offsets and its complete nesting path.
+    string source_region_id;
+    vector<string> source_region_path;
+  };
+
+  struct ConditionalRegion {
+    string source_region_id;
+    unsigned file_id;
+    unsigned opening_offset;
+    unsigned directive_offset;
+    unsigned body_begin_offset;
+    unsigned body_end_offset;
+    bool has_body_end;
+    unsigned branch_index;
+    string parent_source_region_id;
+    string directive_kind;
+    string expression;
+    BranchActivity activity;
+    clang::SourceLocation opening_location;
+    clang::SourceLocation directive_location;
   };
 
   ActiveCondition ActiveConditionAt(clang::SourceLocation loc) const;
+  vector<ConditionalRegion> ConditionalRegionsFor(
+      const clang::FileEntry* file) const;
   ActiveCondition DirectIncludeConditionAt(
       const clang::FileEntry* includer, const string& quoted_include,
       int line_number) const;
@@ -350,6 +376,12 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
     vector<string> prior_branch_expressions;
     const clang::IdentifierInfo* macro;
     bool is_ifndef;
+    BranchActivity parent_activity;
+    bool prior_active;
+    bool prior_unknown;
+    BranchActivity activity;
+    string source_region_id;
+    size_t region_fact_index;
 
     bool operator==(const ActiveConditionalState& other) const {
       return file_id == other.file_id &&
@@ -391,10 +423,17 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
 
   void EnterConditional(clang::SourceLocation loc,
                         const clang::IdentifierInfo* macro,
-                        bool is_ifndef, const string& expression);
+                        bool is_ifndef, const string& expression,
+                        BranchActivity condition_activity,
+                        const string& directive_kind);
   void EnterAlternative(clang::SourceLocation loc, const string& expression,
-                        bool is_else);
+                        bool is_else, BranchActivity condition_activity,
+                        const string& directive_kind);
   void ExitConditional(clang::SourceLocation loc);
+  BranchActivity ActivityUnderParent(BranchActivity condition_activity,
+                                     BranchActivity parent_activity) const;
+  unsigned DirectiveBodyBeginOffset(clang::SourceLocation loc) const;
+  void CloseCurrentRegion(unsigned file_id, unsigned end_offset);
   string ConditionSourceText(clang::SourceRange range) const;
   void RecordConditionEvent(clang::SourceLocation loc);
   bool ConditionPathAt(clang::SourceLocation loc,
@@ -475,6 +514,8 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
   map<const clang::FileEntry*, vector<ConditionalState>> conditional_stacks_;
   map<unsigned, vector<ActiveConditionalState>> active_condition_stacks_;
   map<unsigned, vector<ConditionEvent>> condition_events_;
+  vector<ConditionalRegion> conditional_regions_;
+  map<const clang::FileEntry*, vector<size_t>> conditional_regions_by_file_;
   vector<DirectIncludeCondition> direct_include_conditions_;
   vector<PendingDottedInlineExport> pending_dotted_inline_exports_;
 

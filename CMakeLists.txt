@@ -305,6 +305,12 @@ if (Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   )
 
+  add_test(NAME conditional_regions_test
+    COMMAND ${Python3_EXECUTABLE} tests/conditional_regions_test.py
+      $<TARGET_FILE:include-what-you-use> ${CMAKE_CXX_COMPILER}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
   add_test(NAME iwyu_tool_json_output_test
     COMMAND ${Python3_EXECUTABLE} tests/iwyu_tool_json_output_test.py
       $<TARGET_FILE:include-what-you-use>

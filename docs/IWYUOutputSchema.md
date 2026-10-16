@@ -1,15 +1,27 @@
-# IWYU structured output schema, version 1
+# IWYU structured output schemas, versions 1 and 2
 
-`output-v1.schema.json` defines one record in IWYU's JSON Lines output.
-OUTPUT-001 defined the schema; OUTPUT-002 implements native and compilation-
-database production.
+`output-v1.schema.json` remains the frozen OUTPUT-002 contract.
+`output-v2.schema.json` adds exact conditional-region census facts required for
+branch-local multi-configuration edits. The analyzer now emits version 2;
+`iwyu_tool.py` transports both versions so recorded and synthetic v1 producers
+remain compatible.
+
+Version 2 never identifies a branch by expression text alone. A known condition
+carries `source_region_id` and its complete `source_region_path`. Each ID is
+derived from exact source byte offsets for the opening and selected directive.
+The record-level `conditional_regions` array lists every `#if`/`#ifdef`/
+`#ifndef`/`#elif`/`#else` branch found by raw lexing, including branches Clang
+did not enter. Per-FileID instances classify each existing branch as `active`,
+`inactive`, or `unknown`, and include exact body boundaries for an independent
+applier to verify. Schema v1 has none of these fields and cannot authorize a
+conditional edit.
 
 ## Stream protocol
 
 Structured output uses JSON Lines because `iwyu_tool.py` runs one IWYU child per
 compilation command. Every non-empty line on the structured-output stream is one
-complete UTF-8 JSON object validating against `output-v1.schema.json`. There is
-no surrounding array and no multi-line record.
+complete UTF-8 JSON object validating against the schema named by its
+`schema_version`. There is no surrounding array and no multi-line record.
 
 JSON writes from concurrent children are not assumed atomic. In structured mode,
 the driver captures each child's stdout and stderr separately, validates complete
@@ -76,15 +88,20 @@ relationship; golden vectors in the examples lock serialization.
 
 ## Top-level fields
 
-- `schema_version`: integer `1`.
+- `schema_version`: integer `1` for the frozen contract or `2` for exact
+  conditional-region facts. The native analyzer emits `2`.
 - `record_type`: `file_analysis`.
 - `tool`: IWYU, Clang, and source-revision metadata.
 - `invocation`: stable ID/index, translation unit, configuration availability,
   and required canonical command digest.
 - `file`: analyzed path and kind.
+- `file_digest` (version 2): known `sha256:` digest of the exact SourceManager
+  buffer whose directive byte offsets are reported.
 - `status`: `correct`, `changes`, `skipped`, or `error`.
 - `associated_headers`: typed relationships with machine reason codes and human
   reasons, rather than path strings alone.
+- `conditional_regions` (version 2): complete exact directive/branch/body facts
+  and per-FileID activity for every existing branch in the analyzed file.
 - `analyzed_configurations`: explicit available complete configuration-name set
   against which operation contributions are checked.
 - `operations`: ordered recommendations and policy dispositions.

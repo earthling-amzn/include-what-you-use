@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opaque contracts for native schema-v1 JSON Lines output."""
+"""Opaque contracts for native schema-v2 JSON Lines output."""
 
 import hashlib
 import json
@@ -19,7 +19,7 @@ from validate_output_schema import semantic_errors
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA = json.loads((ROOT / "docs/output-v1.schema.json").read_text())
+SCHEMA = json.loads((ROOT / "docs/output-v2.schema.json").read_text())
 VALIDATOR = jsonschema.Draft202012Validator(SCHEMA)
 IWYU = Path(sys.argv[1]).resolve()
 
@@ -284,6 +284,8 @@ def main():
                 },
             },
             "active_branch": True,
+            "source_region_id": "branch-41-0-41",
+            "source_region_path": ["branch-41-0-41"],
         },
     }
     assert conditional_add["edit_condition"] == expected_condition
@@ -325,6 +327,8 @@ def main():
                 },
             },
             "active_branch": True,
+            "source_region_id": "branch-94-1-120",
+            "source_region_path": ["branch-67-0-67", "branch-94-1-120"],
         },
     }
     assert all(

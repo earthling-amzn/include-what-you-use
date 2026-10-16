@@ -41,7 +41,7 @@ def expect_ok(data, *args):
     assert result.returncode == 0, result.stderr
     assert result.stderr == "", result.stderr
     records = [json.loads(line) for line in result.stdout.splitlines()]
-    assert records and all(record["schema_version"] == 1 for record in records)
+    assert records and all(record["schema_version"] == 2 for record in records)
     return records
 
 

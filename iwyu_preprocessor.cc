@@ -55,6 +55,7 @@ using llvm::errs;
 using llvm::StringRef;
 using std::make_pair;
 using std::string;
+using std::to_string;
 
 namespace SrcMgr = clang::SrcMgr;
 
@@ -1118,9 +1119,63 @@ bool IwyuPreprocessorInfo::ConditionPathAt(
   return true;
 }
 
+IwyuPreprocessorInfo::BranchActivity
+IwyuPreprocessorInfo::ActivityUnderParent(
+    BranchActivity condition_activity, BranchActivity parent_activity) const {
+  if (parent_activity == BranchActivity::kInactive)
+    return BranchActivity::kInactive;
+  if (parent_activity == BranchActivity::kUnknown)
+    return BranchActivity::kUnknown;
+  return condition_activity;
+}
+
+unsigned IwyuPreprocessorInfo::DirectiveBodyBeginOffset(
+    SourceLocation loc) const {
+  const auto& source_manager = preprocessor_->getSourceManager();
+  loc = source_manager.getExpansionLoc(loc);
+  if (loc.isInvalid() || !loc.isFileID())
+    return 0;
+  bool invalid = false;
+  const FileID file_id = source_manager.getFileID(loc);
+  const StringRef buffer = source_manager.getBufferData(file_id, &invalid);
+  if (invalid)
+    return 0;
+  size_t offset = source_manager.getFileOffset(loc);
+  while (offset < buffer.size()) {
+    if (buffer[offset] != '\n') {
+      ++offset;
+      continue;
+    }
+    size_t slash = offset;
+    if (slash > 0 && buffer[slash - 1] == '\r')
+      --slash;
+    const size_t line_end = slash;
+    while (slash > 0 && buffer[slash - 1] == '\\')
+      --slash;
+    if ((line_end - slash) % 2 == 0)
+      return static_cast<unsigned>(offset + 1);
+    ++offset;
+  }
+  return static_cast<unsigned>(buffer.size());
+}
+
+void IwyuPreprocessorInfo::CloseCurrentRegion(unsigned file_id,
+                                               unsigned end_offset) {
+  auto stack_it = active_condition_stacks_.find(file_id);
+  if (stack_it == active_condition_stacks_.end() || stack_it->second.empty())
+    return;
+  const size_t index = stack_it->second.back().region_fact_index;
+  if (index >= conditional_regions_.size())
+    return;
+  ConditionalRegion& region = conditional_regions_[index];
+  region.body_end_offset = end_offset;
+  region.has_body_end = true;
+}
+
 void IwyuPreprocessorInfo::EnterConditional(
     SourceLocation loc, const clang::IdentifierInfo* macro, bool is_ifndef,
-    const string& expression) {
+    const string& expression, BranchActivity condition_activity,
+    const string& directive_kind) {
   const FileEntry* file = GetFileEntry(loc);
   if (!file)
     return;
@@ -1134,14 +1189,34 @@ void IwyuPreprocessorInfo::EnterConditional(
   if (file_id.isInvalid())
     return;
   const unsigned key = file_id.getHashValue();
-  active_condition_stacks_[key].push_back(
-      {key, source_manager.getFileOffset(file_loc), 0, expression, file_loc,
-       {expression}, macro, is_ifndef});
+  const unsigned opening_offset = source_manager.getFileOffset(file_loc);
+  vector<ActiveConditionalState>& active_stack = active_condition_stacks_[key];
+  const BranchActivity parent_activity = active_stack.empty()
+      ? BranchActivity::kActive : active_stack.back().activity;
+  const BranchActivity activity =
+      ActivityUnderParent(condition_activity, parent_activity);
+  const string parent_id = active_stack.empty()
+      ? string() : active_stack.back().source_region_id;
+  const string source_region_id =
+      "branch-" + to_string(opening_offset) + "-0-" +
+      to_string(opening_offset);
+  const size_t fact_index = conditional_regions_.size();
+  conditional_regions_.push_back(
+      {source_region_id, key, opening_offset, opening_offset,
+       DirectiveBodyBeginOffset(file_loc), 0, false, 0, parent_id,
+       directive_kind, expression, activity, file_loc, file_loc});
+  conditional_regions_by_file_[file].push_back(fact_index);
+  active_stack.push_back(
+      {key, opening_offset, 0, expression, file_loc, {expression}, macro,
+       is_ifndef, parent_activity, activity == BranchActivity::kActive,
+       activity == BranchActivity::kUnknown, activity, source_region_id,
+       fact_index});
   RecordConditionEvent(file_loc);
 }
 
 void IwyuPreprocessorInfo::EnterAlternative(
-    SourceLocation loc, const string& expression, bool is_else) {
+    SourceLocation loc, const string& expression, bool is_else,
+    BranchActivity condition_activity, const string& directive_kind) {
   const FileEntry* file = GetFileEntry(loc);
   if (!file)
     return;
@@ -1156,35 +1231,69 @@ void IwyuPreprocessorInfo::EnterAlternative(
   const FileID file_id = source_manager.getFileID(file_loc);
   if (file_id.isInvalid())
     return;
-  vector<ActiveConditionalState>& active_stack =
-      active_condition_stacks_[file_id.getHashValue()];
-  if (!active_stack.empty()) {
-    ActiveConditionalState& state = active_stack.back();
-    ++state.branch_index;
-    string branch_expression;
-    for (const string& prior : state.prior_branch_expressions) {
-      if (prior.empty()) {
-        branch_expression.clear();
-        break;
-      }
+  const unsigned key = file_id.getHashValue();
+  vector<ActiveConditionalState>& active_stack = active_condition_stacks_[key];
+  if (active_stack.empty())
+    return;
+
+  const unsigned directive_offset = source_manager.getFileOffset(file_loc);
+  CloseCurrentRegion(key, directive_offset);
+  ActiveConditionalState& state = active_stack.back();
+  ++state.branch_index;
+  string branch_expression;
+  for (const string& prior : state.prior_branch_expressions) {
+    if (prior.empty()) {
+      branch_expression.clear();
+      break;
+    }
+    if (!branch_expression.empty())
+      branch_expression += " && ";
+    branch_expression += "!(" + prior + ")";
+  }
+  if (!is_else) {
+    if (expression.empty()) {
+      branch_expression.clear();
+    } else {
       if (!branch_expression.empty())
         branch_expression += " && ";
-      branch_expression += "!(" + prior + ")";
+      branch_expression += "(" + expression + ")";
     }
-    if (!is_else) {
-      if (expression.empty()) {
-        branch_expression.clear();
-      } else {
-        if (!branch_expression.empty())
-          branch_expression += " && ";
-        branch_expression += "(" + expression + ")";
-      }
-      state.prior_branch_expressions.push_back(expression);
-    }
-    state.expression = branch_expression;
-    state.directive_location = file_loc;
-    RecordConditionEvent(file_loc);
+    state.prior_branch_expressions.push_back(expression);
   }
+
+  BranchActivity activity = BranchActivity::kUnknown;
+  if (state.parent_activity == BranchActivity::kInactive || state.prior_active) {
+    activity = BranchActivity::kInactive;
+  } else if (state.parent_activity == BranchActivity::kUnknown ||
+             state.prior_unknown) {
+    activity = BranchActivity::kUnknown;
+  } else if (is_else) {
+    activity = BranchActivity::kActive;
+  } else {
+    activity = ActivityUnderParent(condition_activity, state.parent_activity);
+  }
+  state.prior_active = state.prior_active ||
+                       activity == BranchActivity::kActive;
+  state.prior_unknown = state.prior_unknown ||
+                        activity == BranchActivity::kUnknown;
+  state.expression = branch_expression;
+  state.directive_location = file_loc;
+  state.activity = activity;
+  state.source_region_id =
+      "branch-" + to_string(state.opening_location) + "-" +
+      to_string(state.branch_index) + "-" + to_string(directive_offset);
+  const string parent_id = active_stack.size() > 1
+      ? active_stack[active_stack.size() - 2].source_region_id : string();
+  const SourceLocation opening_location =
+      conditional_regions_[state.region_fact_index].opening_location;
+  state.region_fact_index = conditional_regions_.size();
+  conditional_regions_.push_back(
+      {state.source_region_id, key, state.opening_location, directive_offset,
+       DirectiveBodyBeginOffset(file_loc), 0, false, state.branch_index,
+       parent_id, directive_kind, branch_expression, activity,
+       opening_location, file_loc});
+  conditional_regions_by_file_[file].push_back(state.region_fact_index);
+  RecordConditionEvent(file_loc);
 }
 
 void IwyuPreprocessorInfo::ExitConditional(SourceLocation loc) {
@@ -1202,9 +1311,10 @@ void IwyuPreprocessorInfo::ExitConditional(SourceLocation loc) {
   const FileID file_id = source_manager.getFileID(file_loc);
   if (file_id.isInvalid())
     return;
-  vector<ActiveConditionalState>& active_stack =
-      active_condition_stacks_[file_id.getHashValue()];
+  const unsigned key = file_id.getHashValue();
+  vector<ActiveConditionalState>& active_stack = active_condition_stacks_[key];
   if (!active_stack.empty()) {
+    CloseCurrentRegion(key, source_manager.getFileOffset(file_loc));
     active_stack.pop_back();
     RecordConditionEvent(file_loc);
   }
@@ -1212,43 +1322,63 @@ void IwyuPreprocessorInfo::ExitConditional(SourceLocation loc) {
 
 void IwyuPreprocessorInfo::If(
     SourceLocation loc, SourceRange condition_range,
-    ConditionValueKind /*condition_value*/) {
-  EnterConditional(loc, nullptr, false, ConditionSourceText(condition_range));
+    ConditionValueKind condition_value) {
+  const BranchActivity activity =
+      condition_value == ConditionValueKind::CVK_True
+          ? BranchActivity::kActive
+          : (condition_value == ConditionValueKind::CVK_False
+                 ? BranchActivity::kInactive : BranchActivity::kUnknown);
+  EnterConditional(loc, nullptr, false, ConditionSourceText(condition_range),
+                   activity, "if");
 }
 
 void IwyuPreprocessorInfo::Elif(
     SourceLocation loc, SourceRange condition_range,
-    ConditionValueKind /*condition_value*/, SourceLocation /*if_loc*/) {
-  EnterAlternative(loc, ConditionSourceText(condition_range), false);
+    ConditionValueKind condition_value, SourceLocation /*if_loc*/) {
+  const BranchActivity activity =
+      condition_value == ConditionValueKind::CVK_True
+          ? BranchActivity::kActive
+          : (condition_value == ConditionValueKind::CVK_False
+                 ? BranchActivity::kInactive : BranchActivity::kUnknown);
+  EnterAlternative(loc, ConditionSourceText(condition_range), false, activity,
+                   "elif");
 }
 
 void IwyuPreprocessorInfo::Elifdef(
     SourceLocation loc, const Token& id,
-    const MacroDefinition& /*definition*/) {
-  EnterAlternative(loc, "defined(" + GetName(id) + ")", false);
+    const MacroDefinition& definition) {
+  EnterAlternative(loc, "defined(" + GetName(id) + ")", false,
+                   definition.getMacroInfo() ? BranchActivity::kActive
+                                             : BranchActivity::kInactive,
+                   "elifdef");
 }
 
 void IwyuPreprocessorInfo::Elifdef(
     SourceLocation loc, SourceRange condition_range,
     SourceLocation /*if_loc*/) {
-  EnterAlternative(loc, ConditionSourceText(condition_range), false);
+  EnterAlternative(loc, ConditionSourceText(condition_range), false,
+                   BranchActivity::kUnknown, "elifdef");
 }
 
 void IwyuPreprocessorInfo::Elifndef(
     SourceLocation loc, const Token& id,
-    const MacroDefinition& /*definition*/) {
-  EnterAlternative(loc, "!defined(" + GetName(id) + ")", false);
+    const MacroDefinition& definition) {
+  EnterAlternative(loc, "!defined(" + GetName(id) + ")", false,
+                   definition.getMacroInfo() ? BranchActivity::kInactive
+                                             : BranchActivity::kActive,
+                   "elifndef");
 }
 
 void IwyuPreprocessorInfo::Elifndef(
     SourceLocation loc, SourceRange condition_range,
     SourceLocation /*if_loc*/) {
-  EnterAlternative(loc, ConditionSourceText(condition_range), false);
+  EnterAlternative(loc, ConditionSourceText(condition_range), false,
+                   BranchActivity::kUnknown, "elifndef");
 }
 
 void IwyuPreprocessorInfo::Else(
     SourceLocation loc, SourceLocation /*if_loc*/) {
-  EnterAlternative(loc, "", true);
+  EnterAlternative(loc, "", true, BranchActivity::kUnknown, "else");
 }
 
 void IwyuPreprocessorInfo::Endif(
@@ -1258,9 +1388,12 @@ void IwyuPreprocessorInfo::Endif(
 
 void IwyuPreprocessorInfo::Ifdef(SourceLocation loc,
                                  const Token& id,
-                                 const MacroDefinition& /*definition*/) {
+                                 const MacroDefinition& definition) {
   EnterConditional(loc, id.getIdentifierInfo(), false,
-                   "defined(" + GetName(id) + ")");
+                   "defined(" + GetName(id) + ")",
+                   definition.getMacroInfo() ? BranchActivity::kActive
+                                             : BranchActivity::kInactive,
+                   "ifdef");
   ERRSYM(GetFileEntry(id.getLocation()))
       << "[ #ifdef      ] " << PrintableLoc(id.getLocation())
       << ": " << GetName(id) << "\n";
@@ -1269,9 +1402,12 @@ void IwyuPreprocessorInfo::Ifdef(SourceLocation loc,
 
 void IwyuPreprocessorInfo::Ifndef(SourceLocation loc,
                                   const Token& id,
-                                  const MacroDefinition& /*definition*/) {
+                                  const MacroDefinition& definition) {
   EnterConditional(loc, id.getIdentifierInfo(), true,
-                   "!defined(" + GetName(id) + ")");
+                   "!defined(" + GetName(id) + ")",
+                   definition.getMacroInfo() ? BranchActivity::kInactive
+                                             : BranchActivity::kActive,
+                   "ifndef");
   ERRSYM(GetFileEntry(id.getLocation()))
       << "[ #ifndef     ] " << PrintableLoc(id.getLocation())
       << ": " << GetName(id) << "\n";
@@ -2082,6 +2218,9 @@ IwyuPreprocessorInfo::ActiveConditionAt(SourceLocation loc) const {
   result.active_branch = true;
   for (size_t index = begin; index < path.size(); ++index) {
     const ActiveConditionalState& branch = path[index];
+    result.source_region_path.push_back(branch.source_region_id);
+    if (branch.activity != BranchActivity::kActive)
+      result.active_branch = false;
     if (branch.expression.empty())
       return result;
     if (!result.expression.empty())
@@ -2092,7 +2231,185 @@ IwyuPreprocessorInfo::ActiveConditionAt(SourceLocation loc) const {
       result.expression += "(" + branch.expression + ")";
     }
   }
+  result.source_region_id = result.source_region_path.back();
   result.status = ActiveCondition::Status::kKnown;
+  return result;
+}
+
+vector<IwyuPreprocessorInfo::ConditionalRegion>
+IwyuPreprocessorInfo::ConditionalRegionsFor(const FileEntry* file) const {
+  vector<ConditionalRegion> observed;
+  const auto found = conditional_regions_by_file_.find(file);
+  if (found == conditional_regions_by_file_.end())
+    return observed;
+  for (size_t index : found->second) {
+    if (index < conditional_regions_.size())
+      observed.push_back(conditional_regions_[index]);
+  }
+  if (observed.empty())
+    return observed;
+
+  const auto& source_manager = preprocessor_->getSourceManager();
+  const FileID scan_file_id = source_manager.getFileID(
+      source_manager.getExpansionLoc(observed.front().opening_location));
+  bool invalid = false;
+  const StringRef buffer = source_manager.getBufferData(scan_file_id, &invalid);
+  if (invalid)
+    return observed;
+  const SourceLocation file_start =
+      source_manager.getLocForStartOfFile(scan_file_id);
+  clang::Lexer lexer(file_start, preprocessor_->getLangOpts(), buffer.begin(),
+                     buffer.begin(), buffer.end());
+
+  struct Directive {
+    unsigned offset;
+    unsigned body_begin;
+    string kind;
+  };
+  vector<Directive> directives;
+  bool pending_hash = false;
+  clang::Token token;
+  do {
+    lexer.LexFromRawLexer(token);
+    if (token.is(clang::tok::hash) && token.isAtStartOfLine()) {
+      pending_hash = true;
+      continue;
+    }
+    if (!pending_hash)
+      continue;
+    pending_hash = false;
+    if (!token.is(clang::tok::raw_identifier))
+      continue;
+    const string kind = token.getRawIdentifier().str();
+    if (kind != "if" && kind != "ifdef" && kind != "ifndef" &&
+        kind != "elif" && kind != "elifdef" && kind != "elifndef" &&
+        kind != "else" && kind != "endif") {
+      continue;
+    }
+    const unsigned directive_offset =
+        source_manager.getFileOffset(token.getLocation());
+    const SourceLocation directive_location =
+        file_start.getLocWithOffset(directive_offset);
+    directives.push_back(
+        {directive_offset, DirectiveBodyBeginOffset(directive_location), kind});
+  } while (!token.is(clang::tok::eof));
+
+  struct RegionTemplate {
+    string source_region_id;
+    unsigned opening_offset;
+    unsigned directive_offset;
+    unsigned body_begin_offset;
+    unsigned body_end_offset;
+    unsigned branch_index;
+    string parent_source_region_id;
+    string directive_kind;
+  };
+  struct Group {
+    unsigned opening_offset;
+    unsigned branch_index;
+    size_t current_region;
+  };
+  vector<RegionTemplate> templates;
+  vector<Group> stack;
+  bool malformed = false;
+  for (const Directive& directive : directives) {
+    if (directive.kind == "if" || directive.kind == "ifdef" ||
+        directive.kind == "ifndef") {
+      const string parent = stack.empty()
+          ? string() : templates[stack.back().current_region].source_region_id;
+      const string id = "branch-" + to_string(directive.offset) + "-0-" +
+                        to_string(directive.offset);
+      templates.push_back({id, directive.offset, directive.offset,
+                           directive.body_begin, 0, 0, parent,
+                           directive.kind});
+      stack.push_back({directive.offset, 0, templates.size() - 1});
+    } else if (directive.kind == "elif" || directive.kind == "elifdef" ||
+               directive.kind == "elifndef" || directive.kind == "else") {
+      if (stack.empty()) {
+        malformed = true;
+        break;
+      }
+      templates[stack.back().current_region].body_end_offset = directive.offset;
+      ++stack.back().branch_index;
+      const unsigned branch_index = stack.back().branch_index;
+      const string parent = stack.size() > 1
+          ? templates[stack[stack.size() - 2].current_region].source_region_id
+          : string();
+      const string id = "branch-" + to_string(stack.back().opening_offset) +
+                        "-" + to_string(branch_index) + "-" +
+                        to_string(directive.offset);
+      templates.push_back({id, stack.back().opening_offset, directive.offset,
+                           directive.body_begin, 0, branch_index, parent,
+                           directive.kind});
+      stack.back().current_region = templates.size() - 1;
+    } else if (directive.kind == "endif") {
+      if (stack.empty()) {
+        malformed = true;
+        break;
+      }
+      templates[stack.back().current_region].body_end_offset = directive.offset;
+      stack.pop_back();
+    }
+  }
+  if (malformed || !stack.empty() ||
+      std::any_of(templates.begin(), templates.end(),
+                  [](const RegionTemplate& region) {
+                    return region.body_end_offset == 0;
+                  })) {
+    return observed;
+  }
+
+  map<pair<string, unsigned>, const ConditionalRegion*> exact;
+  set<unsigned> file_ids;
+  for (const ConditionalRegion& region : observed) {
+    exact[{region.source_region_id, region.file_id}] = &region;
+    file_ids.insert(region.file_id);
+  }
+
+  vector<ConditionalRegion> result;
+  for (unsigned file_id : file_ids) {
+    map<string, BranchActivity> activity_by_region;
+    map<unsigned, pair<bool, bool>> prior_group_activity;
+    for (const RegionTemplate& region : templates) {
+      BranchActivity activity = BranchActivity::kUnknown;
+      string expression;
+      const auto exact_it = exact.find({region.source_region_id, file_id});
+      if (exact_it != exact.end()) {
+        activity = exact_it->second->activity;
+        expression = exact_it->second->expression;
+      } else {
+        const auto parent = activity_by_region.find(
+            region.parent_source_region_id);
+        if (!region.parent_source_region_id.empty() &&
+            parent != activity_by_region.end() &&
+            parent->second == BranchActivity::kInactive) {
+          activity = BranchActivity::kInactive;
+        } else {
+          const pair<bool, bool> prior =
+              GetOrDefault(prior_group_activity, region.opening_offset,
+                           pair<bool, bool>{false, false});
+          if (prior.first)
+            activity = BranchActivity::kInactive;
+          else if (prior.second)
+            activity = BranchActivity::kUnknown;
+        }
+      }
+      activity_by_region[region.source_region_id] = activity;
+      pair<bool, bool>& prior = prior_group_activity[region.opening_offset];
+      prior.first = prior.first || activity == BranchActivity::kActive;
+      prior.second = prior.second || activity == BranchActivity::kUnknown;
+      const SourceLocation opening =
+          file_start.getLocWithOffset(region.opening_offset);
+      const SourceLocation directive =
+          file_start.getLocWithOffset(region.directive_offset);
+      result.push_back(
+          {region.source_region_id, file_id, region.opening_offset,
+           region.directive_offset, region.body_begin_offset,
+           region.body_end_offset, true, region.branch_index,
+           region.parent_source_region_id, region.directive_kind, expression,
+           activity, opening, directive});
+    }
+  }
   return result;
 }
 

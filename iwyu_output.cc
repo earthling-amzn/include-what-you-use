@@ -2638,12 +2638,19 @@ llvm::json::Object ConditionObject(
     return NotApplicableValue();
   if (condition.status == Status::kUnknown)
     return llvm::json::Object{{"status", "unknown"}, {"value", nullptr}};
+  llvm::json::Object value{
+      {"expression", condition.expression},
+      {"location", AvailableLocation(condition.directive_location, false)},
+      {"active_branch", condition.active_branch}};
+  if (GlobalFlags().output_schema_version >= 2) {
+    llvm::json::Array source_region_path;
+    for (const string& region : condition.source_region_path)
+      source_region_path.push_back(region);
+    value["source_region_id"] = condition.source_region_id;
+    value["source_region_path"] = std::move(source_region_path);
+  }
   return llvm::json::Object{
-      {"status", "known"},
-      {"value", llvm::json::Object{
-          {"expression", condition.expression},
-          {"location", AvailableLocation(condition.directive_location, false)},
-          {"active_branch", condition.active_branch}}}};
+      {"status", "known"}, {"value", std::move(value)}};
 }
 
 ProjectPolicyActiveCondition PolicyActiveCondition(
@@ -3202,7 +3209,9 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       if (common.status != condition.status ||
           common.expression != condition.expression ||
           common.directive_location != condition.directive_location ||
-          common.active_branch != condition.active_branch) {
+          common.active_branch != condition.active_branch ||
+          common.source_region_id != condition.source_region_id ||
+          common.source_region_path != condition.source_region_path) {
         return ActiveCondition{};
       }
     }
@@ -3321,6 +3330,46 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
         {"reason", association.reason}});
   }
 
+  llvm::json::Array conditional_regions;
+  vector<IwyuPreprocessorInfo::ConditionalRegion> region_facts =
+      preprocessor_info_->ConditionalRegionsFor(file_);
+  std::sort(region_facts.begin(), region_facts.end(),
+            [](const auto& lhs, const auto& rhs) {
+              return std::tie(lhs.opening_offset, lhs.branch_index,
+                              lhs.directive_offset, lhs.file_id) <
+                     std::tie(rhs.opening_offset, rhs.branch_index,
+                              rhs.directive_offset, rhs.file_id);
+            });
+  for (const auto& region : region_facts) {
+    const char* activity =
+        region.activity == IwyuPreprocessorInfo::BranchActivity::kActive
+            ? "active"
+            : (region.activity ==
+                       IwyuPreprocessorInfo::BranchActivity::kInactive
+                   ? "inactive" : "unknown");
+    llvm::json::Object body_end = region.has_body_end
+        ? llvm::json::Object{{"status", "known"},
+                             {"value", region.body_end_offset}}
+        : llvm::json::Object{{"status", "unknown"}, {"value", nullptr}};
+    llvm::json::Object parent = region.parent_source_region_id.empty()
+        ? NotApplicableValue()
+        : KnownString(region.parent_source_region_id);
+    conditional_regions.push_back(llvm::json::Object{
+        {"source_region_id", region.source_region_id},
+        {"file_id", region.file_id},
+        {"opening_offset", region.opening_offset},
+        {"directive_offset", region.directive_offset},
+        {"body_begin_offset", region.body_begin_offset},
+        {"body_end_offset", std::move(body_end)},
+        {"branch_index", region.branch_index},
+        {"parent_source_region_id", std::move(parent)},
+        {"directive_kind", region.directive_kind},
+        {"expression", region.expression},
+        {"activity", activity},
+        {"opening_location", AvailableLocation(region.opening_location, false)},
+        {"directive_location", AvailableLocation(region.directive_location, false)}});
+  }
+
   llvm::json::Array diagnostics;
   const string absolute_file_path =
       NormalizeFilePath(MakeAbsolutePath(file_path()));
@@ -3358,7 +3407,8 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
         {"severity", "warning"},
         {"code", "duplicate_occurrence_unrepresentable"},
         {"message", "Duplicate item occurrences cannot be represented "
-                    "unambiguously by output schema version 1."},
+                    "unambiguously by output schema version " +
+                    to_string(GlobalFlags().output_schema_version) + "."},
         {"location", UnavailableValue()}});
   }
 
@@ -3389,6 +3439,21 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
   llvm::json::Object file;
   file["path"] = file_path();
   file["kind"] = ProjectPolicyFileKind(file_path());
+
+  llvm::json::Object file_digest = UnavailableValue();
+  const clang::FileID digest_file_id = GlobalSourceManager()->translateFile(file_);
+  if (digest_file_id.isValid()) {
+    bool digest_invalid = false;
+    const llvm::StringRef source_bytes =
+        GlobalSourceManager()->getBufferData(digest_file_id, &digest_invalid);
+    if (!digest_invalid) {
+      const auto bytes = llvm::ArrayRef<uint8_t>(
+          reinterpret_cast<const uint8_t*>(source_bytes.data()),
+          source_bytes.size());
+      file_digest = KnownString(
+          "sha256:" + llvm::toHex(llvm::SHA256::hash(bytes), true));
+    }
+  }
 
   llvm::json::Object desired_state;
   if (has_duplicate_occurrence) {
@@ -3471,6 +3536,8 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
   if (flags.output_schema_version >= 2) {
     record["source_identity"] = StructuredSourceIdentity(file_);
     record["source_digest"] = StructuredSourceDigest(file_);
+    record["file_digest"] = std::move(file_digest);
+    record["conditional_regions"] = std::move(conditional_regions);
     record["declaration_facts"] = std::move(declaration_facts);
     record["declaration_conflicts"] = llvm::json::Array{};
   }
@@ -3565,7 +3632,9 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
             if (common.status != condition.status ||
                 common.expression != condition.expression ||
                 common.directive_location != condition.directive_location ||
-                common.active_branch != condition.active_branch) {
+                common.active_branch != condition.active_branch ||
+                common.source_region_id != condition.source_region_id ||
+                common.source_region_path != condition.source_region_path) {
               return ProjectPolicyActiveCondition{};
             }
           }

@@ -379,6 +379,8 @@ def main():
     validate_invocation_vectors()
     schema = json.loads(SCHEMA.read_text())
     jsonschema.Draft202012Validator.check_schema(schema)
+    v2_schema = json.loads((ROOT / "docs" / "output-v2.schema.json").read_text())
+    jsonschema.Draft202012Validator.check_schema(v2_schema)
     validator = jsonschema.Draft202012Validator(schema)
 
     positive = EXAMPLES / "positive.jsonl"

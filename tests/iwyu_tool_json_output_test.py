@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opaque contracts for iwyu_tool.py schema-v1 JSON Lines mode."""
+"""Opaque contracts for iwyu_tool.py versioned JSON Lines mode."""
 
 import json
 import os
@@ -21,8 +21,11 @@ from validate_output_schema import semantic_errors
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = ROOT / "iwyu_tool.py"
 IWYU = Path(sys.argv[1]).resolve()
-SCHEMA = json.loads((ROOT / "docs/output-v1.schema.json").read_text())
-VALIDATOR = jsonschema.Draft202012Validator(SCHEMA)
+SCHEMAS = {
+    version: jsonschema.Draft202012Validator(json.loads(
+        (ROOT / f"docs/output-v{version}.schema.json").read_text()))
+    for version in (1, 2)
+}
 
 
 def validate_stream(output):
@@ -31,7 +34,7 @@ def validate_stream(output):
     for line in output.splitlines():
         assert line.strip(), "structured stream contains an empty record"
         record = json.loads(line)
-        VALIDATOR.validate(record)
+        SCHEMAS[record["schema_version"]].validate(record)
         errors = semantic_errors(record)
         assert not errors, errors
         records.append(record)
