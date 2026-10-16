@@ -1653,6 +1653,17 @@ IwyuPreprocessorInfo::DirectIncludeCoverageAt(
     const SourceLocation provider_loc =
         source_manager.getExpansionLoc(include.location);
     const SourceLocation consumer_loc = source_manager.getExpansionLoc(use_loc);
+    const SourceLocation spelling_loc = source_manager.getSpellingLoc(use_loc);
+    if (use_loc.isMacroID() && spelling_loc.isValid() &&
+        GetLocFileEntry(spelling_loc) == includer &&
+        source_manager.getFileID(spelling_loc) !=
+            source_manager.getFileID(consumer_loc)) {
+      // A token spelled in a macro body can be expanded in a different file or
+      // include instance. Neither the spelling order nor the expansion
+      // condition alone proves that this direct occurrence dominates the use.
+      unknown = true;
+      continue;
+    }
     if (provider_loc.isInvalid() || consumer_loc.isInvalid() ||
         !provider_loc.isFileID() || !consumer_loc.isFileID()) {
       unknown = true;

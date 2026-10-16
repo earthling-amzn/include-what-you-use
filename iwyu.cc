@@ -104,6 +104,7 @@
 #include "iwyu_ast_util.h"
 #include "iwyu_cache.h"
 #include "iwyu_globals.h"
+#include "iwyu_include_picker.h"
 #include "iwyu_lexer_utils.h"
 #include "iwyu_location_util.h"
 #include "iwyu_output.h"
@@ -2451,35 +2452,57 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
 
   // A function declaration makes its type subtree forward-declarable, but an
   // existing direct definition for a by-value parameter or return type must not
-  // be replaced with a forward declaration. Keep nested template arguments
-  // under their own rules: in Box<T*> value, T remains forward-declarable.
+  // be replaced with a forward declaration. Classify the declaration's outer
+  // type as written, rather than a descendant type or an adjusted parameter
+  // type. This leaves references, pointers, member pointers, arrays, function
+  // parameters, and nested class components under their ordinary incomplete-use
+  // rules.
   bool IsDirectlyProvidedByValueFunctionType(const ASTNode* ast_node) const {
     CHECK_(ast_node->IsA<Type>());
 
-    ast_node = MostElaboratedAncestor(ast_node);
-    if (ast_node->HasAncestorOfType<TemplateArgument>())
-      return false;
-
-    bool is_by_value_function_type = false;
+    const Type* declared_type = nullptr;
     if (const auto* param = ast_node->GetAncestorAs<ParmVarDecl>()) {
-      is_by_value_function_type =
-          !IsPointerOrReferenceAsWritten(GetTypeOf(param));
+      declared_type = param->getOriginalType().getTypePtrOrNull();
     } else if (const auto* function =
                    ast_node->GetAncestorAs<FunctionDecl>()) {
-      const Type* return_type = function->getReturnType().getTypePtr();
-      is_by_value_function_type =
-          ast_node->StackContainsContent(return_type) &&
-          !IsPointerOrReferenceAsWritten(return_type);
+      declared_type = function->getReturnType().getTypePtrOrNull();
     }
-
-    if (!is_by_value_function_type)
+    if (!declared_type)
       return false;
 
-    const NamedDecl* type_decl = TypeToDeclAsWritten(ast_node->GetAs<Type>());
-    const NamedDecl* definition = GetTagDefinition(type_decl);
-    return definition && preprocessor_info().PublicHeaderIntendsToProvide(
-                             GetFileEntry(ast_node->GetLocation()),
-                             GetFileEntry(definition));
+    // TypeToDeclAsWritten only reaches a declaration when the outer type itself
+    // is a class type. It deliberately returns null for every indirection and
+    // adjusted-as-written shape above. Comparing declarations confines this
+    // decision to that outer class, not class types nested beneath it.
+    const NamedDecl* declared_type_decl = TypeToDeclAsWritten(declared_type);
+    const NamedDecl* node_type_decl =
+        TypeToDeclAsWritten(ast_node->GetAs<Type>());
+    if (!declared_type_decl || node_type_decl != declared_type_decl)
+      return false;
+
+    const NamedDecl* definition = GetTagDefinition(declared_type_decl);
+    const SourceLocation use_loc = ast_node->GetLocation();
+    const FileEntry* use_file = GetFileEntry(use_loc);
+    if (!definition || !use_file || use_loc.isInvalid())
+      return false;
+
+    const vector<string> providers =
+        GlobalIncludePicker().GetCandidateHeadersForFilepathIncludedFrom(
+            GetFilePath(definition), GetFilePath(use_file));
+    for (const string& provider : providers) {
+      const auto coverage = preprocessor_info().DirectIncludeCoverageAt(
+          use_file, provider, use_loc);
+      if (coverage ==
+          IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse) {
+        return true;
+      }
+      // Macro-body locations that cross FileIDs cannot yet prove an exact
+      // occurrence ordering. Keep the complete requirement in that case so SEM
+      // never emits advice that can make the declaration uncompilable.
+      if (coverage == IwyuPreprocessorInfo::DirectIncludeCoverage::kUnknown)
+        return true;
+    }
+    return false;
   }
 
   // TODO(csilvers): get rid of in_forward_declare_context() and make

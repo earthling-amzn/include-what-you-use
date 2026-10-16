@@ -35,6 +35,34 @@ INCOMPLETE = {
         ("PointerTemplateArgument", 28, 9, 5),
     ],
 }
+MACRO_COMPLETE = {
+    "macro_argument.hpp": ("MacroArgumentValue", "macro_provider.hpp"),
+    "macro_body.hpp": ("MacroBodyValue", "macro_provider.hpp"),
+}
+ORDER_SENSITIVE = {
+    "include_after_use.hpp": (
+        "IncludeAfterUse", "include_after_use_provider.hpp"),
+    "conditional_provider.hpp": (
+        "ConditionalProviderValue", "conditional_provider_definition.hpp"),
+}
+MATRIX = "by_value_type_matrix.hpp"
+MATRIX_COMPLETE = {
+    "MatrixByValueParameter", "MatrixByValueReturn", "MatrixByValueBox"}
+MATRIX_INCOMPLETE = {
+    "MatrixRvalueParameter", "MatrixRvalueReturn", "MatrixMemberPointee",
+    "MatrixMemberOwner", "MatrixAdjustedFunctionReturn",
+    "MatrixArrayParameter", "MatrixLvalueParameter", "MatrixLvalueReturn",
+    "MatrixPointerParameter", "MatrixPointerReturn",
+    "MatrixNestedValueArgument",
+}
+SUPPORT = {
+    "provider.hpp", "complete_use.cc", "value_shapes_provider.hpp",
+    "incomplete_shapes_provider.hpp", "include_after_use_provider.hpp",
+    "conditional_provider_definition.hpp", "macro_provider.hpp",
+    "macro_cross_definition.hpp", "macro_cross_provider.hpp",
+}
+TARGETS = (set(COMPLETE) | set(INCOMPLETE) | set(MACRO_COMPLETE) |
+           set(ORDER_SENSITIVE) | {MATRIX, "macro_cross_file.hpp"})
 
 
 def run(command, cwd=ROOT, stdin=None):
@@ -141,8 +169,9 @@ def analyze_json(filename, root=ROOT, corpus=CORPUS):
     source = corpus / filename
     source_argument = source.relative_to(root)
     include_argument = corpus.relative_to(root)
+    defines = ["-DFLAG=1"] if filename == "conditional_provider.hpp" else []
     result = run([
-        IWYU, "-Xiwyu", "--output_format=json", "-std=c++17",
+        IWYU, "-Xiwyu", "--output_format=json", "-std=c++17", *defines,
         "-I", include_argument, "-x", "c++-header", source_argument,
     ], cwd=root)
     records = [json.loads(line) for line in result.stdout.splitlines()]
@@ -150,9 +179,37 @@ def analyze_json(filename, root=ROOT, corpus=CORPUS):
     return records[0]
 
 
+def analyze_macro_cross_file(root=ROOT, corpus=CORPUS):
+    source = corpus / "macro_cross_file.hpp"
+    checked = corpus / "macro_cross_definition.hpp"
+    result = run([
+        IWYU, "-Xiwyu", "--output_format=json",
+        "-Xiwyu", f"--check_also={checked.relative_to(root)}",
+        "-std=c++17", "-I", corpus.relative_to(root),
+        "-x", "c++-header", source.relative_to(root),
+    ], cwd=root)
+    records = [json.loads(line) for line in result.stdout.splitlines()]
+    assert len(records) == 2, records
+    return {record["file"]["path"]: record for record in records}
+
+
+def item_spellings(record, kind):
+    return {
+        item["spelling"] for item in record["desired_state"]["items"]
+        if item["item_kind"] == kind
+    }
+
+
+def operation_spellings(record, action, kind):
+    return {
+        operation["spelling"] for operation in record["operations"]
+        if operation["subject_action"] == action and
+        operation["item_kind"] == kind
+    }
+
+
 def assert_initial_contracts():
-    expected_names = set(COMPLETE) | set(INCOMPLETE) | {
-        "provider.hpp", "complete_use.cc"}
+    expected_names = TARGETS | SUPPORT
     actual_names = {
         path.name for path in CORPUS.iterdir()
         if path.is_file()
@@ -195,16 +252,79 @@ def assert_initial_contracts():
             "status": "known",
         }
 
+    for filename, (symbol, provider_header) in MACRO_COMPLETE.items():
+        record = analyze_json(filename)
+        assert record["status"] == "correct", (filename, record)
+        assert record["operations"] == [], (filename, record["operations"])
+        assert item_spellings(record, "include") == {
+            f'#include "{provider_header}"'}, record["desired_state"]
+        assert item_spellings(record, "forward_declaration") == set(), record
+        include_item = record["desired_state"]["items"][0]
+        assert include_item["symbols"] == [symbol], include_item
+
+    records = analyze_macro_cross_file()
+    definition_record = records[
+        "tests/complete_use/macro_cross_definition.hpp"]
+    expansion_record = records["tests/complete_use/macro_cross_file.hpp"]
+    for record in (definition_record, expansion_record):
+        assert record["status"] == "correct", record
+        assert record["operations"] == [], record["operations"]
+    assert item_spellings(definition_record, "include") == {
+        '#include "macro_cross_provider.hpp"'}, definition_record
+    assert definition_record["desired_state"]["items"][0]["symbols"] == [
+        "MacroCrossValue"], definition_record
+    assert item_spellings(expansion_record, "include") == {
+        '#include "macro_cross_definition.hpp"'}, expansion_record
+
+    for filename, (symbol, provider_header) in ORDER_SENSITIVE.items():
+        record = analyze_json(filename)
+        assert record["status"] == "changes", (filename, record)
+        assert item_spellings(record, "include") == set(), (
+            filename, record["desired_state"])
+        assert item_spellings(record, "forward_declaration") == {
+            f"class {symbol};"}, record["desired_state"]
+        assert operation_spellings(record, "remove", "include") == {
+            f'#include "{provider_header}"'}, record["operations"]
+        assert operation_spellings(
+            record, "remove", "forward_declaration") == set(), (
+                filename, record["operations"])
+        assert operation_spellings(
+            record, "add", "forward_declaration") == set(), record["operations"]
+
+    record = analyze_json(MATRIX)
+    assert record["status"] == "changes", record
+    assert item_spellings(record, "include") == {
+        '#include "value_shapes_provider.hpp"'}, record["desired_state"]
+    assert item_spellings(record, "forward_declaration") == {
+        f"class {symbol};" for symbol in MATRIX_INCOMPLETE
+    }, record["desired_state"]
+    assert operation_spellings(record, "remove", "include") == {
+        '#include "incomplete_shapes_provider.hpp"'}, record["operations"]
+    assert operation_spellings(record, "add", "forward_declaration") == {
+        f"class {symbol};" for symbol in MATRIX_INCOMPLETE
+    }, record["operations"]
+    desired_include = next(
+        item for item in record["desired_state"]["items"]
+        if item["item_kind"] == "include")
+    assert set(desired_include["symbols"]) == MATRIX_COMPLETE, desired_include
+
 
 def compile_tree(corpus):
-    for filename in sorted(set(COMPLETE) | set(INCOMPLETE)):
+    for filename in sorted(TARGETS):
         with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".cc", dir=corpus.parent,
                 delete=False) as stream:
             stream.write(f'#include "{filename}"\n')
             probe = Path(stream.name)
         try:
-            run([CXX, "-std=c++17", "-fsyntax-only", "-I", corpus, probe])
+            extra = (
+                ["-DFLAG=1"] if filename == "conditional_provider.hpp"
+                else [])
+            run([CXX, "-std=c++17", "-fsyntax-only", *extra,
+                 "-I", corpus, probe])
+            if filename == "conditional_provider.hpp":
+                run([CXX, "-std=c++17", "-fsyntax-only", "-DFLAG=0",
+                     "-I", corpus, probe])
         finally:
             probe.unlink()
 
@@ -222,10 +342,13 @@ def assert_fixed_tree():
         temporary_corpus = temporary_root / "complete_use"
         shutil.copytree(CORPUS, temporary_corpus)
 
-        for filename in sorted(set(COMPLETE) | set(INCOMPLETE)):
+        for filename in sorted(TARGETS):
             source = temporary_corpus / filename
+            defines = (
+                ["-DFLAG=1"] if filename == "conditional_provider.hpp"
+                else [])
             analysis = run([
-                IWYU, "-std=c++17", "-I", temporary_corpus,
+                IWYU, "-std=c++17", *defines, "-I", temporary_corpus,
                 "-x", "c++-header", source,
             ], cwd=temporary_root)
             run([
@@ -233,18 +356,38 @@ def assert_fixed_tree():
                 "--nocomments", "--noblank_lines",
             ], cwd=temporary_root, stdin=analysis.stderr)
 
-        for filename in COMPLETE:
+        cross_source = temporary_corpus / "macro_cross_file.hpp"
+        cross_definition = temporary_corpus / "macro_cross_definition.hpp"
+        cross_analysis = run([
+            IWYU, "-Xiwyu", f"--check_also={cross_definition}",
+            "-std=c++17", "-I", temporary_corpus,
+            "-x", "c++-header", cross_source,
+        ], cwd=temporary_root)
+        run([
+            sys.executable, ROOT / "fix_includes.py", "--nosafe_headers",
+            "--nocomments", "--noblank_lines",
+        ], cwd=temporary_root, stdin=cross_analysis.stderr)
+
+        unchanged = (set(COMPLETE) | set(MACRO_COMPLETE) |
+                     {"macro_cross_file.hpp", "macro_cross_definition.hpp"})
+        for filename in unchanged:
             assert (temporary_corpus / filename).read_bytes() == (
                 CORPUS / filename).read_bytes(), filename
-        for filename in INCOMPLETE:
+        transformed = set(INCOMPLETE) | set(ORDER_SENSITIVE) | {MATRIX}
+        for filename in transformed:
             assert (temporary_corpus / filename).read_bytes() == (
                 CORPUS / "expected" / filename).read_bytes(), filename
 
         compile_tree(temporary_corpus)
 
-        for filename in sorted(set(COMPLETE) | set(INCOMPLETE)):
+        for filename in sorted(TARGETS):
             record = analyze_json(
                 filename, root=temporary_root, corpus=temporary_corpus)
+            assert record["status"] == "correct", (filename, record)
+            assert record["operations"] == [], (filename, record["operations"])
+
+        for filename, record in analyze_macro_cross_file(
+                root=temporary_root, corpus=temporary_corpus).items():
             assert record["status"] == "correct", (filename, record)
             assert record["operations"] == [], (filename, record["operations"])
 

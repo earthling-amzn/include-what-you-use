@@ -1,0 +1,11 @@
+#ifndef TESTS_COMPLETE_USE_MACRO_ARGUMENT_HPP_
+#define TESTS_COMPLETE_USE_MACRO_ARGUMENT_HPP_
+
+#include "macro_provider.hpp"
+
+#define DECLARE_MACRO_ARGUMENT_FUNCTION(type) \
+  type ReturnMacroArgumentValue()
+
+DECLARE_MACRO_ARGUMENT_FUNCTION(MacroArgumentValue);
+
+#endif  // TESTS_COMPLETE_USE_MACRO_ARGUMENT_HPP_

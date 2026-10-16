@@ -1,0 +1,9 @@
+#ifndef TESTS_COMPLETE_USE_MACRO_CROSS_DEFINITION_HPP_
+#define TESTS_COMPLETE_USE_MACRO_CROSS_DEFINITION_HPP_
+
+#include "macro_cross_provider.hpp"
+
+#define DECLARE_MACRO_CROSS_FUNCTION() \
+  MacroCrossValue ReturnMacroCrossValue()
+
+#endif  // TESTS_COMPLETE_USE_MACRO_CROSS_DEFINITION_HPP_

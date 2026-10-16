@@ -1,0 +1,7 @@
+#ifndef TESTS_COMPLETE_USE_MACRO_PROVIDER_HPP_
+#define TESTS_COMPLETE_USE_MACRO_PROVIDER_HPP_
+
+class MacroBodyValue {};
+class MacroArgumentValue {};
+
+#endif  // TESTS_COMPLETE_USE_MACRO_PROVIDER_HPP_

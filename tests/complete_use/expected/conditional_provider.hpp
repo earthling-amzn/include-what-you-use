@@ -1,0 +1,8 @@
+#ifndef TESTS_COMPLETE_USE_CONDITIONAL_PROVIDER_HPP_
+#define TESTS_COMPLETE_USE_CONDITIONAL_PROVIDER_HPP_
+
+class ConditionalProviderValue;
+
+void TakeConditionalProvider(ConditionalProviderValue value);
+
+#endif  // TESTS_COMPLETE_USE_CONDITIONAL_PROVIDER_HPP_

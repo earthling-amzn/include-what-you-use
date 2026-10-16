@@ -1,0 +1,11 @@
+#ifndef TESTS_COMPLETE_USE_MACRO_BODY_HPP_
+#define TESTS_COMPLETE_USE_MACRO_BODY_HPP_
+
+#include "macro_provider.hpp"
+
+#define DECLARE_MACRO_BODY_FUNCTION() \
+  MacroBodyValue ReturnMacroBodyValue()
+
+DECLARE_MACRO_BODY_FUNCTION();
+
+#endif  // TESTS_COMPLETE_USE_MACRO_BODY_HPP_
