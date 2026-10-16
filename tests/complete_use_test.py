@@ -44,9 +44,8 @@ MACRO_CONTROLS = {
 ORDER_SENSITIVE = {
     "include_after_use.hpp": (
         "IncludeAfterUse", "include_after_use_provider.hpp"),
-    "conditional_provider.hpp": (
-        "ConditionalProviderValue", "conditional_provider_definition.hpp"),
 }
+MACRO_KEPT = {"macro_controls.hpp", "conditional_provider.hpp"}
 MATRIX = "by_value_type_matrix.hpp"
 MATRIX_COMPLETE = {
     "MatrixByValueParameter", "MatrixByValueReturn", "MatrixByValueBox"}
@@ -66,8 +65,8 @@ SUPPORT = {
     "macro_cross_provider.hpp",
 }
 TARGETS = (set(COMPLETE) | set(INCOMPLETE) | set(MACRO_COMPLETE) |
-           set(ORDER_SENSITIVE) |
-           {MATRIX, "macro_controls.hpp", "macro_cross_file.hpp"})
+           set(ORDER_SENSITIVE) | MACRO_KEPT |
+           {MATRIX, "macro_cross_file.hpp"})
 
 
 def run(command, cwd=ROOT, stdin=None):
@@ -293,15 +292,33 @@ def assert_initial_contracts():
     assert provider_item["symbols"] == ["MacroCrossValue"], provider_item
 
     record = analyze_json("macro_controls.hpp")
-    assert record["status"] == "changes", record
-    assert item_spellings(record, "include") == set(), record
+    assert record["status"] == "correct", record
+    assert item_spellings(record, "include") == {
+        '#include "macro_controls_provider.hpp"'}, record
     assert item_spellings(record, "forward_declaration") == {
         f"class {symbol};" for symbol in MACRO_CONTROLS
     }, record
-    assert operation_spellings(record, "remove", "include") == {
-        '#include "macro_controls_provider.hpp"'}, record
-    assert operation_spellings(
-        record, "add", "forward_declaration") == set(), record
+    assert len(record["operations"]) == 1, record
+    macro_keep = record["operations"][0]
+    assert (macro_keep["subject_action"], macro_keep["disposition"],
+            macro_keep["reason_code"]) == (
+                "remove", "keep", "macro_body_dependency"), macro_keep
+    assert macro_keep["spelling"] == (
+        '#include "macro_controls_provider.hpp"'), macro_keep
+
+    conditional = analyze_json("conditional_provider.hpp", flag=1)
+    assert conditional["status"] == "correct", conditional
+    assert item_spellings(conditional, "include") == {
+        '#include "conditional_provider_definition.hpp"'}, conditional
+    assert item_spellings(conditional, "forward_declaration") == {
+        "class ConditionalProviderValue;"}, conditional
+    assert len(conditional["operations"]) == 1, conditional
+    conditional_keep = conditional["operations"][0]
+    assert (conditional_keep["subject_action"],
+            conditional_keep["disposition"],
+            conditional_keep["reason_code"]) == (
+                "remove", "keep", "macro_body_dependency_unavailable"), (
+                    conditional_keep)
 
     for filename, (symbol, provider_header) in ORDER_SENSITIVE.items():
         record = analyze_json(filename)
@@ -372,9 +389,7 @@ def assert_conditional_fixer_configs():
                 "--nocomments", "--noblank_lines",
             ], cwd=temporary_root, stdin=analysis.stderr)
 
-            expected = (
-                CORPUS / "expected" / "conditional_provider.hpp"
-                if flag else CORPUS / "conditional_provider.hpp")
+            expected = CORPUS / "conditional_provider.hpp"
             fixed = source.read_bytes()
             assert fixed == expected.read_bytes(), flag
             assert conditional_directives(fixed) == (
@@ -388,7 +403,15 @@ def assert_conditional_fixer_configs():
                 "conditional_provider.hpp", root=temporary_root,
                 corpus=temporary_corpus, flag=flag)
             assert record["status"] == "correct", (flag, record)
-            assert record["operations"] == [], (flag, record["operations"])
+            if flag:
+                assert len(record["operations"]) == 1, (
+                    flag, record["operations"])
+                operation = record["operations"][0]
+                assert (operation["disposition"], operation["reason_code"]) == (
+                    "keep", "macro_body_dependency_unavailable"), operation
+            else:
+                assert record["operations"] == [], (
+                    flag, record["operations"])
 
 
 def compile_tree(corpus):
@@ -450,13 +473,13 @@ def assert_fixed_tree():
             "--nocomments", "--noblank_lines",
         ], cwd=temporary_root, stdin=cross_analysis.stderr)
 
-        unchanged = (set(COMPLETE) | set(MACRO_COMPLETE) |
+        unchanged = (set(COMPLETE) | set(MACRO_COMPLETE) | MACRO_KEPT |
                      {"macro_cross_file.hpp", "macro_cross_definition.hpp"})
         for filename in unchanged:
             assert (temporary_corpus / filename).read_bytes() == (
                 CORPUS / filename).read_bytes(), filename
         transformed = (set(INCOMPLETE) | set(ORDER_SENSITIVE) |
-                       {MATRIX, "macro_controls.hpp"})
+                       {MATRIX})
         for filename in transformed:
             assert (temporary_corpus / filename).read_bytes() == (
                 CORPUS / "expected" / filename).read_bytes(), filename
@@ -467,7 +490,14 @@ def assert_fixed_tree():
             record = analyze_json(
                 filename, root=temporary_root, corpus=temporary_corpus)
             assert record["status"] == "correct", (filename, record)
-            assert record["operations"] == [], (filename, record["operations"])
+            if filename in MACRO_KEPT:
+                assert not any(
+                    operation["disposition"] == "apply"
+                    for operation in record["operations"]), (
+                        filename, record["operations"])
+            else:
+                assert record["operations"] == [], (
+                    filename, record["operations"])
 
         for filename, record in analyze_macro_cross_file(
                 root=temporary_root, corpus=temporary_corpus).items():
