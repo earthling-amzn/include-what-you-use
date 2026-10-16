@@ -629,9 +629,9 @@ bool IsInInlineNamespace(const clang::Decl* decl);
 
 bool IsInNamespace(const clang::NamedDecl*, const clang::NamespaceDecl*);
 
-// Returns true if a named decl looks like a forward-declaration of a
-// class (rather than a definition, a friend declaration, or an 'in
-// place' declaration like 'struct Foo' in 'void MyFunc(struct Foo*);'
+// Returns true if this decl looks like a forward-declaration of a class or
+// class template (rather than a definition, a friend declaration, or an 'in
+// place' declaration like 'struct Foo' in 'void MyFunc(struct Foo*);').
 // Always returns false for enums.
 bool IsForwardDecl(const clang::NamedDecl* decl);
 

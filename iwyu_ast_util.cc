@@ -1076,16 +1076,19 @@ bool IsInNamespace(const clang::NamedDecl* decl,
 }
 
 bool IsForwardDecl(const NamedDecl* decl) {
-  if (const auto* tag_decl = dyn_cast<TagDecl>(decl)) {
-    // clang-format off
-    return (!tag_decl->getName().empty() &&
-            !tag_decl->isCompleteDefinition() &&
-            !tag_decl->isEmbeddedInDeclarator() &&
-            !IsFriendDecl(tag_decl) &&
-            !IsExplicitInstantiation(tag_decl));
-  }  // clang-format on
+  const auto* tag_decl = dyn_cast<TagDecl>(decl);
+  if (const auto* template_decl = dyn_cast<ClassTemplateDecl>(decl))
+    tag_decl = template_decl->getTemplatedDecl();
+  if (!tag_decl)
+    return false;
 
-  return false;
+  // clang-format off
+  return (!tag_decl->getName().empty() &&
+          !tag_decl->isCompleteDefinition() &&
+          !tag_decl->isEmbeddedInDeclarator() &&
+          !IsFriendDecl(tag_decl) &&
+          !IsExplicitInstantiation(tag_decl));
+  // clang-format on
 }
 
 // Two possibilities: it's written as a nested class (that is, with a
