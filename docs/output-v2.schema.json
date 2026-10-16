@@ -1054,6 +1054,7 @@
         "directive_kind",
         "expression",
         "activity",
+        "lexical_scope",
         "opening_location",
         "directive_location"
       ],
@@ -1106,6 +1107,13 @@
           "enum": [
             "active",
             "inactive",
+            "unknown"
+          ]
+        },
+        "lexical_scope": {
+          "enum": [
+            "file",
+            "non_file",
             "unknown"
           ]
         },

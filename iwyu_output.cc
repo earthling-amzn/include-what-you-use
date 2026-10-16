@@ -3347,6 +3347,12 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
             : (region.activity ==
                        IwyuPreprocessorInfo::BranchActivity::kInactive
                    ? "inactive" : "unknown");
+    const char* lexical_scope =
+        region.lexical_scope == IwyuPreprocessorInfo::LexicalScope::kFile
+            ? "file"
+            : (region.lexical_scope ==
+                       IwyuPreprocessorInfo::LexicalScope::kNonFile
+                   ? "non_file" : "unknown");
     llvm::json::Object body_end = region.has_body_end
         ? llvm::json::Object{{"status", "known"},
                              {"value", region.body_end_offset}}
@@ -3366,6 +3372,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
         {"directive_kind", region.directive_kind},
         {"expression", region.expression},
         {"activity", activity},
+        {"lexical_scope", lexical_scope},
         {"opening_location", AvailableLocation(region.opening_location, false)},
         {"directive_location", AvailableLocation(region.directive_location, false)}});
   }

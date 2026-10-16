@@ -1129,6 +1129,18 @@ IwyuPreprocessorInfo::ActivityUnderParent(
   return condition_activity;
 }
 
+void IwyuPreprocessorInfo::ObserveExpandedToken(const Token& token) {
+  if (token.is(clang::tok::l_brace)) {
+    ++expanded_brace_depth_;
+  } else if (token.is(clang::tok::r_brace)) {
+    if (expanded_brace_depth_ == 0) {
+      expanded_scope_unknown_ = true;
+    } else {
+      --expanded_brace_depth_;
+    }
+  }
+}
+
 unsigned IwyuPreprocessorInfo::DirectiveBodyBeginOffset(
     SourceLocation loc) const {
   const auto& source_manager = preprocessor_->getSourceManager();
@@ -1195,6 +1207,14 @@ void IwyuPreprocessorInfo::EnterConditional(
       ? BranchActivity::kActive : active_stack.back().activity;
   const BranchActivity activity =
       ActivityUnderParent(condition_activity, parent_activity);
+  const LexicalScope lexical_scope =
+      (!active_stack.empty() &&
+       active_stack.back().activity != BranchActivity::kActive)
+          ? LexicalScope::kUnknown
+          : (expanded_scope_unknown_
+                 ? LexicalScope::kUnknown
+                 : (expanded_brace_depth_ == 0 ? LexicalScope::kFile
+                                                : LexicalScope::kNonFile));
   const string parent_id = active_stack.empty()
       ? string() : active_stack.back().source_region_id;
   const string source_region_id =
@@ -1204,13 +1224,13 @@ void IwyuPreprocessorInfo::EnterConditional(
   conditional_regions_.push_back(
       {source_region_id, key, opening_offset, opening_offset,
        DirectiveBodyBeginOffset(file_loc), 0, false, 0, parent_id,
-       directive_kind, expression, activity, file_loc, file_loc});
+       directive_kind, expression, activity, lexical_scope, file_loc, file_loc});
   conditional_regions_by_file_[file].push_back(fact_index);
   active_stack.push_back(
       {key, opening_offset, 0, expression, file_loc, {expression}, macro,
        is_ifndef, parent_activity, activity == BranchActivity::kActive,
-       activity == BranchActivity::kUnknown, activity, source_region_id,
-       fact_index});
+       activity == BranchActivity::kUnknown, activity, lexical_scope,
+       source_region_id, fact_index});
   RecordConditionEvent(file_loc);
 }
 
@@ -1291,7 +1311,7 @@ void IwyuPreprocessorInfo::EnterAlternative(
       {state.source_region_id, key, state.opening_location, directive_offset,
        DirectiveBodyBeginOffset(file_loc), 0, false, state.branch_index,
        parent_id, directive_kind, branch_expression, activity,
-       opening_location, file_loc});
+       state.lexical_scope, opening_location, file_loc});
   conditional_regions_by_file_[file].push_back(state.region_fact_index);
   RecordConditionEvent(file_loc);
 }
@@ -2372,10 +2392,12 @@ IwyuPreprocessorInfo::ConditionalRegionsFor(const FileEntry* file) const {
     map<unsigned, pair<bool, bool>> prior_group_activity;
     for (const RegionTemplate& region : templates) {
       BranchActivity activity = BranchActivity::kUnknown;
+      LexicalScope lexical_scope = LexicalScope::kUnknown;
       string expression;
       const auto exact_it = exact.find({region.source_region_id, file_id});
       if (exact_it != exact.end()) {
         activity = exact_it->second->activity;
+        lexical_scope = exact_it->second->lexical_scope;
         expression = exact_it->second->expression;
       } else {
         const auto parent = activity_by_region.find(
@@ -2407,7 +2429,7 @@ IwyuPreprocessorInfo::ConditionalRegionsFor(const FileEntry* file) const {
            region.directive_offset, region.body_begin_offset,
            region.body_end_offset, true, region.branch_index,
            region.parent_source_region_id, region.directive_kind, expression,
-           activity, opening, directive});
+           activity, lexical_scope, opening, directive});
     }
   }
   return result;

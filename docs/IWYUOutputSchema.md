@@ -13,7 +13,11 @@ The record-level `conditional_regions` array lists every `#if`/`#ifdef`/
 `#ifndef`/`#elif`/`#else` branch found by raw lexing, including branches Clang
 did not enter. Per-FileID instances classify each existing branch as `active`,
 `inactive`, or `unknown`, and include exact body boundaries for an independent
-applier to verify. Schema v1 has none of these fields and cannot authorize a
+applier to verify. Each region also carries `lexical_scope`: `file` is proved
+from Clang's final macro-expanded token stream, while function, class,
+namespace-block, macro-expanded, malformed, and otherwise uncertain positions
+are `non_file` or `unknown`. Comments, ordinary strings, and raw strings cannot
+forge that fact. Schema v1 has none of these fields and cannot authorize a
 conditional edit.
 
 ## Stream protocol
@@ -100,8 +104,9 @@ relationship; golden vectors in the examples lock serialization.
 - `status`: `correct`, `changes`, `skipped`, or `error`.
 - `associated_headers`: typed relationships with machine reason codes and human
   reasons, rather than path strings alone.
-- `conditional_regions` (version 2): complete exact directive/branch/body facts
-  and per-FileID activity for every existing branch in the analyzed file.
+- `conditional_regions` (version 2): complete exact directive/branch/body facts,
+  per-FileID activity, and parser-visible `file`/`non_file`/`unknown` lexical
+  scope for every existing branch in the analyzed file.
 - `analyzed_configurations`: explicit available complete configuration-name set
   against which operation contributions are checked.
 - `operations`: ordered recommendations and policy dispositions.

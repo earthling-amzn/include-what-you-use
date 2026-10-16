@@ -15,6 +15,7 @@ CXX = sys.argv[2]
 SCHEMA = json.loads((ROOT / "docs/output-v2.schema.json").read_text())
 VALIDATOR = jsonschema.Draft202012Validator(SCHEMA)
 SOURCE = "tests/conditional_regions/conditional.cc"
+SCOPE_SOURCE = "tests/conditional_regions/scope.cc"
 
 CONFIGS = {
     "server": ["-DCOMPILER2", "-DARCH_TEST", "-DX86"],
@@ -37,17 +38,17 @@ EXPECTED_ADDS = {
 }
 
 
-def analyze(configuration, flags):
+def analyze(configuration, flags, source=SOURCE):
     command = [str(IWYU), "-Xiwyu", "--output_format=json", "-Xiwyu",
                "--configuration=" + configuration, "-I", ".", "-std=c++17",
-               *flags, SOURCE]
+               *flags, source]
     result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
     records = [json.loads(line) for line in result.stdout.splitlines()]
     for record in records:
         VALIDATOR.validate(record)
     return next(record for record in records
-                if record["file"]["path"].endswith("conditional.cc"))
+                if record["file"]["path"].endswith(source.rsplit("/", 1)[-1]))
 
 
 def main():
@@ -65,6 +66,10 @@ def main():
             identities = current
         assert current == identities
         assert [region["activity"] for region in regions] == EXPECTED[name]
+        assert all(region["lexical_scope"] in ("file", "unknown")
+                   for region in regions)
+        assert all(region["lexical_scope"] == "file"
+                   for region in regions if region["activity"] == "active")
         assert len(regions) == 6
         assert all(region["body_end_offset"]["status"] == "known"
                    for region in regions)
@@ -96,7 +101,23 @@ def main():
                 operation["spelling"].endswith('x86.hpp"'))
     assert arch["edit_condition"]["value"]["source_region_path"] == [
         "branch-310-0-310", "branch-333-0-333"]
-    print("PASS: MC-002 complete conditional-region census")
+
+    # Clang's final macro-expanded token stream, rather than a raw brace scan,
+    # proves legal include scope. Comments, normal strings, and raw strings do
+    # not create scope; function/class/namespace braces and macro-expanded
+    # namespace braces do.
+    scope_flags = ["-DFUNCTION_REGION", "-DCLASS_REGION",
+                   "-DNAMESPACE_REGION", "-DMACRO_REGION", "-DFILE_REGION"]
+    scope = analyze("scope", scope_flags, SCOPE_SOURCE)
+    scope_regions = scope["conditional_regions"]
+    assert [region["lexical_scope"] for region in scope_regions] == [
+        "non_file", "non_file", "non_file", "non_file", "file"]
+    scope_compile = subprocess.run(
+        [CXX, "-std=c++17", "-I", str(ROOT), *scope_flags,
+         "-fsyntax-only", str(ROOT / SCOPE_SOURCE)],
+        text=True, capture_output=True)
+    assert scope_compile.returncode == 0, scope_compile.stderr
+    print("PASS: MC-002 complete conditional-region census and scope facts")
 
 
 if __name__ == "__main__":

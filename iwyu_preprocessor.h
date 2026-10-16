@@ -98,8 +98,14 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
                              public clang::CommentHandler {
  public:
   explicit IwyuPreprocessorInfo(clang::Preprocessor& preprocessor)
-      : preprocessor_(&preprocessor), main_file_(nullptr),
+      : preprocessor_(&preprocessor), expanded_brace_depth_(0),
+        expanded_scope_unknown_(false), main_file_(nullptr),
         empty_file_info_(nullptr, this, "") {}
+
+  // Observe Clang's final macro-expanded token stream. Conditional callbacks
+  // snapshot this parser-visible brace depth so consumers never infer legal
+  // include scope from raw source text, comments, literals, or macro bodies.
+  void ObserveExpandedToken(const clang::Token& token);
 
   // The client *must* call this from the beginning of HandleTranslationUnit()
   void HandlePreprocessingDone();
@@ -195,6 +201,7 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
                                     clang::SourceLocation use_loc) const;
 
   enum class BranchActivity { kActive, kInactive, kUnknown };
+  enum class LexicalScope { kFile, kNonFile, kUnknown };
 
   struct ActiveCondition {
     enum class Status { kNotApplicable, kKnown, kUnknown };
@@ -221,6 +228,7 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
     string directive_kind;
     string expression;
     BranchActivity activity;
+    LexicalScope lexical_scope;
     clang::SourceLocation opening_location;
     clang::SourceLocation directive_location;
   };
@@ -380,6 +388,7 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
     bool prior_active;
     bool prior_unknown;
     BranchActivity activity;
+    LexicalScope lexical_scope;
     string source_region_id;
     size_t region_fact_index;
 
@@ -511,6 +520,8 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
   bool HasOpenBeginKeep(const clang::FileEntry* file) const;
 
   clang::Preprocessor* preprocessor_;
+  unsigned expanded_brace_depth_;
+  bool expanded_scope_unknown_;
   map<const clang::FileEntry*, vector<ConditionalState>> conditional_stacks_;
   map<unsigned, vector<ActiveConditionalState>> active_condition_stacks_;
   map<unsigned, vector<ConditionEvent>> condition_events_;

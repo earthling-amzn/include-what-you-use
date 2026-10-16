@@ -4757,6 +4757,10 @@ class IwyuAction : public ASTFrontendAction {
         new IwyuPreprocessorInfo(compiler.getPreprocessor());
     compiler.getPreprocessor().addPPCallbacks(
         std::unique_ptr<PPCallbacks>(preprocessor_consumer));
+    compiler.getPreprocessor().setTokenWatcher(
+        [preprocessor_consumer](const clang::Token& token) {
+          preprocessor_consumer->ObserveExpandedToken(token);
+        });
     compiler.getPreprocessor().addCommentHandler(preprocessor_consumer);
 
     if (GlobalFlags().output_format == CommandlineFlags::kJsonOutput) {
