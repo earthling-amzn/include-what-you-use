@@ -2735,6 +2735,12 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
 
   const auto operation_provider = [&](const OperationRef& operation) {
     llvm::json::Object provider;
+    if (operation.reason_code == "macro_body_dependency_unavailable") {
+      provider["selected"] = UnavailableValue();
+      provider["candidates"] = UnavailableValue();
+      provider["chain"] = UnavailableValue();
+      return provider;
+    }
     if (operation.subject_action != "add" ||
         operation.item_kind != "include") {
       provider["selected"] = NotApplicableValue();

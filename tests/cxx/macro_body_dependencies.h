@@ -52,12 +52,12 @@ tests/cxx/macro_body_dependencies.h should remove these lines:
 - #include "tests/cxx/macro_body_dependencies-ambiguous-a.h"  // lines XX-XX
 - #include "tests/cxx/macro_body_dependencies-ambiguous-b.h"  // lines XX-XX
 - #include "tests/cxx/macro_body_dependencies-disabled.h"  // lines XX-XX
+- #include "tests/cxx/macro_body_dependencies-member.h"  // lines XX-XX
 - #include "tests/cxx/macro_body_dependencies-unrelated.h"  // lines XX-XX
 
 The full include-list for tests/cxx/macro_body_dependencies.h:
 #include "tests/cxx/macro_body_dependencies-conditional.h"  // lines XX-XX
 #include "tests/cxx/macro_body_dependencies-free.h"  // lines XX-XX
-#include "tests/cxx/macro_body_dependencies-member.h"  // lines XX-XX
 #include "tests/cxx/macro_body_dependencies-nested.h"  // for MACRO_BODY_INNER
 #include "tests/cxx/macro_body_dependencies-provider.h"  // lines XX-XX
 

@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "tests/cxx/macro_body_dependencies.h"
+#include "tests/cxx/macro_body_dependencies-member.h"
 
 #ifdef MACRO_BODY_DISABLED
 #error "disabled conditional macro unexpectedly defined"

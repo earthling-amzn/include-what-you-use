@@ -103,10 +103,9 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
   // The client *must* call this from the beginning of HandleTranslationUnit()
   void HandlePreprocessingDone();
 
-  // Resolve declaration tokens in live function-like macro bodies after Clang
-  // has built the AST. A direct include that uniquely provides such a token is
-  // retained for future consumers even if this translation unit never expands
-  // the macro.
+  // Resolve declaration references in every exported function-like macro body
+  // after Clang has built the AST. Records belong to the defining include
+  // instance, so later files cannot erase a header's self-containment facts.
   void ResolveMacroBodyDependencies(clang::ASTContext& context);
 
   // More direct ways of getting at this information
@@ -318,8 +317,10 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
 
   struct DirectIncludeCondition {
     const clang::FileEntry* includer;
+    const clang::FileEntry* includee;
     string quoted_include;
     clang::SourceLocation location;
+    clang::FileID includee_file_id;
   };
 
   struct PendingDottedInlineExport {
@@ -372,7 +373,8 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
   // Called whenever an #include is seen in the preprocessor output.
   void AddDirectInclude(clang::SourceLocation includer_loc,
                         const clang::FileEntry* includee,
-                        const string& include_name_as_written);
+                        const string& include_name_as_written,
+                        clang::FileID includee_file_id = clang::FileID());
 
   // Report a "begin_exports"/"end_exports" pragma pair.
   // begin_line is first line, end_line is just after the last line.
@@ -434,15 +436,25 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
   // context to know how to interpret the tokens we see, in general).
   map<string, clang::SourceLocation> macros_definition_loc_;  // key: macro name
 
-  struct MacroBodyDependency {
-    clang::SourceLocation definition_location;
-    vector<const clang::IdentifierInfo*> identifiers;
+  struct MacroBodyReference {
+    vector<const clang::IdentifierInfo*> components;
+    bool globally_qualified;
+    bool was_macro;
   };
 
-  // MacroInfo token provenance for the currently live function-like macro
-  // definition of each name. Disabled preprocessor branches never produce a
-  // callback, and MacroUndefined removes stale definitions.
-  map<string, MacroBodyDependency> macro_body_dependencies_;
+  struct MacroBodyDependency {
+    const clang::MacroInfo* macro_info;
+    clang::SourceLocation definition_location;
+    string macro_name;
+    vector<MacroBodyReference> references;
+    bool retired_in_defining_instance;
+  };
+
+  // One immutable record per function-like macro definition. A downstream
+  // #undef or redefinition must not erase the self-containment requirements of
+  // a header already parsed. An #undef in the same FileID can retire only the
+  // exact MacroInfo definition named by Clang.
+  vector<MacroBodyDependency> macro_body_dependencies_;
 
   // This should logically be a set, but set<> needs Token::operator<
   // which we don't have.  Luckily, a vector works just as well.
