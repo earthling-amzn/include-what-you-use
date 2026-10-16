@@ -2452,19 +2452,34 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
 
   // A function declaration makes its type subtree forward-declarable, but an
   // existing direct definition for a by-value parameter or return type must not
-  // be replaced with a forward declaration. Classify the declaration's outer
-  // type as written, rather than a descendant type or an adjusted parameter
-  // type. This leaves references, pointers, member pointers, arrays, function
-  // parameters, and nested class components under their ordinary incomplete-use
-  // rules.
+  // be replaced with a forward declaration. Classify only the declaration's
+  // outer type as written. Nested prototype parameters, references, pointers,
+  // member pointers, arrays, and nested class components remain under their
+  // ordinary incomplete-use rules.
   bool IsDirectlyProvidedByValueFunctionType(const ASTNode* ast_node) const {
     CHECK_(ast_node->IsA<Type>());
 
+    const FunctionDecl* function = ast_node->GetAncestorAs<FunctionDecl>();
+    if (!function)
+      return false;
+
     const Type* declared_type = nullptr;
     if (const auto* param = ast_node->GetAncestorAs<ParmVarDecl>()) {
+      // A ParmVarDecl can occur in a nested function prototype while a
+      // FunctionDecl is still present higher in the traversal stack. Only a
+      // parameter listed directly by that FunctionDecl is its top-level
+      // parameter and eligible for the by-value exception.
+      bool is_function_parameter = false;
+      for (const ParmVarDecl* function_param : function->parameters()) {
+        if (function_param == param) {
+          is_function_parameter = true;
+          break;
+        }
+      }
+      if (!is_function_parameter)
+        return false;
       declared_type = param->getOriginalType().getTypePtrOrNull();
-    } else if (const auto* function =
-                   ast_node->GetAncestorAs<FunctionDecl>()) {
+    } else {
       declared_type = function->getReturnType().getTypePtrOrNull();
     }
     if (!declared_type)
@@ -2481,24 +2496,34 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
       return false;
 
     const NamedDecl* definition = GetTagDefinition(declared_type_decl);
-    const SourceLocation use_loc = ast_node->GetLocation();
-    const FileEntry* use_file = GetFileEntry(use_loc);
-    if (!definition || !use_file || use_loc.isInvalid())
+    if (!definition)
       return false;
 
+    SourceLocation consumer_loc = ast_node->GetLocation();
+    if (consumer_loc.isInvalid())
+      return true;
+    if (consumer_loc.isMacroID()) {
+      consumer_loc =
+          GlobalSourceManager()->getExpansionLoc(consumer_loc);
+      // Without a concrete expansion occurrence, source order and active
+      // conditions cannot prove that removing a definition is safe.
+      if (consumer_loc.isInvalid() || !consumer_loc.isFileID())
+        return true;
+    }
+
+    const FileEntry* consumer_file = GetLocFileEntry(consumer_loc);
+    if (!consumer_file)
+      return true;
     const vector<string> providers =
         GlobalIncludePicker().GetCandidateHeadersForFilepathIncludedFrom(
-            GetFilePath(definition), GetFilePath(use_file));
+            GetFilePath(definition), GetFilePath(consumer_file));
     for (const string& provider : providers) {
       const auto coverage = preprocessor_info().DirectIncludeCoverageAt(
-          use_file, provider, use_loc);
+          consumer_file, provider, consumer_loc);
       if (coverage ==
           IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse) {
         return true;
       }
-      // Macro-body locations that cross FileIDs cannot yet prove an exact
-      // occurrence ordering. Keep the complete requirement in that case so SEM
-      // never emits advice that can make the declaration uncompilable.
       if (coverage == IwyuPreprocessorInfo::DirectIncludeCoverage::kUnknown)
         return true;
     }

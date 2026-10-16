@@ -37,8 +37,10 @@ INCOMPLETE = {
 }
 MACRO_COMPLETE = {
     "macro_argument.hpp": ("MacroArgumentValue", "macro_provider.hpp"),
-    "macro_body.hpp": ("MacroBodyValue", "macro_provider.hpp"),
+    "macro_body.hpp": ("X", "macro_provider.hpp"),
 }
+MACRO_CONTROLS = {
+    "MacroArgumentControlValue", "MacroBodyControlValue"}
 ORDER_SENSITIVE = {
     "include_after_use.hpp": (
         "IncludeAfterUse", "include_after_use_provider.hpp"),
@@ -51,7 +53,8 @@ MATRIX_COMPLETE = {
 MATRIX_INCOMPLETE = {
     "MatrixRvalueParameter", "MatrixRvalueReturn", "MatrixMemberPointee",
     "MatrixMemberOwner", "MatrixAdjustedFunctionReturn",
-    "MatrixArrayParameter", "MatrixLvalueParameter", "MatrixLvalueReturn",
+    "MatrixNestedPrototypeParameter", "MatrixArrayParameter",
+    "MatrixLvalueParameter", "MatrixLvalueReturn",
     "MatrixPointerParameter", "MatrixPointerReturn",
     "MatrixNestedValueArgument",
 }
@@ -59,10 +62,12 @@ SUPPORT = {
     "provider.hpp", "complete_use.cc", "value_shapes_provider.hpp",
     "incomplete_shapes_provider.hpp", "include_after_use_provider.hpp",
     "conditional_provider_definition.hpp", "macro_provider.hpp",
-    "macro_cross_definition.hpp", "macro_cross_provider.hpp",
+    "macro_controls_provider.hpp", "macro_cross_definition.hpp",
+    "macro_cross_provider.hpp",
 }
 TARGETS = (set(COMPLETE) | set(INCOMPLETE) | set(MACRO_COMPLETE) |
-           set(ORDER_SENSITIVE) | {MATRIX, "macro_cross_file.hpp"})
+           set(ORDER_SENSITIVE) |
+           {MATRIX, "macro_controls.hpp", "macro_cross_file.hpp"})
 
 
 def run(command, cwd=ROOT, stdin=None):
@@ -165,11 +170,16 @@ def add_operation(filename, index, symbol, declaration_line, use_line,
     }
 
 
-def analyze_json(filename, root=ROOT, corpus=CORPUS):
+def analyze_json(filename, root=ROOT, corpus=CORPUS, flag=None):
     source = corpus / filename
     source_argument = source.relative_to(root)
     include_argument = corpus.relative_to(root)
-    defines = ["-DFLAG=1"] if filename == "conditional_provider.hpp" else []
+    if filename == "conditional_provider.hpp":
+        flag = 1 if flag is None else flag
+        defines = [f"-DFLAG={flag}"]
+    else:
+        assert flag is None, (filename, flag)
+        defines = []
     result = run([
         IWYU, "-Xiwyu", "--output_format=json", "-std=c++17", *defines,
         "-I", include_argument, "-x", "c++-header", source_argument,
@@ -269,12 +279,29 @@ def assert_initial_contracts():
     for record in (definition_record, expansion_record):
         assert record["status"] == "correct", record
         assert record["operations"] == [], record["operations"]
-    assert item_spellings(definition_record, "include") == {
-        '#include "macro_cross_provider.hpp"'}, definition_record
-    assert definition_record["desired_state"]["items"][0]["symbols"] == [
-        "MacroCrossValue"], definition_record
+    assert item_spellings(definition_record, "include") == set(), (
+        definition_record)
+    assert item_spellings(definition_record, "forward_declaration") == {
+        "class MacroCrossValue;"}, definition_record
     assert item_spellings(expansion_record, "include") == {
-        '#include "macro_cross_definition.hpp"'}, expansion_record
+        '#include "macro_cross_definition.hpp"',
+        '#include "macro_cross_provider.hpp"',
+    }, expansion_record
+    provider_item = next(
+        item for item in expansion_record["desired_state"]["items"]
+        if item["spelling"] == '#include "macro_cross_provider.hpp"')
+    assert provider_item["symbols"] == ["MacroCrossValue"], provider_item
+
+    record = analyze_json("macro_controls.hpp")
+    assert record["status"] == "changes", record
+    assert item_spellings(record, "include") == set(), record
+    assert item_spellings(record, "forward_declaration") == {
+        f"class {symbol};" for symbol in MACRO_CONTROLS
+    }, record
+    assert operation_spellings(record, "remove", "include") == {
+        '#include "macro_controls_provider.hpp"'}, record
+    assert operation_spellings(
+        record, "add", "forward_declaration") == set(), record
 
     for filename, (symbol, provider_header) in ORDER_SENSITIVE.items():
         record = analyze_json(filename)
@@ -307,6 +334,61 @@ def assert_initial_contracts():
         item for item in record["desired_state"]["items"]
         if item["item_kind"] == "include")
     assert set(desired_include["symbols"]) == MATRIX_COMPLETE, desired_include
+
+    inactive = analyze_json("conditional_provider.hpp", flag=0)
+    assert inactive["status"] == "correct", inactive
+    assert inactive["operations"] == [], inactive["operations"]
+    assert item_spellings(inactive, "include") == set(), inactive
+    assert item_spellings(inactive, "forward_declaration") == {
+        "class ConditionalProviderValue;"}, inactive
+
+
+def conditional_directives(content):
+    removed_include = b'#include "conditional_provider_definition.hpp"\n'
+    return [
+        line for line in content.splitlines(keepends=True)
+        if line.startswith(b"#") and line != removed_include
+    ]
+
+
+def assert_conditional_fixer_configs():
+    build = ROOT / "build"
+    build.mkdir(exist_ok=True)
+    for flag in (0, 1):
+        with tempfile.TemporaryDirectory(
+                prefix=f"sem001-flag{flag}-", dir=build) as tmp:
+            temporary_root = Path(tmp)
+            temporary_corpus = temporary_root / "complete_use"
+            shutil.copytree(CORPUS, temporary_corpus)
+            source = temporary_corpus / "conditional_provider.hpp"
+            original = source.read_bytes()
+
+            analysis = run([
+                IWYU, "-std=c++17", f"-DFLAG={flag}",
+                "-I", temporary_corpus, "-x", "c++-header", source,
+            ], cwd=temporary_root)
+            run([
+                sys.executable, ROOT / "fix_includes.py", "--nosafe_headers",
+                "--nocomments", "--noblank_lines",
+            ], cwd=temporary_root, stdin=analysis.stderr)
+
+            expected = (
+                CORPUS / "expected" / "conditional_provider.hpp"
+                if flag else CORPUS / "conditional_provider.hpp")
+            fixed = source.read_bytes()
+            assert fixed == expected.read_bytes(), flag
+            assert conditional_directives(fixed) == (
+                conditional_directives(original)), flag
+
+            run([
+                CXX, "-std=c++17", "-fsyntax-only", f"-DFLAG={flag}",
+                "-I", temporary_corpus, "-x", "c++-header", source,
+            ], cwd=temporary_root)
+            record = analyze_json(
+                "conditional_provider.hpp", root=temporary_root,
+                corpus=temporary_corpus, flag=flag)
+            assert record["status"] == "correct", (flag, record)
+            assert record["operations"] == [], (flag, record["operations"])
 
 
 def compile_tree(corpus):
@@ -373,7 +455,8 @@ def assert_fixed_tree():
         for filename in unchanged:
             assert (temporary_corpus / filename).read_bytes() == (
                 CORPUS / filename).read_bytes(), filename
-        transformed = set(INCOMPLETE) | set(ORDER_SENSITIVE) | {MATRIX}
+        transformed = (set(INCOMPLETE) | set(ORDER_SENSITIVE) |
+                       {MATRIX, "macro_controls.hpp"})
         for filename in transformed:
             assert (temporary_corpus / filename).read_bytes() == (
                 CORPUS / "expected" / filename).read_bytes(), filename
@@ -395,6 +478,7 @@ def assert_fixed_tree():
 def main():
     assert_initial_contracts()
     compile_tree(CORPUS)
+    assert_conditional_fixer_configs()
     assert_fixed_tree()
     print("SEM-001 complete-use analyzer corpus passed")
 

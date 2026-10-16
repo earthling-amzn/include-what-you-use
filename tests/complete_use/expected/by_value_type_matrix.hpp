@@ -9,6 +9,7 @@ class MatrixLvalueParameter;
 class MatrixLvalueReturn;
 class MatrixMemberOwner;
 class MatrixMemberPointee;
+class MatrixNestedPrototypeParameter;
 class MatrixNestedValueArgument;
 class MatrixPointerParameter;
 class MatrixPointerReturn;
@@ -23,6 +24,8 @@ MatrixRvalueReturn&& MatrixReturnRvalue();
 void MatrixTakeMemberPointer(MatrixMemberPointee MatrixMemberOwner::* value);
 MatrixMemberPointee MatrixMemberOwner::* MatrixReturnMemberPointer();
 void MatrixTakeAdjustedFunction(MatrixAdjustedFunctionReturn callback());
+void MatrixTakeNestedPrototype(
+    void callback(MatrixNestedPrototypeParameter value));
 void MatrixTakeArray(MatrixArrayParameter values[3]);
 void MatrixTakeLvalue(MatrixLvalueParameter& value);
 MatrixLvalueReturn& MatrixReturnLvalue();

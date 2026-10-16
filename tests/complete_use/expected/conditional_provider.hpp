@@ -3,6 +3,14 @@
 
 class ConditionalProviderValue;
 
-void TakeConditionalProvider(ConditionalProviderValue value);
+#define DECL_CONDITIONAL_PROVIDER() \
+  void TakeConditionalProvider(ConditionalProviderValue value)
+
+#if FLAG
+
+inline constexpr int ConditionalControl = FLAG;
+#endif
+
+DECL_CONDITIONAL_PROVIDER();
 
 #endif  // TESTS_COMPLETE_USE_CONDITIONAL_PROVIDER_HPP_

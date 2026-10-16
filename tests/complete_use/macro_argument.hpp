@@ -3,9 +3,8 @@
 
 #include "macro_provider.hpp"
 
-#define DECLARE_MACRO_ARGUMENT_FUNCTION(type) \
-  type ReturnMacroArgumentValue()
+#define DECL_MACRO_ARGUMENT(type) void MacroArgument(type value)
 
-DECLARE_MACRO_ARGUMENT_FUNCTION(MacroArgumentValue);
+DECL_MACRO_ARGUMENT(MacroArgumentValue);
 
 #endif  // TESTS_COMPLETE_USE_MACRO_ARGUMENT_HPP_

@@ -3,9 +3,8 @@
 
 #include "macro_provider.hpp"
 
-#define DECLARE_MACRO_BODY_FUNCTION() \
-  MacroBodyValue ReturnMacroBodyValue()
+#define DECL_X void MacroBody(X value)
 
-DECLARE_MACRO_BODY_FUNCTION();
+DECL_X;
 
 #endif  // TESTS_COMPLETE_USE_MACRO_BODY_HPP_

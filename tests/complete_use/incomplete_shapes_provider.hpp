@@ -6,6 +6,7 @@ class MatrixRvalueReturn {};
 class MatrixMemberPointee {};
 class MatrixMemberOwner {};
 class MatrixAdjustedFunctionReturn {};
+class MatrixNestedPrototypeParameter {};
 class MatrixArrayParameter {};
 class MatrixLvalueParameter {};
 class MatrixLvalueReturn {};

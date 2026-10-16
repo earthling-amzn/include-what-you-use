@@ -1,0 +1,7 @@
+#ifndef TESTS_COMPLETE_USE_MACRO_CONTROLS_PROVIDER_HPP_
+#define TESTS_COMPLETE_USE_MACRO_CONTROLS_PROVIDER_HPP_
+
+class MacroArgumentControlValue {};
+class MacroBodyControlValue {};
+
+#endif  // TESTS_COMPLETE_USE_MACRO_CONTROLS_PROVIDER_HPP_
