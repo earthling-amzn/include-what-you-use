@@ -8,6 +8,7 @@
   "required": [
     "schema_version",
     "record_type",
+    "source_identity",
     "source_digest",
     "tool",
     "invocation",
@@ -24,6 +25,7 @@
   "properties": {
     "schema_version": {"const": 2},
     "record_type": {"const": "file_analysis"},
+    "source_identity": {"$ref": "#/$defs/nonempty_string"},
     "source_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
     "tool": {"$ref": "#/$defs/tool"},
     "invocation": {"$ref": "#/$defs/invocation"},

@@ -1233,6 +1233,17 @@ def _validate_declaration_facts(record, native_conflicts=True):
                         for item in desired['items']]
         if len(desired_keys) != len(set(desired_keys)):
             raise ProtocolError('duplicate desired-state item')
+        seen_forward_declaration = False
+        for item in desired['items']:
+            if item['item_kind'] == 'forward_declaration':
+                seen_forward_declaration = True
+            elif seen_forward_declaration:
+                raise ProtocolError(
+                    'desired-state include follows a forward declaration')
+            if (item['symbols'] != sorted(item['symbols']) or
+                    len(item['symbols']) != len(set(item['symbols']))):
+                raise ProtocolError(
+                    'desired-state symbols are duplicate or unsorted')
         desired_set = set(desired_keys)
         for operation in operations:
             key = (operation['item_kind'], operation['spelling'])
@@ -1341,11 +1352,20 @@ def _validate_record(record, invocation, previous_path, identities,
         raise ProtocolError('records are not in normalized target-file order')
 
     if record['schema_version'] == 2:
-        canonical_source = path if os.path.isabs(path) else os.path.join(
+        display_source = path if os.path.isabs(path) else os.path.join(
             invocation.cwd, path)
-        canonical_source = os.path.abspath(os.path.normpath(canonical_source))
+        expected_identity = os.path.realpath(display_source).replace(
+            os.path.sep, '/')
+        producer_identity = record['source_identity']
+        if (not os.path.isabs(producer_identity) or
+                not _normalized_output_path(producer_identity)):
+            raise ProtocolError(
+                'source_identity is not a normalized absolute path')
+        if producer_identity != expected_identity:
+            raise ProtocolError(
+                'source_identity does not match file.path physical identity')
         try:
-            with open(canonical_source, 'rb') as source_file:
+            with open(expected_identity, 'rb') as source_file:
                 current_digest = 'sha256:' + hashlib.sha256(
                     source_file.read()).hexdigest()
         except OSError as why:
@@ -1353,16 +1373,16 @@ def _validate_record(record, invocation, previous_path, identities,
                                 (path, why))
         producer_digest = record['source_digest']
         if source_digests is not None:
-            previous_digest = source_digests.get(canonical_source)
+            previous_digest = source_digests.get(producer_identity)
             if (previous_digest is not None and
                     previous_digest != producer_digest):
                 raise ProtocolError(
-                    'same source path has different producer-computed bytes')
+                    'same physical source has different producer-computed bytes')
         if producer_digest != current_digest:
             raise ProtocolError(
                 'source_digest does not match current source bytes for %s' % path)
         if source_digests is not None:
-            source_digests[canonical_source] = producer_digest
+            source_digests[producer_identity] = producer_digest
 
     identity = (record['schema_version'], metadata['index'], metadata['id'],
                 metadata['translation_unit'], path)
@@ -1440,7 +1460,7 @@ def _aggregate_declaration_conflicts(groups, invocations):
         if invocation.configuration is None:
             continue
         for record in records:
-            by_file.setdefault(record['file']['path'], []).append(
+            by_file.setdefault(record['source_identity'], []).append(
                 (invocation.configuration, record))
 
     def incompatible(kinds):
@@ -1535,15 +1555,23 @@ def _aggregate_declaration_conflicts(groups, invocations):
                 if (item['item_kind'], item['spelling']) not in blocked_add_keys]
             desired_keys = set((item['item_kind'], item['spelling'])
                                for item in desired['items'])
+            restored_includes = []
             for operation in paired_removals:
                 key = (operation['item_kind'], operation['spelling'])
                 if key not in desired_keys:
-                    desired['items'].append({
+                    restored_includes.append({
                         'item_kind': operation['item_kind'],
                         'spelling': operation['spelling'],
                         'symbols': sorted(symbol_names(operation)),
                     })
                     desired_keys.add(key)
+            if restored_includes:
+                first_forward = next(
+                    (index for index, item in enumerate(desired['items'])
+                     if item['item_kind'] == 'forward_declaration'),
+                    len(desired['items']))
+                desired['items'][first_forward:first_forward] = \
+                    restored_includes
 
             record['operations'].sort(key=_operation_sort_key)
             for index, operation in enumerate(record['operations'], 1):

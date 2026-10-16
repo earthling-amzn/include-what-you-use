@@ -7,11 +7,18 @@ remains the default and is unchanged. Select version 2 with
 
 ## Declaration facts
 
-Every version-2 record has `source_digest`, `declaration_facts`, and
-`declaration_conflicts`. `source_digest` is SHA-256 over the exact bytes in
-Clang's analyzed source buffer. The driver verifies it against the source before
-emission and requires every named configuration for one canonical path to
-report the same digest.
+Every version-2 record has `source_identity`, `source_digest`,
+`declaration_facts`, and `declaration_conflicts`. `source_identity` is the
+normalized absolute physical path from Clang's `FileEntry` real path. It is
+separate from `file.path`, which retains the source spelling used for locations
+and edits. `source_digest` is SHA-256 over the exact bytes in Clang's analyzed
+source buffer. The driver resolves `file.path` relative to the child invocation,
+requires that resolution to equal `source_identity`, verifies the digest against
+that physical file, and keys cross-configuration grouping and digest agreement
+by `source_identity`. Symlink aliases of one file therefore combine, while
+identically spelled relative paths in different compilation directories remain
+distinct. Identity/path/digest mismatches fail the complete driver run before
+any stdout is emitted.
 
 `declaration_facts` is a sorted, unique list of declarations observed in
 non-ignored semantic uses of the analyzed file. Function-local declarations are
@@ -43,7 +50,9 @@ the driver changes only that addition and the matching provider removal to
 operations, so unrelated removals with similar include spellings are untouched. It
 keeps unrelated unanimous operations applicable, preserves a known complete
 desired state with the provider retained and the unsafe declaration absent, and
-sets record status from the remaining applicable edits. Class-template
+sets record status from the remaining applicable edits. A restored provider
+include is inserted in the include segment before every forward declaration, as
+required by native full-list and `fix_includes.py` ordering. Class-template
 primaries and specializations use one canonical primary-template name, kind,
 and declaration location.
 

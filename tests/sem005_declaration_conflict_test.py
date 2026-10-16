@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -28,7 +29,8 @@ KINDS_SOURCE = ROOT / "tests/sem005/declaration_kinds.cc"
 
 
 def run(command, **kwargs):
-    return subprocess.run(command, cwd=ROOT, text=True, capture_output=True,
+    cwd = kwargs.pop("cwd", ROOT)
+    return subprocess.run(command, cwd=cwd, text=True, capture_output=True,
                           **kwargs)
 
 
@@ -41,10 +43,10 @@ def parse_records(result):
     return values
 
 
-def write_database(path, arguments, source=SOURCE):
+def write_database(path, arguments, source=SOURCE, directory=ROOT):
     path.mkdir()
     entry = {
-        "directory": str(ROOT),
+        "directory": str(directory),
         "file": str(source),
         "arguments": arguments,
     }
@@ -61,6 +63,27 @@ def driver_command(product_db, debug_db):
 
 def configuration(record):
     return record["invocation"]["configuration"]["value"]
+
+
+def fixer_report(record, target):
+    additions = [
+        operation["spelling"] for operation in record["operations"]
+        if operation["subject_action"] == "add" and
+           operation["disposition"] == "apply"]
+    full_list = [item["spelling"]
+                 for item in record["desired_state"]["items"]]
+    filename = str(target)
+    return "\n".join([
+        filename + " should add these lines:",
+        *additions,
+        "",
+        filename + " should remove these lines:",
+        "",
+        "The full include-list for " + filename + ":",
+        *full_list,
+        "---",
+        "",
+    ])
 
 
 def kind_for(record, qualified_name):
@@ -89,15 +112,21 @@ configuration = values["configuration"]
 translation_unit = values["translation_unit"]
 with open(translation_unit, "rb") as source_file:
     source_digest = "sha256:" + hashlib.sha256(source_file.read()).hexdigest()
-if os.environ.get("SEM005_MALFORMED") == "different_digest" and configuration == "debug":
+source_identity = os.path.realpath(translation_unit).replace(os.sep, "/")
+file_path = translation_unit
+mode = os.environ.get("SEM005_MALFORMED")
+if mode == "different_digest" and configuration == "debug":
     source_digest = "sha256:" + "f" * 64
+elif mode == "identity_forgery":
+    source_identity = os.path.realpath(translation_unit + ".forged").replace(os.sep, "/")
+elif mode == "path_forgery":
+    file_path = os.path.realpath(__file__).replace(os.sep, "/")
 fact = {
     "qualified_name": "opaque::Entity",
     "kind": "class",
     "declaration": {"path": translation_unit, "line": 1, "column": 1},
 }
 conflicts = []
-mode = os.environ.get("SEM005_MALFORMED")
 if mode == "source_race" and configuration == "product":
     with open(translation_unit, "ab") as source_file:
         source_file.write(b"// raced after producer digest\n")
@@ -139,6 +168,7 @@ if mode == "kind_matrix":
 record = {
     "schema_version": 2,
     "record_type": "file_analysis",
+    "source_identity": source_identity,
     "source_digest": source_digest,
     "tool": {
         "name": "include-what-you-use",
@@ -153,7 +183,7 @@ record = {
         "configuration": {"status": "known", "value": configuration},
         "command_digest": digest,
     },
-    "file": {"path": translation_unit, "kind": "source"},
+    "file": {"path": file_path, "kind": "source"},
     "status": "correct",
     "associated_headers": [],
     "analyzed_configurations": {"status": "known", "value": [configuration]},
@@ -200,6 +230,9 @@ def main():
         enum_entity = "sem005_corpus::EnumClassHandle"
         compatible_entity = "sem005_corpus::CompatibleRecord"
         source_digest = "sha256:" + hashlib.sha256(SOURCE.read_bytes()).hexdigest()
+        source_identity = str(SOURCE.resolve()).replace(os.sep, "/")
+        assert product["source_identity"] == source_identity
+        assert debug["source_identity"] == source_identity
         assert product["source_digest"] == source_digest
         assert debug["source_digest"] == source_digest
         assert kind_for(product, entity) == {"typedef"}
@@ -268,6 +301,15 @@ def main():
         assert ("include", "#include <vector>") in desired_spellings
         assert ("include", '#include "tests/sem005/variant_provider.hpp"') \
             in desired_spellings
+        desired_items = debug["desired_state"]["items"]
+        provider_index = next(
+            index for index, item in enumerate(desired_items)
+            if item["spelling"] ==
+               '#include "tests/sem005/variant_provider.hpp"')
+        first_forward_index = next(
+            index for index, item in enumerate(desired_items)
+            if item["item_kind"] == "forward_declaration")
+        assert provider_index < first_forward_index, desired_items
         assert not any(item_kind == "forward_declaration" and
                        ("Handle" in spelling and "CompatibleRecord" not in spelling)
                        for item_kind, spelling in desired_spellings)
@@ -284,11 +326,93 @@ def main():
                    operation["disposition"] == "apply"
                    for operation in single_record["operations"])
 
+        # Two source spellings that are symlinks to one physical file must
+        # aggregate by Clang FileEntry identity and expose the same conflicts.
+        product_alias = temporary / "product-alias.cc"
+        debug_alias = temporary / "debug-alias.cc"
+        product_alias.symlink_to(SOURCE)
+        debug_alias.symlink_to(SOURCE)
+        alias_product_db = temporary / "alias-product"
+        alias_debug_db = temporary / "alias-debug"
+        write_database(
+            alias_product_db,
+            include_args + ["-c", str(product_alias)], product_alias)
+        write_database(
+            alias_debug_db,
+            include_args + ["-DSEM005_DEBUG_CONFIGURATION=1", "-c",
+                            str(debug_alias)], debug_alias)
+        alias_records = parse_records(run(
+            driver_command(alias_product_db, alias_debug_db), env=analyzer_env))
+        assert {record["file"]["path"] for record in alias_records} == {
+            str(product_alias), str(debug_alias)}
+        assert {record["source_identity"] for record in alias_records} == {
+            source_identity}
+        assert all(record["declaration_conflicts"] == expected_conflict
+                   for record in alias_records)
+
+        # The same relative spelling in different compilation directories
+        # denotes different physical files and must never be combined.
+        relative_product_root = temporary / "relative-product-root"
+        relative_debug_root = temporary / "relative-debug-root"
+        relative_source = Path("same") / "consumer.cc"
+        for source_root in (relative_product_root, relative_debug_root):
+            (source_root / relative_source).parent.mkdir(parents=True)
+            (source_root / relative_source).write_bytes(SOURCE.read_bytes())
+        relative_product_db = temporary / "relative-product-db"
+        relative_debug_db = temporary / "relative-debug-db"
+        relative_args = [str(COMPILER), "-I", str(ROOT), "-std=c++17"]
+        write_database(
+            relative_product_db,
+            relative_args + ["-c", str(relative_source)], relative_source,
+            relative_product_root)
+        write_database(
+            relative_debug_db,
+            relative_args + ["-DSEM005_DEBUG_CONFIGURATION=1", "-c",
+                             str(relative_source)], relative_source,
+            relative_debug_root)
+        relative_records = parse_records(run(
+            driver_command(relative_product_db, relative_debug_db),
+            env=analyzer_env))
+        assert {record["file"]["path"] for record in relative_records} == {
+            str(relative_source)}
+        assert len({record["source_identity"]
+                    for record in relative_records}) == 2
+        assert all(record["declaration_conflicts"] == []
+                   for record in relative_records)
+
+        # Feed the aggregated desired state through the actual fixer. The
+        # retained provider must remain in the include block before the safe
+        # forward declaration, and the result must compile in both variants.
+        fixer_root = temporary / "fixer-tree"
+        fixer_fixture = fixer_root / "tests" / "sem005"
+        fixer_fixture.mkdir(parents=True)
+        fixed_source = fixer_fixture / "variant_consumer.cc"
+        shutil.copy2(SOURCE, fixed_source)
+        shutil.copy2(ROOT / "tests/sem005/variant_provider.hpp",
+                     fixer_fixture / "variant_provider.hpp")
+        fixed = run(
+            [sys.executable, str(ROOT / "fix_includes.py"), "--nosafe_headers"],
+            cwd=fixer_root, input=fixer_report(debug, fixed_source))
+        assert fixed.returncode == 0, (fixed.stdout, fixed.stderr)
+        fixed_text = fixed_source.read_text()
+        assert fixed_text.index("#include <vector>") < fixed_text.index(
+            '#include "tests/sem005/variant_provider.hpp"')
+        assert fixed_text.index(
+            '#include "tests/sem005/variant_provider.hpp"') < \
+            fixed_text.index("class CompatibleRecord;")
+        for define in ([], ["-DSEM005_DEBUG_CONFIGURATION=1"]):
+            result = run([
+                str(COMPILER), "-I", str(fixer_root), "-std=c++17", *define,
+                "-c", str(fixed_source), "-o",
+                str(temporary / ("fixed-%d.o" % len(define)))])
+            assert result.returncode == 0, result.stderr
+
         # Schema v1 remains the direct-output default and has no v2 fields.
         legacy = run([str(IWYU), "-Xiwyu", "--output_format=json",
                       "-I", str(ROOT), "-std=c++17", str(SOURCE)])
         legacy_record = json.loads(legacy.stdout.splitlines()[0])
         assert legacy_record["schema_version"] == 1
+        assert "source_identity" not in legacy_record
         assert "source_digest" not in legacy_record
         assert "declaration_facts" not in legacy_record
         assert "declaration_conflicts" not in legacy_record
@@ -388,8 +512,12 @@ def main():
                 ("missing_tool", "missing required field tool"),
                 ("missing_operations", "missing required field operations"),
                 ("semantic_status", "changes record contains no applied edit"),
+                ("identity_forgery",
+                 "source_identity does not match file.path physical identity"),
+                ("path_forgery",
+                 "source_identity does not match file.path physical identity"),
                 ("different_digest",
-                 "same source path has different producer-computed bytes")]:
+                 "same physical source has different producer-computed bytes")]:
             env = os.environ.copy()
             env["IWYU_BINARY"] = str(fake)
             env["SEM005_MALFORMED"] = mode

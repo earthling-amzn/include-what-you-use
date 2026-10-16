@@ -2558,6 +2558,13 @@ string StructuredDeclarationKind(const NamedDecl* input_decl) {
   return string();
 }
 
+string StructuredSourceIdentity(const FileEntry* file) {
+  const llvm::StringRef real_path = file->tryGetRealPathName();
+  CHECK_(!real_path.empty() &&
+         "analyzed source must have a canonical physical identity");
+  return NormalizeFilePath(real_path.str());
+}
+
 string StructuredSourceDigest(const FileEntry* file) {
   clang::SourceManager& source_manager = *GlobalSourceManager();
   const clang::FileID file_id = source_manager.translateFile(file);
@@ -3462,6 +3469,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
   record["desired_state"] = std::move(desired_state);
   record["diagnostics"] = std::move(diagnostics);
   if (flags.output_schema_version >= 2) {
+    record["source_identity"] = StructuredSourceIdentity(file_);
     record["source_digest"] = StructuredSourceDigest(file_);
     record["declaration_facts"] = std::move(declaration_facts);
     record["declaration_conflicts"] = llvm::json::Array{};
