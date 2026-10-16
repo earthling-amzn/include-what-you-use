@@ -2208,7 +2208,7 @@ IwyuPreprocessorInfo::DirectProviderCoverageAt(
     const FileEntry* includer, const string& selected_spelling,
     const string& selected_path, SourceLocation declaration_loc,
     SourceLocation use_loc) const {
-  if (!includer || selected_spelling.empty() || selected_path.empty() ||
+  if (!includer || selected_spelling.empty() ||
       declaration_loc.isInvalid() || use_loc.isInvalid()) {
     return DirectIncludeCoverage::kUnknown;
   }
@@ -2222,8 +2222,9 @@ IwyuPreprocessorInfo::DirectProviderCoverageAt(
   if (definition_file_id.isInvalid())
     return DirectIncludeCoverage::kUnknown;
 
-  const string expected_path =
-      NormalizeFilePath(MakeAbsolutePath(selected_path));
+  const string expected_path = selected_path.empty()
+      ? string()
+      : NormalizeFilePath(MakeAbsolutePath(selected_path));
   bool found = false;
   bool unknown = false;
   for (const DirectIncludeCondition& include : direct_include_conditions_) {
@@ -2233,8 +2234,9 @@ IwyuPreprocessorInfo::DirectProviderCoverageAt(
     }
     found = true;
     if (!include.includee ||
-        NormalizeFilePath(MakeAbsolutePath(GetFilePath(include.includee))) !=
-            expected_path) {
+        (!expected_path.empty() &&
+         NormalizeFilePath(MakeAbsolutePath(GetFilePath(include.includee))) !=
+             expected_path)) {
       continue;
     }
     const DirectIncludeCoverage root_coverage =
@@ -2284,8 +2286,7 @@ IwyuPreprocessorInfo::AssociatedProviderCoverageAt(
     const string& selected_spelling, const string& selected_path,
     SourceLocation declaration_loc, SourceLocation use_loc) const {
   if (!includer || !associated_header || selected_spelling.empty() ||
-      selected_path.empty() || declaration_loc.isInvalid() ||
-      use_loc.isInvalid()) {
+      declaration_loc.isInvalid() || use_loc.isInvalid()) {
     return DirectIncludeCoverage::kUnknown;
   }
 
@@ -2298,8 +2299,9 @@ IwyuPreprocessorInfo::AssociatedProviderCoverageAt(
   if (definition_file_id.isInvalid())
     return DirectIncludeCoverage::kUnknown;
 
-  const string expected_path =
-      NormalizeFilePath(MakeAbsolutePath(selected_path));
+  const string expected_path = selected_path.empty()
+      ? string()
+      : NormalizeFilePath(MakeAbsolutePath(selected_path));
   bool found = false;
   bool unknown = false;
   for (const DirectIncludeCondition& association :
@@ -2321,9 +2323,10 @@ IwyuPreprocessorInfo::AssociatedProviderCoverageAt(
     }
     if (association.includee_file_id == definition_file_id &&
         association.quoted_include == selected_spelling &&
-        NormalizeFilePath(
-            MakeAbsolutePath(GetFilePath(associated_header))) ==
-            expected_path) {
+        (expected_path.empty() ||
+         NormalizeFilePath(
+             MakeAbsolutePath(GetFilePath(associated_header))) ==
+             expected_path)) {
       return DirectIncludeCoverage::kCoversUse;
     }
 
@@ -2339,8 +2342,10 @@ IwyuPreprocessorInfo::AssociatedProviderCoverageAt(
           !selected_loc.isFileID() ||
           source_manager.getFileID(selected_loc) !=
               association.includee_file_id ||
-          NormalizeFilePath(MakeAbsolutePath(GetFilePath(selected.includee))) !=
-              expected_path) {
+          (!expected_path.empty() &&
+           NormalizeFilePath(
+               MakeAbsolutePath(GetFilePath(selected.includee))) !=
+               expected_path)) {
         continue;
       }
       if (!DirectOccurrenceIsUnconditional(selected, &unknown))
