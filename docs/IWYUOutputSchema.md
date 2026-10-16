@@ -1,10 +1,10 @@
 # IWYU structured output schemas, versions 1 and 2
 
 `output-v1.schema.json` remains the frozen OUTPUT-002 contract.
-`output-v2.schema.json` adds exact conditional-region census facts required for
-branch-local multi-configuration edits. The analyzer now emits version 2;
-`iwyu_tool.py` transports both versions so recorded and synthetic v1 producers
-remain compatible.
+`output-v2.schema.json` combines typed declaration-kind/conflict facts with the
+exact conditional-region census required for branch-local multi-configuration
+edits. The analyzer keeps version 1 as its default; select version 2 explicitly
+with `--output_schema=2`. `iwyu_tool.py` transports both versions.
 
 Version 2 never identifies a branch by expression text alone. A known condition
 carries `source_region_id` and its complete `source_region_path`. Each ID is
@@ -49,8 +49,9 @@ preserving gaps left by source selection. Named JSON invocations receive the
 exact driver-owned `--configuration=NAME`; the driver validates matching
 `invocation.configuration`, `analyzed_configurations`, and operation
 contributions before emitting any stdout. Records and stderr remain grouped in
-database order, then original entry order. The driver performs no semantic
-multi-configuration aggregation.
+database order, then original entry order. For schema version 2, the driver
+validates both field families, preserves each record's conditional census, and
+aggregates typed declaration conflicts across named configurations.
 
 Human diagnostics remain the default. Direct structured output uses
 `-Xiwyu --output_format=json`; the compilation-database driver uses `-o json`.
@@ -93,13 +94,15 @@ relationship; golden vectors in the examples lock serialization.
 
 ## Top-level fields
 
-- `schema_version`: integer `1` for the frozen contract or `2` for exact
-  conditional-region facts. The native analyzer emits `2`.
+- `schema_version`: integer `1` for the frozen default contract or `2` for the
+  combined declaration-kind and conditional-region contract.
 - `record_type`: `file_analysis`.
 - `tool`: IWYU, Clang, and source-revision metadata.
 - `invocation`: stable ID/index, translation unit, configuration availability,
   and required canonical command digest.
 - `file`: analyzed path and kind.
+- `source_identity` and `source_digest` (version 2): canonical physical source
+  identity and SHA-256 of the exact analyzed source bytes.
 - `file_digest` (version 2): known `sha256:` digest of the exact SourceManager
   buffer whose directive byte offsets are reported.
 - `status`: `correct`, `changes`, `skipped`, or `error`.
@@ -108,6 +111,8 @@ relationship; golden vectors in the examples lock serialization.
 - `conditional_regions` (version 2): complete exact directive/branch/body facts,
   per-FileID activity, and parser-visible `file`/`non_file`/`unknown` lexical
   scope for every existing branch in the analyzed file.
+- `declaration_facts` and `declaration_conflicts` (version 2): typed Clang
+  declaration observations and cross-configuration incompatibilities.
 - `analyzed_configurations`: explicit available complete configuration-name set
   against which operation contributions are checked.
 - `operations`: ordered recommendations and policy dispositions.

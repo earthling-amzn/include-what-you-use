@@ -40,6 +40,7 @@ EXPECTED_ADDS = {
 
 def analyze(configuration, flags, source=SOURCE):
     command = [str(IWYU), "-Xiwyu", "--output_format=json", "-Xiwyu",
+               "--output_schema=2", "-Xiwyu",
                "--configuration=" + configuration, "-I", ".", "-std=c++17",
                *flags, source]
     result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
@@ -57,6 +58,10 @@ def main():
     identities = None
     for name, record in records.items():
         regions = record["conditional_regions"]
+        assert record["declaration_facts"]
+        assert record["declaration_conflicts"] == []
+        assert record["source_identity"]
+        assert record["source_digest"]
         assert record["file_digest"] == {
             "status": "known",
             "value": "sha256:" + hashlib.sha256(source_bytes).hexdigest(),

@@ -98,8 +98,6 @@ def condition(filename):
                     "path": f"tests/complete_use/{filename}",
                 },
             },
-            "source_region_id": "branch-1-0-1",
-            "source_region_path": ["branch-1-0-1"],
         },
     }
 

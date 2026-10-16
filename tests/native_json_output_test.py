@@ -26,6 +26,10 @@ IWYU = Path(sys.argv[1]).resolve()
 
 def run(source, *iwyu_args):
     command = [str(IWYU)]
+    if ("--output_format=json" in iwyu_args and
+            not any(argument.startswith("--output_schema=")
+                    for argument in iwyu_args)):
+        iwyu_args += ("--output_schema=2",)
     for argument in iwyu_args:
         command.extend(["-Xiwyu", argument])
     command.extend(["-I", ".", "-std=c++17", source])
@@ -120,7 +124,8 @@ def main():
         response.write("-I . -std=c++17 tests/cxx/ctad.cc\n")
         response.flush()
         response_result = subprocess.run(
-            [str(IWYU), "-Xiwyu", "--output_format=json", "@" + response.name],
+            [str(IWYU), "-Xiwyu", "--output_format=json",
+             "-Xiwyu", "--output_schema=2", "@" + response.name],
             cwd=ROOT, text=True, capture_output=True)
     response_record = by_path(records(response_result), "tests/cxx/ctad.cc")
     assert response_record["invocation"] == changed["invocation"]
@@ -150,7 +155,8 @@ def main():
     # Driver option parsing excludes regular-file operands of -include and -o
     # from translation-unit inference.
     operand_result = subprocess.run(
-        [str(IWYU), "-Xiwyu", "--output_format=json", "-I", ".",
+        [str(IWYU), "-Xiwyu", "--output_format=json",
+             "-Xiwyu", "--output_schema=2", "-I", ".",
          "-std=c++17", "tests/native_json/clean.cc", "-include",
          "tests/native_json/unused.h", "-o", "tests/native_json/decoy.cc"],
         cwd=ROOT, text=True, capture_output=True)
@@ -167,10 +173,12 @@ def main():
         nested.write_bytes(b"-I . -std=c++17 -DTRAIL=tail\\")
         outer.write_text(f"@{nested} tests/native_json/clean.cc")
         nested_result = subprocess.run(
-            [str(IWYU), "-Xiwyu", "--output_format=json", "@" + str(outer)],
+            [str(IWYU), "-Xiwyu", "--output_format=json",
+             "-Xiwyu", "--output_schema=2", "@" + str(outer)],
             cwd=ROOT, text=True, capture_output=True)
         direct_result = subprocess.run(
-            [str(IWYU), "-Xiwyu", "--output_format=json", "-I", ".",
+            [str(IWYU), "-Xiwyu", "--output_format=json",
+             "-Xiwyu", "--output_schema=2", "-I", ".",
              "-std=c++17", "-DTRAIL=tail\\", "tests/native_json/clean.cc"],
             cwd=ROOT, text=True, capture_output=True)
     assert nested_result.returncode == direct_result.returncode == 0
@@ -186,6 +194,7 @@ def main():
             '\"\" -I . -std=c++17 tests/native_json/clean.cc')
         gnu_result = subprocess.run(
             [str(IWYU), "-Xiwyu", "--output_format=json",
+             "-Xiwyu", "--output_schema=2",
              "@" + str(gnu_response)],
             cwd=ROOT, text=True, capture_output=True)
     assert gnu_result.returncode == 0, gnu_result.stderr
@@ -204,10 +213,12 @@ def main():
             '\"\" -I . -std=c++17 /TP tests/native_json/clean.cc')
         cl_response_result = subprocess.run(
             [str(IWYU), "-Xiwyu", "--output_format=json",
+             "-Xiwyu", "--output_schema=2",
              "--driver-mode=cl", "@" + str(cl_response)],
             cwd=ROOT, text=True, capture_output=True)
         cl_direct_result = subprocess.run(
             [str(IWYU), "-Xiwyu", "--output_format=json",
+             "-Xiwyu", "--output_schema=2",
              "--driver-mode=cl", "", "-I", ".", "-std=c++17", "/TP",
              "tests/native_json/clean.cc"],
             cwd=ROOT, text=True, capture_output=True)
@@ -585,7 +596,8 @@ rules:
     assert association_op["symbols"]
 
     prefix_result = subprocess.run(
-        [str(IWYU), "-Xiwyu", "--output_format=json", "-Xiwyu",
+        [str(IWYU), "-Xiwyu", "--output_format=json",
+             "-Xiwyu", "--output_schema=2", "-Xiwyu",
          "--prefix_header_includes=remove", "-include",
          "tests/cxx/prefix_header_includes-d1.h", "-include",
          "tests/cxx/prefix_header_includes-d2.h", "-include",
@@ -762,7 +774,8 @@ rules:
     assert next(value for path, value in kinds.items()
                 if path.endswith("kinds-InL.HH")) == "inline_header"
     other_result = subprocess.run(
-        [str(IWYU), "-Xiwyu", "--output_format=json", "-x", "c++",
+        [str(IWYU), "-Xiwyu", "--output_format=json",
+             "-Xiwyu", "--output_schema=2", "-x", "c++",
          "tests/native_json/kinds.unknown"],
         cwd=ROOT, text=True, capture_output=True)
     assert records(other_result)[0]["file"]["kind"] == "other"
@@ -881,7 +894,8 @@ rules:
         "status": "unavailable", "value": None}
 
     disagreement_result = subprocess.run(
-        [str(IWYU), "-Xiwyu", "--output_format=json", "-I", ".",
+        [str(IWYU), "-Xiwyu", "--output_format=json",
+             "-Xiwyu", "--output_schema=2", "-I", ".",
          "-I", "tests/native_json/assoc003_disagree_a",
          "-I", "tests/native_json/assoc003_disagree_b", "-std=c++17",
          "tests/native_json/assoc003_provider_disagreement.cc"],
@@ -948,7 +962,8 @@ rules:
                 "heuristic", "first_include_basename")
 
     pch_result = subprocess.run(
-        [str(IWYU), "-Xiwyu", "--output_format=json", "-Xiwyu",
+        [str(IWYU), "-Xiwyu", "--output_format=json",
+             "-Xiwyu", "--output_schema=2", "-Xiwyu",
          "--pch_in_code", "-Xiwyu", "--prefix_header_includes=remove",
          "-I", ".", "-std=c++17", "tests/cxx/pch_in_code.cc"],
         cwd=ROOT, text=True, capture_output=True)
@@ -1026,7 +1041,8 @@ rules:
     # even when the JSON option appears after the intercepted option.
     for intercepted in ("--help", "--version"):
         for command in (
-                [str(IWYU), "-Xiwyu", "--output_format=json", intercepted],
+                [str(IWYU), "-Xiwyu", "--output_format=json",
+             "-Xiwyu", "--output_schema=2", intercepted],
                 [str(IWYU), intercepted, "-Xiwyu", "--output_format=json"]):
             info = subprocess.run(command, cwd=ROOT, text=True,
                                   capture_output=True)
@@ -1260,7 +1276,8 @@ rules:
         precedence_path = Path(stream.name).resolve()
     try:
         prefix_policy_result = subprocess.run(
-            [str(IWYU), "-Xiwyu", "--output_format=json", "-Xiwyu",
+            [str(IWYU), "-Xiwyu", "--output_format=json",
+             "-Xiwyu", "--output_schema=2", "-Xiwyu",
              "--project_policy=" + str(precedence_path), "-Xiwyu",
              "--prefix_header_includes=remove", "-include",
              "tests/cxx/prefix_header_includes-d1.h", "-include",

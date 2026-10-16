@@ -931,8 +931,114 @@ def _validate_schema_v2(record):
     _validate_schema_value(record, schema, schema)
 
 
+def _validate_conditional_regions(record):
+    """Validate cross-field invariants for the schema-v2 region census."""
+    source_digest = record['source_digest']
+    if record['file_digest'] != {'status': 'known', 'value': source_digest}:
+        raise ProtocolError('file_digest differs from source_digest')
+
+    file_path = record['file']['path']
+    regions = record['conditional_regions']
+    sort_keys = [
+        (region['opening_offset'], region['branch_index'],
+         region['directive_offset'], region['file_id'])
+        for region in regions]
+    if sort_keys != sorted(sort_keys):
+        raise ProtocolError('conditional regions are not sorted')
+
+    identities = set()
+    regions_by_identity = {}
+    parents_by_source_id = {}
+    branches = {}
+    for region in regions:
+        source_region_id = region['source_region_id']
+        expected_id = 'branch-%d-%d-%d' % (
+            region['opening_offset'], region['branch_index'],
+            region['directive_offset'])
+        if source_region_id != expected_id:
+            raise ProtocolError('conditional region identity differs from offsets')
+        identity = (region['file_id'], source_region_id)
+        if identity in identities:
+            raise ProtocolError('duplicate conditional region identity')
+        identities.add(identity)
+        regions_by_identity[identity] = region
+
+        if not (region['opening_offset'] <= region['directive_offset'] <=
+                region['body_begin_offset']):
+            raise ProtocolError('conditional region offsets are inconsistent')
+        body_end = region['body_end_offset']
+        if (body_end['status'] == 'known' and
+                body_end['value'] < region['body_begin_offset']):
+            raise ProtocolError('conditional region body end precedes body')
+        for location_name in ('opening_location', 'directive_location'):
+            location = region[location_name]
+            if (location['status'] == 'known' and
+                    location['value']['path'] != file_path):
+                raise ProtocolError(
+                    'conditional region location is outside analyzed file')
+
+        parent = region['parent_source_region_id']
+        parent_id = parent['value'] if parent['status'] == 'known' else None
+        parents_by_source_id.setdefault(source_region_id, set()).add(parent_id)
+        branches.setdefault(
+            (region['file_id'], region['opening_offset']), []).append(
+                region['branch_index'])
+
+    for identity, region in regions_by_identity.items():
+        parent = region['parent_source_region_id']
+        if parent['status'] == 'known':
+            parent_identity = (region['file_id'], parent['value'])
+            parent_region = regions_by_identity.get(parent_identity)
+            if parent_region is None:
+                raise ProtocolError('conditional region parent is absent')
+            parent_end = parent_region['body_end_offset']
+            if (parent_region['body_begin_offset'] > region['opening_offset'] or
+                    (parent_end['status'] == 'known' and
+                     region['opening_offset'] >= parent_end['value'])):
+                raise ProtocolError('conditional region is outside parent body')
+        elif parent['status'] != 'not_applicable':
+            raise ProtocolError('conditional region parent availability is invalid')
+
+    for branch_indices in branches.values():
+        if branch_indices != list(range(len(branch_indices))):
+            raise ProtocolError(
+                'conditional region branch indices are not contiguous')
+
+    def validate_condition(condition, context):
+        if condition['status'] != 'known':
+            return
+        value = condition['value']
+        source_region_id = value['source_region_id']
+        source_region_path = value['source_region_path']
+        if source_region_path[-1] != source_region_id:
+            raise ProtocolError('%s condition anchor differs from path' % context)
+        if any(region_id not in parents_by_source_id
+               for region_id in source_region_path):
+            raise ProtocolError('%s condition path names an absent region' % context)
+        if None not in parents_by_source_id[source_region_path[0]]:
+            raise ProtocolError('%s condition path does not begin at a root' %
+                                context)
+        for parent_id, child_id in zip(source_region_path,
+                                       source_region_path[1:]):
+            if parent_id not in parents_by_source_id[child_id]:
+                raise ProtocolError('%s condition path has invalid parentage' %
+                                    context)
+
+    for operation in record['operations']:
+        context = operation['id']
+        validate_condition(operation['edit_condition'], context)
+        multi_config = operation['multi_config']
+        if multi_config['status'] == 'known':
+            for contribution in multi_config['value']:
+                validate_condition(contribution['condition'], context)
+        for symbol in operation['symbols']:
+            for use in symbol['uses']:
+                validate_condition(use['condition'], context)
+
+
 def _validate_declaration_facts(record, native_conflicts=True):
     _validate_schema_v2(record)
+    _validate_conditional_regions(record)
 
     facts = record['declaration_facts']
     fact_keys = []

@@ -1,9 +1,29 @@
 # IWYU structured output schema, version 2
 
-`output-v2.schema.json` extends the version-1 file-analysis record with typed
-Clang declaration-kind facts needed for multi-configuration safety. Version 1
-remains the default and is unchanged. Select version 2 with
+`output-v2.schema.json` extends the version-1 file-analysis record with both
+typed Clang declaration-kind facts and an exact conditional-region census for
+multi-configuration safety. These field families coexist in every version-2
+record and are validated as one closed object. Version 1 remains the default and
+is byte-compatible with the prior contract. Select version 2 with
 `-Xiwyu --output_schema=2`, or with `iwyu_tool.py -o json --output-schema 2`.
+
+## Conditional regions
+
+Every version-2 record has `file_digest` and `conditional_regions` in addition
+to the declaration fields below. `file_digest.value` equals `source_digest` and
+binds region byte offsets to the exact analyzed SourceManager buffer. The census
+contains every physical `#if`/`#ifdef`/`#ifndef` branch and each alternative,
+including inactive branches. Each child records stable source-derived region and
+parent identities, opening/directive/body offsets, branch index, directive kind,
+expression, per-FileID activity, source locations, and `lexical_scope`.
+
+Known operation, use, and contribution conditions carry `source_region_id` and
+the complete outer-to-inner `source_region_path`; expression text alone is not
+an identity. `lexical_scope` is `file` only when both the final macro-expanded
+token stream and completed AST ranges prove that the directive can accept a
+file-scope include. Function, class, namespace-block, macro-expanded,
+declaration-embedded, malformed, and uncertain locations are `non_file` or
+`unknown`.
 
 ## Declaration facts
 
@@ -64,12 +84,13 @@ meaning. Adding kinds to v1 would violate its strict versioning contract.
 
 The analyzer and driver therefore keep version 1 as the default. A driver that
 requests version 2 validates the complete child structure and cross-field
-semantics before emitting any stdout. It rejects version-1 children, missing or
-extra fields at any depth, malformed operations and desired states, unknown
-kinds, duplicate or unsorted facts, non-empty native conflict claims, source
-digest mismatches, and same-path records produced from different bytes.
-Version-1 output is passed through unchanged and receives no new aggregation
-behavior.
+semantics of both declaration and conditional-region families before emitting
+any stdout. It rejects version-1 children, missing or extra fields at any depth,
+malformed region identities, paths, offsets, states, anchors, lexical scopes,
+operations and desired states, unknown declaration kinds, duplicate or unsorted
+facts, non-empty native conflict claims, source-digest mismatches, and same-path
+records produced from different bytes. Version-1 output is passed through
+unchanged and receives no new aggregation behavior.
 
 All stream framing, invocation identity, operation, desired-state, and ordering
 rules not replaced above are inherited unchanged from

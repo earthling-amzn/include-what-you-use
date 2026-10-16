@@ -111,7 +111,8 @@ digest = values["command_digest"]
 configuration = values["configuration"]
 translation_unit = values["translation_unit"]
 with open(translation_unit, "rb") as source_file:
-    source_digest = "sha256:" + hashlib.sha256(source_file.read()).hexdigest()
+    source_bytes = source_file.read()
+source_digest = "sha256:" + hashlib.sha256(source_bytes).hexdigest()
 source_identity = os.path.realpath(translation_unit).replace(os.sep, "/")
 file_path = translation_unit
 mode = os.environ.get("SEM005_MALFORMED")
@@ -165,6 +166,26 @@ if mode == "kind_matrix":
         "kind": kind,
         "declaration": {"path": translation_unit, "line": 1, "column": 1},
     } for name, kind in sorted(selected.items())]
+conditional_regions = [{
+    "source_region_id": "branch-0-0-0",
+    "file_id": 0,
+    "opening_offset": 0,
+    "directive_offset": 0,
+    "body_begin_offset": 0,
+    "body_end_offset": {"status": "known", "value": len(source_bytes)},
+    "branch_index": 0,
+    "parent_source_region_id": {"status": "not_applicable", "value": None},
+    "directive_kind": "if",
+    "expression": "1",
+    "activity": "active",
+    "lexical_scope": "file",
+    "opening_location": {"status": "known", "value": {
+        "path": file_path, "line": 1, "column": 1}},
+    "directive_location": {"status": "known", "value": {
+        "path": file_path, "line": 1, "column": 1}},
+}]
+if mode == "malformed_region_child":
+    conditional_regions[0]["lexical_scope"] = "block"
 record = {
     "schema_version": 2,
     "record_type": "file_analysis",
@@ -184,8 +205,10 @@ record = {
         "command_digest": digest,
     },
     "file": {"path": file_path, "kind": "source"},
+    "file_digest": {"status": "known", "value": source_digest},
     "status": "correct",
     "associated_headers": [],
+    "conditional_regions": conditional_regions,
     "analyzed_configurations": {"status": "known", "value": [configuration]},
     "operations": [],
     "desired_state": {"status": "known", "complete": True, "items": []},
@@ -488,6 +511,17 @@ def main():
         # Malformed and forged facts fail atomically before any JSON is emitted.
         fake = temporary / "fake-iwyu.py"
         write_fake_analyzer(fake)
+        combined_env = os.environ.copy()
+        combined_env["IWYU_BINARY"] = str(fake)
+        combined_records = parse_records(run(command, env=combined_env))
+        assert all(record["declaration_facts"] and
+                   record["conditional_regions"]
+                   for record in combined_records)
+        assert all(record["file_digest"] == {
+                       "status": "known",
+                       "value": record["source_digest"],
+                   } for record in combined_records)
+
         matrix_env = os.environ.copy()
         matrix_env["IWYU_BINARY"] = str(fake)
         matrix_env["SEM005_MALFORMED"] = "kind_matrix"
@@ -507,6 +541,7 @@ def main():
 
         for mode, message in [
                 ("unknown_kind", "value is outside schema enum"),
+                ("malformed_region_child", "value is outside schema enum"),
                 ("extra_fact_key", "unexpected field spelling"),
                 ("forged_conflict", "must be an empty array"),
                 ("missing_tool", "missing required field tool"),
