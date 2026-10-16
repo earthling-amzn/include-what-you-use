@@ -11,19 +11,30 @@ is byte-compatible with the prior contract. Select version 2 with
 
 Every version-2 record has `file_digest` and `conditional_regions` in addition
 to the declaration fields below. `file_digest.value` equals `source_digest` and
-binds region byte offsets to the exact analyzed SourceManager buffer. The census
-contains every physical `#if`/`#ifdef`/`#ifndef` branch and each alternative,
-including inactive branches. Each child records stable source-derived region and
-parent identities, opening/directive/body offsets, branch index, directive kind,
-expression, per-FileID activity, source locations, and `lexical_scope`.
+binds region byte offsets to the exact analyzed SourceManager buffer. The driver
+hashes one byte snapshot, then validates every opening, directive, body-begin,
+and known body-end offset against that same snapshot. Directive offsets must
+name the exact `directive_kind` token after the source line's optional whitespace
+and literal `#`; body beginnings follow the producer's escaped-newline rule, and
+known final body ends name `#endif`. The census contains every physical
+`#if`/`#ifdef`/`#ifndef` branch and each alternative, including inactive
+branches. Each child records stable source-derived region and parent identities,
+opening/directive/body offsets, branch index, directive kind, expression,
+per-FileID activity, source locations, and `lexical_scope`. Branch groups must
+have one opening branch, ordered contiguous alternatives, at most one final
+`else`, exact adjacent boundaries, acyclic parents, and complete containment of
+every known child body within its known parent body.
 
 Known operation, use, and contribution conditions carry `source_region_id` and
 the complete outer-to-inner `source_region_path`; expression text alone is not
-an identity. `lexical_scope` is `file` only when both the final macro-expanded
-token stream and completed AST ranges prove that the directive can accept a
-file-scope include. Function, class, namespace-block, macro-expanded,
-declaration-embedded, malformed, and uncertain locations are `non_file` or
-`unknown`.
+an identity. Every known anchor must resolve through that parent path to an
+active branch. Known edit anchors and non-`none` contribution anchors must also
+have `active_branch: true` and resolve to `lexical_scope: file`; use-only
+provenance may legitimately resolve to `non_file`. `lexical_scope` is `file`
+only when both the final macro-expanded token stream and completed AST ranges
+prove that the directive can accept a file-scope include. Function, class,
+namespace-block, macro-expanded, declaration-embedded, malformed, and uncertain
+locations are `non_file` or `unknown`.
 
 ## Declaration facts
 
@@ -55,10 +66,12 @@ availability. Macro-only facts remain `unavailable` when the retained macro
 provenance does not identify a Clang declaration node. Producers and consumers
 must not infer a kind from a rendered declaration or diagnostic text.
 
-A direct analyzer invocation emits an empty `declaration_conflicts` array.
-The named-database driver validates all child facts before producing conflicts.
-For each analyzed file and stable qualified name, the driver compares all
-observed kinds. `class` and `struct` are compatible class-keys under Clang's C++
+A direct analyzer invocation emits an empty `declaration_conflicts` array and
+must not emit incompatible kinds for one qualified entity in the same record.
+`class` and `struct` are the only compatible multi-kind family. The
+named-database driver validates all child facts before producing conflicts. For
+each analyzed file and stable qualified name, the driver compares all observed
+kinds. `class` and `struct` are compatible class-keys under Clang's C++
 redeclaration semantics. Every other multi-kind set is incompatible, including
 union/record, scoped/unscoped enum, enum/record, template/non-template, and all
 alias conflicts. Each reported conflict carries the record's `source_digest`;

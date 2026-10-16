@@ -931,13 +931,58 @@ def _validate_schema_v2(record):
     _validate_schema_value(record, schema, schema)
 
 
-def _validate_conditional_regions(record):
-    """Validate cross-field invariants for the schema-v2 region census."""
+def _source_location_at_offset(source_bytes, path, offset):
+    line_start = source_bytes.rfind(b'\n', 0, offset) + 1
+    return {
+        'path': path,
+        'line': source_bytes.count(b'\n', 0, offset) + 1,
+        'column': offset - line_start + 1,
+    }
+
+
+def _directive_body_begin_offset(source_bytes, offset):
+    """Mirror IwyuPreprocessorInfo::DirectiveBodyBeginOffset exactly."""
+    while offset < len(source_bytes):
+        if source_bytes[offset] != ord('\n'):
+            offset += 1
+            continue
+        slash = offset
+        if slash > 0 and source_bytes[slash - 1] == ord('\r'):
+            slash -= 1
+        line_end = slash
+        while slash > 0 and source_bytes[slash - 1] == ord('\\'):
+            slash -= 1
+        if (line_end - slash) % 2 == 0:
+            return offset + 1
+        offset += 1
+    return len(source_bytes)
+
+
+def _validate_directive_spelling(source_bytes, offset, directive_kind,
+                                 context):
+    token = directive_kind.encode('ascii')
+    if source_bytes[offset:offset + len(token)] != token:
+        raise ProtocolError('%s offset does not name directive keyword' % context)
+    after = offset + len(token)
+    if (after < len(source_bytes) and
+            source_bytes[after] in
+            b'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'):
+        raise ProtocolError('%s directive keyword is not token-delimited' %
+                            context)
+    line_start = source_bytes.rfind(b'\n', 0, offset) + 1
+    prefix = source_bytes[line_start:offset]
+    if re.fullmatch(br'[ \t\v\f\r]*\#[ \t\v\f\r]*', prefix) is None:
+        raise ProtocolError('%s directive lacks source # spelling' % context)
+
+
+def _validate_conditional_regions(record, source_bytes):
+    """Validate schema-v2 regions against the exact digest-checked bytes."""
     source_digest = record['source_digest']
     if record['file_digest'] != {'status': 'known', 'value': source_digest}:
         raise ProtocolError('file_digest differs from source_digest')
 
     file_path = record['file']['path']
+    source_length = len(source_bytes)
     regions = record['conditional_regions']
     sort_keys = [
         (region['opening_offset'], region['branch_index'],
@@ -948,8 +993,8 @@ def _validate_conditional_regions(record):
 
     identities = set()
     regions_by_identity = {}
-    parents_by_source_id = {}
-    branches = {}
+    regions_by_source_id = {}
+    groups = {}
     for region in regions:
         source_region_id = region['source_region_id']
         expected_id = 'branch-%d-%d-%d' % (
@@ -962,49 +1007,122 @@ def _validate_conditional_regions(record):
             raise ProtocolError('duplicate conditional region identity')
         identities.add(identity)
         regions_by_identity[identity] = region
+        regions_by_source_id.setdefault(source_region_id, []).append(identity)
+        groups.setdefault(
+            (region['file_id'], region['opening_offset']), []).append(identity)
 
-        if not (region['opening_offset'] <= region['directive_offset'] <=
-                region['body_begin_offset']):
-            raise ProtocolError('conditional region offsets are inconsistent')
+        opening = region['opening_offset']
+        directive = region['directive_offset']
+        body_begin = region['body_begin_offset']
+        if not (0 <= opening < source_length and
+                opening <= directive < body_begin <= source_length):
+            raise ProtocolError('conditional region offsets are out of bounds or inconsistent')
         body_end = region['body_end_offset']
-        if (body_end['status'] == 'known' and
-                body_end['value'] < region['body_begin_offset']):
-            raise ProtocolError('conditional region body end precedes body')
-        for location_name in ('opening_location', 'directive_location'):
+        if body_end['status'] == 'known':
+            if not (body_begin <= body_end['value'] <= source_length):
+                raise ProtocolError(
+                    'conditional region body end is out of bounds or precedes body')
+
+        _validate_directive_spelling(
+            source_bytes, directive, region['directive_kind'],
+            'conditional region')
+        if body_begin != _directive_body_begin_offset(source_bytes, directive):
+            raise ProtocolError(
+                'conditional region body begin differs from source directive')
+
+        expected_locations = {
+            'opening_location': _source_location_at_offset(
+                source_bytes, file_path, opening),
+            'directive_location': _source_location_at_offset(
+                source_bytes, file_path, directive),
+        }
+        for location_name, expected_location in expected_locations.items():
             location = region[location_name]
             if (location['status'] == 'known' and
-                    location['value']['path'] != file_path):
+                    location['value'] != expected_location):
                 raise ProtocolError(
-                    'conditional region location is outside analyzed file')
+                    'conditional region location differs from source offset')
 
         parent = region['parent_source_region_id']
-        parent_id = parent['value'] if parent['status'] == 'known' else None
-        parents_by_source_id.setdefault(source_region_id, set()).add(parent_id)
-        branches.setdefault(
-            (region['file_id'], region['opening_offset']), []).append(
-                region['branch_index'])
-
-    for identity, region in regions_by_identity.items():
-        parent = region['parent_source_region_id']
-        if parent['status'] == 'known':
-            parent_identity = (region['file_id'], parent['value'])
-            parent_region = regions_by_identity.get(parent_identity)
-            if parent_region is None:
-                raise ProtocolError('conditional region parent is absent')
-            parent_end = parent_region['body_end_offset']
-            if (parent_region['body_begin_offset'] > region['opening_offset'] or
-                    (parent_end['status'] == 'known' and
-                     region['opening_offset'] >= parent_end['value'])):
-                raise ProtocolError('conditional region is outside parent body')
-        elif parent['status'] != 'not_applicable':
+        if parent['status'] not in ('known', 'not_applicable'):
             raise ProtocolError('conditional region parent availability is invalid')
 
-    for branch_indices in branches.values():
-        if branch_indices != list(range(len(branch_indices))):
+    # Validate each complete #if/#elif/#else group and its exact source joins.
+    for group_id, group_identities in groups.items():
+        group = [regions_by_identity[identity]
+                 for identity in group_identities]
+        branch_indices = [region['branch_index'] for region in group]
+        if branch_indices != list(range(len(group))):
             raise ProtocolError(
                 'conditional region branch indices are not contiguous')
+        first = group[0]
+        if (first['directive_offset'] != first['opening_offset'] or
+                first['directive_kind'] not in ('if', 'ifdef', 'ifndef')):
+            raise ProtocolError('conditional region group has invalid opening branch')
+        expected_parent = first['parent_source_region_id']
+        expected_opening_location = first['opening_location']
+        saw_else = False
+        for index, region in enumerate(group):
+            if (region['parent_source_region_id'] != expected_parent or
+                    region['opening_location'] != expected_opening_location):
+                raise ProtocolError('conditional region group metadata differs')
+            kind = region['directive_kind']
+            if index:
+                if saw_else or kind not in ('elif', 'elifdef', 'elifndef',
+                                             'else'):
+                    raise ProtocolError('conditional region group has invalid branch shape')
+                saw_else = kind == 'else'
+            if index + 1 < len(group):
+                following = group[index + 1]
+                body_end = region['body_end_offset']
+                if (body_end['status'] == 'known' and
+                        body_end['value'] != following['directive_offset']):
+                    raise ProtocolError(
+                        'conditional region branch boundary differs from next directive')
 
-    def validate_condition(condition, context):
+    # Parent identity includes FileID. This makes the graph deterministic even
+    # when one physical header is entered more than once.
+    parent_by_identity = {}
+    for identity, region in regions_by_identity.items():
+        parent = region['parent_source_region_id']
+        if parent['status'] == 'not_applicable':
+            parent_by_identity[identity] = None
+            continue
+        parent_identity = (region['file_id'], parent['value'])
+        parent_region = regions_by_identity.get(parent_identity)
+        if parent_region is None:
+            raise ProtocolError('conditional region parent is absent')
+        parent_by_identity[identity] = parent_identity
+        parent_end = parent_region['body_end_offset']
+        child_end = region['body_end_offset']
+        if parent_region['body_begin_offset'] > region['opening_offset']:
+            raise ProtocolError('conditional region is outside parent body')
+        if (parent_end['status'] == 'known' and
+                child_end['status'] == 'known' and
+                child_end['value'] > parent_end['value']):
+            raise ProtocolError('conditional region body escapes parent body')
+        if (parent_end['status'] == 'known' and
+                region['opening_offset'] >= parent_end['value']):
+            raise ProtocolError('conditional region is outside parent body')
+
+    for identity in parent_by_identity:
+        seen = set()
+        current = identity
+        while current is not None:
+            if current in seen:
+                raise ProtocolError('conditional region parent graph is cyclic')
+            seen.add(current)
+            current = parent_by_identity[current]
+
+    for group_identities in groups.values():
+        final_region = regions_by_identity[group_identities[-1]]
+        final_end = final_region['body_end_offset']
+        if final_end['status'] == 'known':
+            _validate_directive_spelling(
+                source_bytes, final_end['value'], 'endif',
+                'conditional region closing')
+
+    def resolve_condition(condition, context, require_file_scope):
         if condition['status'] != 'known':
             return
         value = condition['value']
@@ -1012,33 +1130,78 @@ def _validate_conditional_regions(record):
         source_region_path = value['source_region_path']
         if source_region_path[-1] != source_region_id:
             raise ProtocolError('%s condition anchor differs from path' % context)
-        if any(region_id not in parents_by_source_id
-               for region_id in source_region_path):
-            raise ProtocolError('%s condition path names an absent region' % context)
-        if None not in parents_by_source_id[source_region_path[0]]:
+
+        candidates = [
+            identity for identity in regions_by_source_id.get(
+                source_region_path[0], [])
+            if parent_by_identity[identity] is None]
+        if not candidates:
             raise ProtocolError('%s condition path does not begin at a root' %
                                 context)
-        for parent_id, child_id in zip(source_region_path,
-                                       source_region_path[1:]):
-            if parent_id not in parents_by_source_id[child_id]:
+        for child_source_id in source_region_path[1:]:
+            next_candidates = []
+            for child_identity in regions_by_source_id.get(child_source_id, []):
+                if parent_by_identity[child_identity] in candidates:
+                    next_candidates.append(child_identity)
+            candidates = next_candidates
+            if not candidates:
                 raise ProtocolError('%s condition path has invalid parentage' %
                                     context)
+        candidates = [identity for identity in candidates
+                      if identity[1] == source_region_id]
+        if not candidates:
+            raise ProtocolError('%s condition path names an absent region' %
+                                context)
+
+        location = value['location']
+        if location['status'] == 'known':
+            candidates = [
+                identity for identity in candidates
+                if regions_by_identity[identity]['directive_location'] == location]
+            if not candidates:
+                raise ProtocolError('%s condition location differs from anchor' %
+                                    context)
+        if not value['active_branch']:
+            raise ProtocolError('%s condition anchor is not an active branch' %
+                                context)
+        active = [identity for identity in candidates
+                  if regions_by_identity[identity]['activity'] == 'active']
+        if not active:
+            raise ProtocolError('%s condition anchor resolves inactive or unknown' %
+                                context)
+        if require_file_scope and not any(
+                regions_by_identity[identity]['lexical_scope'] == 'file'
+                for identity in active):
+            raise ProtocolError('%s condition anchor is not active file scope' %
+                                context)
 
     for operation in record['operations']:
         context = operation['id']
-        validate_condition(operation['edit_condition'], context)
+        resolve_condition(operation['edit_condition'], context, True)
         multi_config = operation['multi_config']
         if multi_config['status'] == 'known':
             for contribution in multi_config['value']:
-                validate_condition(contribution['condition'], context)
+                if contribution['subject_action'] != 'none':
+                    resolve_condition(
+                        contribution['condition'], context + ' contribution',
+                        True)
         for symbol in operation['symbols']:
             for use in symbol['uses']:
-                validate_condition(use['condition'], context)
+                # Uses inside functions, classes, and other non-file scopes are
+                # valid provenance. They still must name a branch active in at
+                # least one matching physical include instance.
+                resolve_condition(use['condition'], context + ' use', False)
 
 
-def _validate_declaration_facts(record, native_conflicts=True):
-    _validate_schema_v2(record)
-    _validate_conditional_regions(record)
+def _declaration_kinds_incompatible(kinds):
+    return len(kinds) > 1 and not kinds <= set(['class', 'struct'])
+
+
+def _validate_declaration_facts(record, source_bytes, native_conflicts=True,
+                                schema_validated=False):
+    if not schema_validated:
+        _validate_schema_v2(record)
+    _validate_conditional_regions(record, source_bytes)
 
     facts = record['declaration_facts']
     fact_keys = []
@@ -1054,6 +1217,12 @@ def _validate_declaration_facts(record, native_conflicts=True):
         raise ProtocolError('duplicate schema-v2 declaration fact')
     if fact_keys != sorted(fact_keys):
         raise ProtocolError('schema-v2 declaration facts are not sorted')
+    for qualified_name, declarations in facts_by_name.items():
+        kinds = set(kind for kind, _ in declarations)
+        if _declaration_kinds_incompatible(kinds):
+            raise ProtocolError(
+                'native declaration facts contain incompatible kind families '
+                'for %s' % qualified_name)
     if native_conflicts and record['declaration_conflicts'] != []:
         raise ProtocolError(
             'native schema-v2 declaration_conflicts must be an empty array')
@@ -1417,12 +1586,12 @@ def _parse_json_object(line):
 
 
 def _validate_record(record, invocation, previous_path, identities,
-                     source_digests=None):
+                     source_digests=None, source_contents=None):
     if type(record.get('schema_version')) is not int or \
             record['schema_version'] != invocation.output_schema_version:
         raise ProtocolError('record has unsupported or unexpected schema_version')
     if record['schema_version'] == 2:
-        _validate_declaration_facts(record)
+        _validate_schema_v2(record)
     if record.get('record_type') != 'file_analysis':
         raise ProtocolError('record has invalid record_type')
 
@@ -1472,11 +1641,11 @@ def _validate_record(record, invocation, previous_path, identities,
                 'source_identity does not match file.path physical identity')
         try:
             with open(expected_identity, 'rb') as source_file:
-                current_digest = 'sha256:' + hashlib.sha256(
-                    source_file.read()).hexdigest()
+                source_bytes = source_file.read()
         except OSError as why:
             raise ProtocolError('cannot verify source_digest for %s: %s' %
                                 (path, why))
+        current_digest = 'sha256:' + hashlib.sha256(source_bytes).hexdigest()
         producer_digest = record['source_digest']
         if source_digests is not None:
             previous_digest = source_digests.get(producer_identity)
@@ -1487,8 +1656,16 @@ def _validate_record(record, invocation, previous_path, identities,
         if producer_digest != current_digest:
             raise ProtocolError(
                 'source_digest does not match current source bytes for %s' % path)
+        if source_contents is not None:
+            previous_bytes = source_contents.get(producer_identity)
+            if previous_bytes is not None and previous_bytes != source_bytes:
+                raise ProtocolError(
+                    'same physical source changed during JSON validation')
+            source_contents[producer_identity] = source_bytes
         if source_digests is not None:
             source_digests[producer_identity] = producer_digest
+        _validate_declaration_facts(
+            record, source_bytes, schema_validated=True)
 
     identity = (record['schema_version'], metadata['index'], metadata['id'],
                 metadata['translation_unit'], path)
@@ -1499,7 +1676,7 @@ def _validate_record(record, invocation, previous_path, identities,
 
 
 def parse_json_output(output, invocation, identities=None,
-                      source_digests=None):
+                      source_digests=None, source_contents=None):
     """Parse and validate one child's complete LF-framed stdout atomically.
 
     Return the original JSON records so driver emission does not alter native
@@ -1510,6 +1687,8 @@ def parse_json_output(output, invocation, identities=None,
         identities = set()
     if source_digests is None:
         source_digests = {}
+    if source_contents is None:
+        source_contents = {}
     if output == '':
         return []
     if '\r' in output:
@@ -1529,7 +1708,8 @@ def parse_json_output(output, invocation, identities=None,
             raise ProtocolError('JSON Lines output contains a whitespace record')
         record = _parse_json_object(line)
         previous_path = _validate_record(
-            record, invocation, previous_path, identities, source_digests)
+            record, invocation, previous_path, identities, source_digests,
+            source_contents)
     return lines
 
 
@@ -1557,7 +1737,7 @@ def _operation_sort_key(operation):
             _operation_range_key(operation['source_range']),
             operation['spelling'], operation['reason_code'])
 
-def _aggregate_declaration_conflicts(groups, invocations):
+def _aggregate_declaration_conflicts(groups, invocations, source_contents):
     """Aggregate incompatible declarations and suppress only unsafe pairs."""
     parsed_groups = [
         [_parse_json_object(line) for line in lines] for lines in groups]
@@ -1568,11 +1748,6 @@ def _aggregate_declaration_conflicts(groups, invocations):
         for record in records:
             by_file.setdefault(record['source_identity'], []).append(
                 (invocation.configuration, record))
-
-    def incompatible(kinds):
-        # C++ permits class/struct redeclarations of the same class-key. Every
-        # other cross-kind set changes entity semantics or declaration syntax.
-        return len(kinds) > 1 and not kinds <= set(['class', 'struct'])
 
     def symbol_names(operation):
         names = set()
@@ -1596,7 +1771,8 @@ def _aggregate_declaration_conflicts(groups, invocations):
         for qualified_name, entries in declarations.items():
             configurations = set(configuration for configuration, _ in entries)
             kinds = set(kind for _, kind in entries)
-            if len(configurations) < 2 or not incompatible(kinds):
+            if (len(configurations) < 2 or
+                    not _declaration_kinds_incompatible(kinds)):
                 continue
             dangerous_names.add(qualified_name)
             conflicts.append({
@@ -1621,7 +1797,9 @@ def _aggregate_declaration_conflicts(groups, invocations):
                         blocked_adds.append(operation)
                         blocked_names.update(names)
             if not blocked_adds:
-                _validate_declaration_facts(record, native_conflicts=False)
+                _validate_declaration_facts(
+                    record, source_contents[record['source_identity']],
+                    native_conflicts=False)
                 continue
 
             paired_removals = []
@@ -1695,7 +1873,9 @@ def _aggregate_declaration_conflicts(groups, invocations):
                     'unrelated safe edits remain applicable.'),
                 'location': {'status': 'unavailable', 'value': None},
             })
-            _validate_declaration_facts(record, native_conflicts=False)
+            _validate_declaration_facts(
+                record, source_contents[record['source_identity']],
+                native_conflicts=False)
 
     return [[_json_dumps_canonical(record) for record in records]
             for records in parsed_groups]
@@ -1753,6 +1933,7 @@ def execute_json(invocations, verbose, jobs, max_load_average=0):
     # Validate all groups before writing any structured stdout.
     identities = set()
     source_digests = {}
+    source_contents = {}
     groups = []
     errors = []
     exit_code = 0
@@ -1767,7 +1948,8 @@ def execute_json(invocations, verbose, jobs, max_load_average=0):
             continue
         try:
             lines = parse_json_output(
-                stdout, invocation, identities, source_digests)
+                stdout, invocation, identities, source_digests,
+                source_contents)
             if returncode == 0 and not lines:
                 raise ProtocolError('successful child produced no records')
             groups.append(lines)
@@ -1789,7 +1971,8 @@ def execute_json(invocations, verbose, jobs, max_load_average=0):
     if groups and all(invocation.output_schema_version == 2
                       for invocation in ordered):
         try:
-            groups = _aggregate_declaration_conflicts(groups, ordered)
+            groups = _aggregate_declaration_conflicts(
+                groups, ordered, source_contents)
         except ProtocolError as why:
             print('error: IWYU JSON aggregation: %s' % why, file=sys.stderr)
             return max(exit_code, 1)

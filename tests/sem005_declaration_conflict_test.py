@@ -166,24 +166,59 @@ if mode == "kind_matrix":
         "kind": kind,
         "declaration": {"path": translation_unit, "line": 1, "column": 1},
     } for name, kind in sorted(selected.items())]
+condition_marker = b"#if defined(SEM005_DEBUG_CONFIGURATION)"
+has_condition = condition_marker in source_bytes
+opening_offset = source_bytes.find(condition_marker) + 1
+alternative_offset = source_bytes.find(b"#else", opening_offset) + 1
+closing_offset = source_bytes.find(b"#endif", alternative_offset) + 1
+
+def body_begin(offset):
+    return source_bytes.index(b"\n", offset) + 1
+
+def location(offset):
+    line_start = source_bytes.rfind(b"\n", 0, offset) + 1
+    return {
+        "path": file_path,
+        "line": source_bytes.count(b"\n", 0, offset) + 1,
+        "column": offset - line_start + 1,
+    }
+
+debug_active = configuration == "debug"
 conditional_regions = [{
-    "source_region_id": "branch-0-0-0",
-    "file_id": 0,
-    "opening_offset": 0,
-    "directive_offset": 0,
-    "body_begin_offset": 0,
-    "body_end_offset": {"status": "known", "value": len(source_bytes)},
+    "source_region_id": "branch-%d-0-%d" % (
+        opening_offset, opening_offset),
+    "file_id": 1,
+    "opening_offset": opening_offset,
+    "directive_offset": opening_offset,
+    "body_begin_offset": body_begin(opening_offset),
+    "body_end_offset": {"status": "known", "value": alternative_offset},
     "branch_index": 0,
     "parent_source_region_id": {"status": "not_applicable", "value": None},
     "directive_kind": "if",
-    "expression": "1",
-    "activity": "active",
-    "lexical_scope": "file",
-    "opening_location": {"status": "known", "value": {
-        "path": file_path, "line": 1, "column": 1}},
-    "directive_location": {"status": "known", "value": {
-        "path": file_path, "line": 1, "column": 1}},
+    "expression": "defined(SEM005_DEBUG_CONFIGURATION)",
+    "activity": "active" if debug_active else "inactive",
+    "lexical_scope": "non_file",
+    "opening_location": {"status": "known", "value": location(opening_offset)},
+    "directive_location": {"status": "known", "value": location(opening_offset)},
+}, {
+    "source_region_id": "branch-%d-1-%d" % (
+        opening_offset, alternative_offset),
+    "file_id": 1,
+    "opening_offset": opening_offset,
+    "directive_offset": alternative_offset,
+    "body_begin_offset": body_begin(alternative_offset),
+    "body_end_offset": {"status": "known", "value": closing_offset},
+    "branch_index": 1,
+    "parent_source_region_id": {"status": "not_applicable", "value": None},
+    "directive_kind": "else",
+    "expression": "!(defined(SEM005_DEBUG_CONFIGURATION))",
+    "activity": "inactive" if debug_active else "active",
+    "lexical_scope": "non_file",
+    "opening_location": {"status": "known", "value": location(opening_offset)},
+    "directive_location": {"status": "known", "value": location(alternative_offset)},
 }]
+if not has_condition:
+    conditional_regions = []
 if mode == "malformed_region_child":
     conditional_regions[0]["lexical_scope"] = "block"
 record = {
@@ -222,6 +257,74 @@ elif mode == "missing_operations":
     del record["operations"]
 elif mode == "semantic_status":
     record["status"] = "changes"
+print(json.dumps(record, separators=(",", ":")))
+''')
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def write_record_mutator(path):
+    path.write_text(r'''#!/usr/bin/env python3
+import copy
+import json
+import os
+
+with open(os.environ["SEM005_BASE_RECORD"]) as stream:
+    record = json.loads(stream.readline())
+mode = os.environ["SEM005_RECORD_MUTATION"]
+regions = record["conditional_regions"]
+
+if mode == "child_body_escapes_parent":
+    child = next(region for region in reversed(regions)
+                 if region["parent_source_region_id"]["status"] == "known")
+    parent_id = child["parent_source_region_id"]["value"]
+    parent = next(region for region in regions
+                  if region["file_id"] == child["file_id"] and
+                     region["source_region_id"] == parent_id)
+    child["body_end_offset"] = {
+        "status": "known", "value": parent["body_end_offset"]["value"] + 1}
+elif mode in ("anchored_region_non_file", "anchored_region_inactive"):
+    target = next(
+        operation["edit_condition"]["value"]["source_region_id"]
+        for operation in record["operations"]
+        if operation["edit_condition"]["status"] == "known")
+    region = next(region for region in regions
+                  if region["source_region_id"] == target)
+    if mode == "anchored_region_non_file":
+        region["lexical_scope"] = "non_file"
+    else:
+        region["activity"] = "inactive"
+elif mode == "directive_offset_not_keyword":
+    region = next(region for region in regions if region["branch_index"] == 1)
+    old_id = region["source_region_id"]
+    region["directive_offset"] += 1
+    region["source_region_id"] = "branch-%d-%d-%d" % (
+        region["opening_offset"], region["branch_index"],
+        region["directive_offset"])
+    group = [item for item in regions
+             if item["file_id"] == region["file_id"] and
+                item["opening_offset"] == region["opening_offset"]]
+    group[region["branch_index"] - 1]["body_end_offset"]["value"] = \
+        region["directive_offset"]
+    def replace(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                value[key] = replace(child)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                value[index] = replace(child)
+        elif value == old_id:
+            return region["source_region_id"]
+        return value
+    replace(record)
+elif mode == "native_kind_family_conflict":
+    fact = copy.deepcopy(record["declaration_facts"][0])
+    fact["kind"] = "union" if fact["kind"] in ("class", "struct") else "class"
+    record["declaration_facts"].append(fact)
+    record["declaration_facts"].sort(
+        key=lambda item: (item["qualified_name"], item["kind"]))
+else:
+    raise SystemExit("unknown mutation: " + mode)
+
 print(json.dumps(record, separators=(",", ":")))
 ''')
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
@@ -560,6 +663,44 @@ def main():
             assert malformed.returncode != 0
             assert malformed.stdout == ""
             assert message in malformed.stderr, malformed.stderr
+
+        # Mutate one authentic nested, file-scope conditional record at a time.
+        # Every malformed child must fail the complete named-database run before
+        # the driver emits any structured stdout.
+        conditional_source = ROOT / "tests/conditional_regions/conditional.cc"
+        malformed_db = temporary / "malformed-server"
+        write_database(
+            malformed_db,
+            [str(COMPILER), "-I", str(ROOT), "-std=c++17", "-DCOMPILER2",
+             "-DARCH_TEST", "-DX86", "-c", str(conditional_source)],
+            conditional_source)
+        malformed_command = [
+            sys.executable, str(DRIVER), "-o", "json", "--output-schema", "2",
+            "--database", "server=" + str(malformed_db),
+        ]
+        authentic = run(malformed_command, env=analyzer_env)
+        authentic_records = parse_records(authentic)
+        assert len(authentic_records) == 1
+        base_record = temporary / "authentic-conditional.jsonl"
+        base_record.write_text(authentic.stdout)
+        mutator = temporary / "record-mutator.py"
+        write_record_mutator(mutator)
+        malformed_messages = {
+            "child_body_escapes_parent": "body escapes parent body",
+            "anchored_region_non_file": "not active file scope",
+            "anchored_region_inactive": "resolves inactive or unknown",
+            "directive_offset_not_keyword": "does not name directive keyword",
+            "native_kind_family_conflict": "incompatible kind families",
+        }
+        for mode, message in malformed_messages.items():
+            env = os.environ.copy()
+            env["IWYU_BINARY"] = str(mutator)
+            env["SEM005_BASE_RECORD"] = str(base_record)
+            env["SEM005_RECORD_MUTATION"] = mode
+            malformed = run(malformed_command, env=env)
+            assert malformed.returncode != 0, mode
+            assert malformed.stdout == "", (mode, malformed.stdout)
+            assert message in malformed.stderr, (mode, malformed.stderr)
 
         race_source = temporary / "source-race.cc"
         race_source.write_text("struct Race {};\nRace* value;\n")
