@@ -21,6 +21,11 @@ int CallPureDispatch(PureDispatchControl& value) {
   return value.Dispatch();
 }
 
+class PureDispatchImplementation final : public PureDispatchControl {
+ public:
+  int Dispatch() override { return 17; }
+};
+
 class DefaultedDependency {
  public:
   inline DefaultedDependency();
@@ -45,4 +50,7 @@ int UninstantiatedControl(T value) {
   return UninstantiatedInline(value);
 }
 
-int main() { return DiscardedConstexprControl(); }
+int main() {
+  PureDispatchImplementation value;
+  return CallPureDispatch(value) == 17 ? DiscardedConstexprControl() : 1;
+}

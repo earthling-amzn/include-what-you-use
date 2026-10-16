@@ -88,6 +88,24 @@ def assert_analyzer_contracts():
     assert not [diagnostic for diagnostic in contexts["diagnostics"]
                 if diagnostic["code"] == "missing_inline_definition"]
 
+    pure_pointer = analyze("pure_virtual_pointer.cc")
+    assert pure_pointer["status"] == "correct"
+    assert pure_pointer["operations"] == []
+    assert pure_pointer["diagnostics"] == []
+    assert pure_pointer["desired_state"]["items"] == []
+
+    pure_qualified = analyze("pure_virtual_qualified.cc")
+    pure_qualified_facts = [
+        diagnostic for diagnostic in pure_qualified["diagnostics"]
+        if diagnostic["code"] == "missing_inline_definition"]
+    assert [(fact["message"], fact["location"]["value"])
+            for fact in pure_qualified_facts] == [
+        ("Inline function 'PureBase::MissingBody' is odr-used, but no "
+         "definition is visible; include its inline-definition provider "
+         "before linking.",
+         {"column": 49, "line": 8, "path": "pure_virtual_qualified.cc"}),
+    ]
+
     control = analyze("control.cc")
     assert not [diagnostic for diagnostic in control["diagnostics"]
                 if diagnostic["code"] == "missing_inline_definition"]
@@ -129,12 +147,32 @@ def assert_gcc_backstop(corpus=CORPUS):
              "-o", contexts], cwd=corpus)
         run([contexts], cwd=corpus)
 
+        pure_pointer = out / "pure_virtual_pointer"
+        run([CXX, "-std=c++17", "-fno-inline", "-I", ".",
+             "pure_virtual_pointer.cc", "-o", pure_pointer], cwd=corpus)
+        run([pure_pointer], cwd=corpus)
+
+        pure_qualified_object = out / "pure_virtual_qualified.o"
+        run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "-c",
+             "pure_virtual_qualified.cc", "-o", pure_qualified_object],
+            cwd=corpus)
+        pure_qualified_link = subprocess.run(
+            [str(CXX), str(pure_qualified_object), "-o",
+             str(out / "pure_virtual_qualified")], cwd=corpus,
+            text=True, capture_output=True)
+        assert pure_qualified_link.returncode != 0, (
+            pure_qualified_link.stdout + pure_qualified_link.stderr)
+        assert "PureBase::MissingBody()" in (
+            pure_qualified_link.stdout + pure_qualified_link.stderr)
+
 
 def assert_fixer_idempotence():
     with tempfile.TemporaryDirectory(prefix="sem004-fix-", dir=ROOT / "build") as tmp:
         corpus = Path(tmp) / "inline_definition_availability"
         shutil.copytree(CORPUS, corpus)
-        for filename in ("available.cc", "contexts.cc", "control.cc"):
+        for filename in ("available.cc", "contexts.cc", "control.cc",
+                         "pure_virtual_pointer.cc",
+                         "pure_virtual_qualified.cc"):
             first = run([IWYU, "-I", ".", "-std=c++17", filename], cwd=corpus)
             run([sys.executable, ROOT / "fix_includes.py", "--nosafe_headers",
                  "--nocomments", "--noblank_lines"], cwd=corpus,

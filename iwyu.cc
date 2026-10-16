@@ -2379,15 +2379,18 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     return evaluate_from(DynTypedNode::create(*expr), expr, 0);
   }
 
-  bool IsPureVirtualDispatch(const FunctionDecl* callee,
-                             const Expr* calling_expr) {
+  bool PureVirtualUseRequiresDefinition(const FunctionDecl* callee,
+                                        const Expr* use_expr) {
     const auto* method = dyn_cast<CXXMethodDecl>(callee);
     if (!method || !method->isPure())
-      return false;
+      return true;
 
+    // Forming a pointer to a pure virtual member and dispatching through one do
+    // not require a definition for the pure declaration. An explicitly
+    // qualified call suppresses virtual dispatch and does require its body.
     const clang::CXXMemberCallExpr* call =
-        dyn_cast_or_null<clang::CXXMemberCallExpr>(calling_expr);
-    if (!call && llvm::isa_and_nonnull<MemberExpr>(calling_expr)) {
+        dyn_cast_or_null<clang::CXXMemberCallExpr>(use_expr);
+    if (!call && llvm::isa_and_nonnull<MemberExpr>(use_expr)) {
       call = current_ast_node()->
           template GetAncestorAs<clang::CXXMemberCallExpr>();
     }
@@ -2395,8 +2398,12 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
       return false;
     const auto* member = dyn_cast<MemberExpr>(
         call->getCallee()->IgnoreParenImpCasts());
-    return member && member->performsVirtualDispatch(
-                         compiler()->getLangOpts());
+    if (!member ||
+        member->getMemberDecl()->getCanonicalDecl() !=
+            method->getCanonicalDecl()) {
+      return false;
+    }
+    return !member->performsVirtualDispatch(compiler()->getLangOpts());
   }
 
   bool IsInlineDefinitionEligible(const FunctionDecl* callee) const {
@@ -2411,8 +2418,7 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
   bool IsPotentiallyEvaluatedOdrUse(const FunctionDecl* callee,
                                     const Expr* expr) {
     if (!callee || callee->isDeleted() || callee->isDefaulted() ||
-        !IsPotentiallyEvaluated(expr) ||
-        IsPureVirtualDispatch(callee, expr)) {
+        !IsPotentiallyEvaluated(expr)) {
       return false;
     }
     if (const auto* decl_ref = dyn_cast<DeclRefExpr>(expr)) {
@@ -2430,6 +2436,8 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
                                     const Expr* expr) {
     if (!IsPotentiallyEvaluatedOdrUse(callee, expr))
       return false;
+    if (!PureVirtualUseRequiresDefinition(callee, expr))
+      return true;
 
     const SourceLocation use_loc = expr->getExprLoc();
     const FileEntry* use_file = GetFileEntry(use_loc);

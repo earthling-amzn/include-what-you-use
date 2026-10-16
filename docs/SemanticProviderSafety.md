@@ -36,8 +36,11 @@ and Clang-resolved explicit function-template specializations. Clang's semantic
 parent map and `EvaluatedExprVisitor` decide whether the expression is
 potentially evaluated. `decltype`, `sizeof`-like and `noexcept` operands, unused
 default arguments, discarded `if constexpr` branches, pure virtual dispatch,
-and unused deleted/defaulted controls do not create diagnostics. Primary and
-implicitly instantiated templates remain excluded.
+pure virtual member-pointer formation, and unused deleted/defaulted controls do
+not create diagnostics. A direct call explicitly qualified with its pure base
+class suppresses virtual dispatch and still requires the pure declaration's
+out-of-class definition, so it remains diagnostic. Primary and implicitly
+instantiated templates remain excluded.
 
 When Clang resolves an ODR-used definition to a directly included, verified
 generic dotted `.inline.<header-extension>` endpoint, that definition is
