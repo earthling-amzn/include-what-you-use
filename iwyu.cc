@@ -2322,6 +2322,56 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     if (IsProcessedOverloadLoc(CurrentLoc()))
       return true;
 
+    SourceLocation use_loc = calling_expr ? calling_expr->getExprLoc()
+                                          : CurrentLoc();
+    const FileEntry* use_file = GetFileEntry(use_loc);
+    if (use_file) {
+      if (const FunctionDecl* definition = callee->getDefinition()) {
+        const FileEntry* definition_file = GetFileEntry(definition);
+        if (definition_file && definition_file != use_file &&
+            GlobalIncludePicker().IsVerifiedDottedInlineEndpoint(
+                GetFilePath(definition_file)) &&
+            ContainsKey(preprocessor_info()
+                            .FileInfoOrEmptyFor(use_file)
+                            .direct_includes_as_fileentries(),
+                        definition_file)) {
+          // A call needs the selected definition, not only the declaration in
+          // the dotted inline header's plain counterpart. Recording the Clang-
+          // resolved definition prevents removal without guessing a provider.
+          ReportDeclUse(use_loc, definition, "(for inline definition)");
+        }
+      } else {
+        bool ordinary_function =
+            callee->getTemplatedKind() == FunctionDecl::TK_NonTemplate;
+        if (const auto* parent = dyn_cast<CXXRecordDecl>(
+                callee->getDeclContext())) {
+          ordinary_function = ordinary_function &&
+              !parent->getDescribedClassTemplate() &&
+              !isa<ClassTemplateSpecializationDecl>(parent);
+        }
+        const bool declared_inline = ordinary_function && std::any_of(
+            callee->redecls_begin(), callee->redecls_end(),
+            [](const FunctionDecl* redecl) {
+              return redecl->isInlineSpecified();
+            });
+        if (declared_inline) {
+          const string name = callee->getQualifiedNameAsString();
+          const string message =
+              "Inline function '" + name +
+              "' is odr-used, but no definition is visible; include its "
+              "inline-definition provider before linking.";
+          IwyuFileInfo* file_info = preprocessor_info().FileInfoFor(use_file);
+          if (file_info && file_info->AddStructuredDiagnostic(
+                               use_loc, "missing_inline_definition", message) &&
+              GlobalFlags().output_format == CommandlineFlags::kTextOutput) {
+            errs() << PrintableLoc(use_loc)
+                   << ": warning: missing_inline_definition: " << message
+                   << '\n';
+          }
+        }
+      }
+    }
+
     ReportDeclUse(CurrentLoc(), callee);
 
     return true;

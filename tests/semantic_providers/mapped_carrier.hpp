@@ -1,0 +1,6 @@
+#ifndef TESTS_SEMANTIC_PROVIDERS_MAPPED_CARRIER_HPP_
+#define TESTS_SEMANTIC_PROVIDERS_MAPPED_CARRIER_HPP_
+
+#include "private.hpp"
+
+#endif

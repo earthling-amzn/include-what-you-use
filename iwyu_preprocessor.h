@@ -167,6 +167,13 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
   bool FileTransitivelyIncludes(const string& quoted_includer,
                                 const clang::FileEntry* includee) const;
 
+  // Returns the shortest observed include path from includer to the normalized
+  // includee path. This is evidence only: callers must not use it to make an
+  // edit safe. Equal-length paths are resolved by normalized path order.
+  vector<string> ShortestIncludeChain(
+      const clang::FileEntry* includer,
+      const string& normalized_includee_path) const;
+
   // Returns true when the preprocessor branch active at provider_loc is also
   // active at use_loc. An unconditional provider dominates every use in the
   // same include instance; a conditional provider dominates only uses in the

@@ -790,11 +790,21 @@ void IwyuFileInfo::ReportProtectedFileReason(
       std::make_pair(included_file, KeepReason{reason_code, reason}));
 }
 
-void IwyuFileInfo::AddStructuredDiagnostic(SourceLocation location,
+bool IwyuFileInfo::AddStructuredDiagnostic(SourceLocation location,
                                            const string& code,
                                            const string& message,
                                            const string& severity) {
+  const auto duplicate = std::find_if(
+      structured_diagnostics_.begin(), structured_diagnostics_.end(),
+      [&](const StructuredDiagnostic& diagnostic) {
+        return diagnostic.location == location && diagnostic.code == code &&
+               diagnostic.message == message &&
+               diagnostic.severity == severity;
+      });
+  if (duplicate != structured_diagnostics_.end())
+    return false;
   structured_diagnostics_.push_back({location, code, message, severity});
+  return true;
 }
 
 void IwyuFileInfo::ReportForwardDeclareUse(SourceLocation use_loc,
@@ -2810,16 +2820,27 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       }
     }
 
-    if (selected_paths.size() != 1 ||
-        !GlobalIncludePicker().IsVerifiedDottedInlineEndpoint(
-            *selected_paths.begin())) {
+    if (selected_paths.size() != 1)
       return provider;
-    }
+    const string selected_path = *selected_paths.begin();
     provider["selected"] = llvm::json::Object{
         {"status", "known"},
         {"value", llvm::json::Object{
             {"spelling", operation.line->quoted_include()},
-            {"path", *selected_paths.begin()}}}};
+            {"path", selected_path}}}};
+
+    vector<string> chain = preprocessor_info_->ShortestIncludeChain(
+        file_, selected_path);
+    if (!chain.empty()) {
+      // Records use a worktree-relative analyzed-file identity while provider
+      // references are absolute. Preserve both schema identities at the ends.
+      chain.front() = file_path();
+      llvm::json::Array chain_value;
+      for (const string& path : chain)
+        chain_value.push_back(path);
+      provider["chain"] = llvm::json::Object{
+          {"status", "known"}, {"value", std::move(chain_value)}};
+    }
 
     if (!saw_candidate || !candidates_available)
       return provider;

@@ -88,10 +88,24 @@ def main():
     changed = by_path(changed_records, "tests/cxx/ctad.cc")
     ordinary_add = next(op for op in changed["operations"]
                         if op["subject_action"] == "add")
-    assert ordinary_add["provider"]["selected"] == {
-        "status": "unavailable", "value": None}
-    assert ordinary_add["provider"]["candidates"] == {
-        "status": "unavailable", "value": None}
+    ordinary_ref = {
+        "path": str((ROOT / "tests/cxx/ctad-i1.h").resolve()).replace(
+            os.sep, "/"),
+        "spelling": '"tests/cxx/ctad-i1.h"',
+    }
+    assert ordinary_add["provider"] == {
+        "selected": {"status": "known", "value": ordinary_ref},
+        "candidates": {"status": "known", "value": [ordinary_ref]},
+        "chain": {
+            "status": "known",
+            "value": [
+                "tests/cxx/ctad.cc",
+                str((ROOT / "tests/cxx/ctad-d1.h").resolve()).replace(
+                    os.sep, "/"),
+                ordinary_ref["path"],
+            ],
+        },
+    }
     assert changed["status"] == "changes"
     assert changed["invocation"]["index"] == 0
     assert changed["invocation"]["id"].startswith("inv-000000-")
@@ -797,7 +811,15 @@ rules:
             "status": "known",
             "value": [pair_plain_ref, pair_inline_ref],
         },
-        "chain": {"status": "unavailable", "value": None},
+        "chain": {
+            "status": "known",
+            "value": [
+                "tests/native_json/assoc003_provider.cc",
+                str((ROOT / "tests/native_json/assoc003_provider_wrapper.hpp")
+                    .resolve()).replace(os.sep, "/"),
+                pair_inline_path,
+            ],
+        },
     }
     provider_remove = next(
         op for op in provider_record["operations"]

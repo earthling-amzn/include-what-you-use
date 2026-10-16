@@ -1547,8 +1547,6 @@ vector<CandidateHeader> IncludePicker::BestCandidateHeaderRefsForIncluder(
     const string& including_filepath) const {
   const string including_path =
       MakeAbsolutePath(GetParentPath(including_filepath));
-  const string absolute_including_filepath =
-      NormalizeFilePath(MakeAbsolutePath(including_filepath));
   const auto spelling_for = [&](const MappedInclude& mapped_include) {
     const string& quoted_include_as_written =
         MaybeGetIncludeNameAsWritten(including_filepath, mapped_include.path);
@@ -1568,10 +1566,11 @@ vector<CandidateHeader> IncludePicker::BestCandidateHeaderRefsForIncluder(
     if (!mapped_include.path.empty()) {
       paths.insert(NormalizeFilePath(MakeAbsolutePath(mapped_include.path)));
     }
+    // A mapping can select a public spelling not used directly by this
+    // includer. Reuse globally observed resolution only when every occurrence
+    // of that exact spelling names one physical file; ambiguity remains empty.
     for (const auto& observed : includer_and_includee_to_include_as_written_) {
-      if (NormalizeFilePath(MakeAbsolutePath(observed.first.first)) ==
-              absolute_including_filepath &&
-          observed.second == spelling) {
+      if (observed.second == spelling) {
         paths.insert(NormalizeFilePath(
             MakeAbsolutePath(observed.first.second)));
       }

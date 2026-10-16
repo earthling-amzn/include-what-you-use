@@ -424,7 +424,8 @@ class IwyuFileInfo {
                                  const string& reason);
 
   // Retains a recoverable analysis diagnostic for schema-v1 JSON output.
-  void AddStructuredDiagnostic(clang::SourceLocation location,
+  // Returns true when a new diagnostic was inserted.
+  bool AddStructuredDiagnostic(clang::SourceLocation location,
                                const string& code,
                                const string& message,
                                const string& severity = "warning");

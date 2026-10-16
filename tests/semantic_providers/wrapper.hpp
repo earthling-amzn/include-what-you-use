@@ -1,0 +1,6 @@
+#ifndef TESTS_SEMANTIC_PROVIDERS_WRAPPER_HPP_
+#define TESTS_SEMANTIC_PROVIDERS_WRAPPER_HPP_
+
+#include "provider.hpp"
+
+#endif

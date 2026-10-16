@@ -13,9 +13,12 @@
 #include <cctype>
 #include <cstddef>                      // for size_t
 #include <cstring>
+#include <deque>
 #include <iterator>
+#include <map>
 #include <string>                       // for string, basic_string, etc
 #include <utility>                      // for pair, make_pair
+#include <vector>
 
 #include "iwyu_ast_util.h"
 #include "iwyu_globals.h"
@@ -2208,6 +2211,64 @@ bool IwyuPreprocessorInfo::FileTransitivelyIncludes(
       return ContainsKey(entry.second, includee);
   }
   return false;
+}
+
+vector<string> IwyuPreprocessorInfo::ShortestIncludeChain(
+    const FileEntry* includer,
+    const string& normalized_includee_path) const {
+  if (!includer)
+    return {};
+
+  const string target = NormalizeFilePath(
+      MakeAbsolutePath(normalized_includee_path));
+  std::deque<const FileEntry*> pending;
+  set<const FileEntry*> visited;
+  map<const FileEntry*, const FileEntry*> predecessor;
+  pending.push_back(includer);
+  visited.insert(includer);
+
+  const FileEntry* endpoint = nullptr;
+  while (!pending.empty()) {
+    const FileEntry* current = pending.front();
+    pending.pop_front();
+    if (NormalizeFilePath(MakeAbsolutePath(GetFilePath(current))) == target) {
+      endpoint = current;
+      break;
+    }
+
+    vector<const FileEntry*> direct(
+        FileInfoOrEmptyFor(current).direct_includes_as_fileentries().begin(),
+        FileInfoOrEmptyFor(current).direct_includes_as_fileentries().end());
+    std::sort(direct.begin(), direct.end(),
+              [](const FileEntry* lhs, const FileEntry* rhs) {
+                return NormalizeFilePath(MakeAbsolutePath(GetFilePath(lhs))) <
+                       NormalizeFilePath(MakeAbsolutePath(GetFilePath(rhs)));
+              });
+    for (const FileEntry* next : direct) {
+      if (!visited.insert(next).second)
+        continue;
+      predecessor[next] = current;
+      pending.push_back(next);
+    }
+  }
+  if (!endpoint)
+    return {};
+
+  vector<string> reverse_chain;
+  for (const FileEntry* current = endpoint; current;
+       current = GetOrDefault(predecessor, current,
+                              static_cast<const FileEntry*>(nullptr))) {
+    reverse_chain.push_back(
+        NormalizeFilePath(MakeAbsolutePath(GetFilePath(current))));
+    if (current == includer)
+      break;
+  }
+  if (reverse_chain.empty() ||
+      NormalizeFilePath(MakeAbsolutePath(GetFilePath(includer))) !=
+          reverse_chain.back()) {
+    return {};
+  }
+  return vector<string>(reverse_chain.rbegin(), reverse_chain.rend());
 }
 
 bool IwyuPreprocessorInfo::IncludeIsInhibited(
