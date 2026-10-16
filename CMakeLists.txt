@@ -316,4 +316,12 @@ if (Python3_Interpreter_FOUND)
     COMMAND ${Python3_EXECUTABLE} tests/iwyu_tool_named_databases_test.py
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   )
+
+  add_test(NAME sem005_declaration_conflict_test
+    COMMAND ${Python3_EXECUTABLE} tests/sem005_declaration_conflict_test.py
+      $<TARGET_FILE:include-what-you-use> ${CMAKE_CXX_COMPILER}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  set_tests_properties(sem005_declaration_conflict_test
+    PROPERTIES SKIP_RETURN_CODE 77)
 endif()

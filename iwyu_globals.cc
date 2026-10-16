@@ -146,6 +146,8 @@ static void PrintHelp(const char* extra_msg) {
          "        with 'make -k')\n"
          "   --output_format=<value>: output human-readable text (default)\n"
          "        or one JSON object per analyzed file with value 'json'.\n"
+         "   --output_schema=<version>: structured-output schema version 1\n"
+         "        (default) or 2; requires --output_format=json.\n"
          "   --debug=flag[,flag...]: debug flags (undocumented)\n"
          "   --regex=<dialect>: use specified regex dialect in IWYU:\n"
          "          llvm:       fast and simple (default)\n"
@@ -317,6 +319,10 @@ static void FinalizeStructuredOutputOptions(int clang_argc,
       flags.has_invocation_id;
 
   if (flags.output_format != CommandlineFlags::kJsonOutput) {
+    if (flags.has_output_schema) {
+      StructuredOutputError(
+          "--output_schema requires --output_format=json.");
+    }
     if (has_any_driver_metadata) {
       StructuredOutputError(
           "invocation metadata requires --output_format=json.");
@@ -467,11 +473,13 @@ CommandlineFlags::CommandlineFlags()
       exit_code_always(EXIT_SUCCESS),
       regex_dialect(RegexDialect::LLVM),
       output_format(kTextOutput),
+      output_schema_version(1),
       invocation_index(0),
       has_invocation_index(false),
       has_command_digest(false),
       has_translation_unit(false),
       has_invocation_id(false),
+      has_output_schema(false),
       has_project_policy(false),
       has_configuration(false) {
   // Always keep Qt .moc includes; its moc compiler does its own IWYU analysis.
@@ -481,6 +489,7 @@ CommandlineFlags::CommandlineFlags()
 int CommandlineFlags::ParseArgv(int argc, char** argv) {
   enum LongOption {
     kOutputFormat = 256,
+    kOutputSchema,
     kInvocationIndex,
     kInvocationId,
     kCommandDigest,
@@ -510,6 +519,7 @@ int CommandlineFlags::ParseArgv(int argc, char** argv) {
     {"regex", required_argument, nullptr, 'r'},
     {"experimental", required_argument, nullptr, 'p'},
     {"output_format", required_argument, nullptr, kOutputFormat},
+    {"output_schema", required_argument, nullptr, kOutputSchema},
     {"invocation_index", required_argument, nullptr, kInvocationIndex},
     {"invocation_id", required_argument, nullptr, kInvocationId},
     {"command_digest", required_argument, nullptr, kCommandDigest},
@@ -616,6 +626,20 @@ int CommandlineFlags::ParseArgv(int argc, char** argv) {
           PrintHelp("FATAL ERROR: --output_format must be 'text' or 'json'.");
           exit(EXIT_FAILURE);
         }
+        break;
+      case kOutputSchema:
+        if (has_output_schema) {
+          StructuredOutputError("repeated --output_schema.");
+        }
+        if (strcmp(optarg, "1") == 0) {
+          output_schema_version = 1;
+        } else if (strcmp(optarg, "2") == 0) {
+          output_schema_version = 2;
+        } else {
+          StructuredOutputError(
+              "--output_schema must be supported version 1 or 2.");
+        }
+        has_output_schema = true;
         break;
       case kInvocationIndex:
         if (has_invocation_index ||

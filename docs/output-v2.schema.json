@@ -1,0 +1,520 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://include-what-you-use.org/schema/output-v2.schema.json",
+  "title": "Include What You Use file analysis record, schema version 2",
+  "description": "One JSON Lines record describing IWYU analysis and desired edits for one file.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "record_type",
+    "tool",
+    "invocation",
+    "file",
+    "status",
+    "associated_headers",
+    "analyzed_configurations",
+    "operations",
+    "desired_state",
+    "diagnostics",
+    "declaration_facts",
+    "declaration_conflicts"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "record_type": {"const": "file_analysis"},
+    "tool": {"$ref": "#/$defs/tool"},
+    "invocation": {"$ref": "#/$defs/invocation"},
+    "file": {"$ref": "#/$defs/file"},
+    "status": {"enum": ["correct", "changes", "skipped", "error"]},
+    "associated_headers": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/association"}
+    },
+    "analyzed_configurations": {"$ref": "#/$defs/available_string_array"},
+    "operations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/operation"}
+    },
+    "desired_state": {"$ref": "#/$defs/desired_state"},
+    "diagnostics": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/diagnostic"}
+    },
+    "declaration_facts": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/declaration_fact"}
+    },
+    "declaration_conflicts": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/declaration_conflict"}
+    }
+  },
+  "$defs": {
+    "nonempty_string": {"type": "string", "minLength": 1},
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "git_revision", "clang_version"],
+      "properties": {
+        "name": {"const": "include-what-you-use"},
+        "version": {"$ref": "#/$defs/nonempty_string"},
+        "git_revision": {"$ref": "#/$defs/available_string"},
+        "clang_version": {"$ref": "#/$defs/nonempty_string"}
+      }
+    },
+    "invocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "index", "translation_unit", "configuration", "command_digest"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^inv-[0-9]{6,}-[0-9a-f]{12}$"},
+        "index": {"type": "integer", "minimum": 0},
+        "translation_unit": {"$ref": "#/$defs/nonempty_string"},
+        "configuration": {"$ref": "#/$defs/available_string"},
+        "command_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "kind"],
+      "properties": {
+        "path": {"$ref": "#/$defs/nonempty_string"},
+        "kind": {"enum": ["source", "header", "inline_header", "other"]}
+      }
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "line", "column"],
+      "properties": {
+        "path": {"$ref": "#/$defs/nonempty_string"},
+        "line": {"type": "integer", "minimum": 1},
+        "column": {"type": "integer", "minimum": 1}
+      }
+    },
+    "range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": {"$ref": "#/$defs/location"},
+        "end": {"$ref": "#/$defs/location"}
+      }
+    },
+    "available_string": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value"],
+          "properties": {
+            "status": {"const": "known"},
+            "value": {"$ref": "#/$defs/nonempty_string"}
+          }
+        },
+        {"$ref": "#/$defs/unavailable_value"}
+      ]
+    },
+    "available_location": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value"],
+          "properties": {
+            "status": {"const": "known"},
+            "value": {"$ref": "#/$defs/location"}
+          }
+        },
+        {"$ref": "#/$defs/unavailable_value"}
+      ]
+    },
+    "available_range": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value"],
+          "properties": {
+            "status": {"const": "known"},
+            "value": {"$ref": "#/$defs/range"}
+          }
+        },
+        {"$ref": "#/$defs/unavailable_value"}
+      ]
+    },
+    "available_string_array": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value"],
+          "properties": {
+            "status": {"const": "known"},
+            "value": {
+              "type": "array",
+              "items": {"$ref": "#/$defs/nonempty_string"},
+              "uniqueItems": true
+            }
+          }
+        },
+        {"$ref": "#/$defs/unavailable_value"}
+      ]
+    },
+    "unavailable_value": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "value"],
+      "properties": {
+        "status": {"enum": ["unknown", "unavailable", "not_applicable"]},
+        "value": {"type": "null"}
+      }
+    },
+    "association": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "relationship", "reason_code", "reason"],
+      "properties": {
+        "path": {"$ref": "#/$defs/nonempty_string"},
+        "relationship": {
+          "enum": ["declarations", "inline_definitions", "explicit", "heuristic"]
+        },
+        "reason_code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "reason": {"$ref": "#/$defs/nonempty_string"}
+      }
+    },
+    "provider_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["spelling", "path"],
+      "properties": {
+        "spelling": {"type": "string", "pattern": "^(<[^>]+>|\\\"[^\\\"]+\\\")$"},
+        "path": {"$ref": "#/$defs/nonempty_string"}
+      }
+    },
+    "available_provider": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value"],
+          "properties": {
+            "status": {"const": "known"},
+            "value": {"$ref": "#/$defs/provider_ref"}
+          }
+        },
+        {"$ref": "#/$defs/unavailable_value"}
+      ]
+    },
+    "available_provider_array": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value"],
+          "properties": {
+            "status": {"const": "known"},
+            "value": {
+              "type": "array",
+              "items": {"$ref": "#/$defs/provider_ref"}
+            }
+          }
+        },
+        {"$ref": "#/$defs/unavailable_value"}
+      ]
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selected", "candidates", "chain"],
+      "properties": {
+        "selected": {"$ref": "#/$defs/available_provider"},
+        "candidates": {"$ref": "#/$defs/available_provider_array"},
+        "chain": {"$ref": "#/$defs/available_string_array"}
+      }
+    },
+    "condition_value": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expression", "location", "active_branch"],
+      "properties": {
+        "expression": {"$ref": "#/$defs/nonempty_string"},
+        "location": {"$ref": "#/$defs/available_location"},
+        "active_branch": {"type": "boolean"}
+      }
+    },
+    "condition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value"],
+          "properties": {
+            "status": {"const": "known"},
+            "value": {"$ref": "#/$defs/condition_value"}
+          }
+        },
+        {"$ref": "#/$defs/unavailable_value"}
+      ]
+    },
+    "macro_value": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "definition", "expansion"],
+      "properties": {
+        "name": {"$ref": "#/$defs/nonempty_string"},
+        "definition": {"$ref": "#/$defs/available_location"},
+        "expansion": {"$ref": "#/$defs/available_location"}
+      }
+    },
+    "macro": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value"],
+          "properties": {
+            "status": {"const": "known"},
+            "value": {"$ref": "#/$defs/macro_value"}
+          }
+        },
+        {"$ref": "#/$defs/unavailable_value"}
+      ]
+    },
+    "policy_value": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_file", "rule_id", "decision"],
+      "properties": {
+        "policy_file": {"$ref": "#/$defs/nonempty_string"},
+        "rule_id": {"$ref": "#/$defs/nonempty_string"},
+        "decision": {"enum": ["allow", "deny", "keep", "report"]}
+      }
+    },
+    "policy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value"],
+          "properties": {
+            "status": {"const": "known"},
+            "value": {"$ref": "#/$defs/policy_value"}
+          }
+        },
+        {"$ref": "#/$defs/unavailable_value"}
+      ]
+    },
+    "config_contribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configuration", "subject_action", "disposition", "condition"],
+      "properties": {
+        "configuration": {"$ref": "#/$defs/nonempty_string"},
+        "subject_action": {"enum": ["add", "remove", "keep", "none"]},
+        "disposition": {"enum": ["apply", "keep", "suppress", "report", "not_applicable"]},
+        "condition": {"$ref": "#/$defs/condition"}
+      }
+    },
+    "multi_config": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value"],
+          "properties": {
+            "status": {"const": "known"},
+            "value": {
+              "type": "array",
+              "minItems": 1,
+              "items": {"$ref": "#/$defs/config_contribution"}
+            }
+          }
+        },
+        {"$ref": "#/$defs/unavailable_value"}
+      ]
+    },
+    "use": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["location", "requirement", "origin", "condition", "macro"],
+      "properties": {
+        "location": {"$ref": "#/$defs/location"},
+        "requirement": {
+          "enum": ["full", "forward_declaration", "none", "unknown"]
+        },
+        "origin": {"enum": ["ast", "macro", "heuristic", "unknown"]},
+        "condition": {"$ref": "#/$defs/condition"},
+        "macro": {"$ref": "#/$defs/macro"}
+      }
+    },
+    "declaration_kind": {
+      "enum": [
+        "class", "struct", "union", "scoped_enum", "unscoped_enum",
+        "class_template", "typedef", "using_alias"
+      ]
+    },
+    "available_declaration_kind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "value"],
+          "properties": {
+            "status": {"const": "known"},
+            "value": {"$ref": "#/$defs/declaration_kind"}
+          }
+        },
+        {"$ref": "#/$defs/unavailable_value"}
+      ]
+    },
+    "symbol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "qualified_name", "declaration", "declaration_kind", "uses"],
+      "properties": {
+        "name": {"$ref": "#/$defs/nonempty_string"},
+        "qualified_name": {"$ref": "#/$defs/available_string"},
+        "declaration": {"$ref": "#/$defs/available_location"},
+        "declaration_kind": {"$ref": "#/$defs/available_declaration_kind"},
+        "uses": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/use"}
+        }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "subject_action",
+        "disposition",
+        "item_kind",
+        "spelling",
+        "source_range",
+        "reason_code",
+        "reason",
+        "symbols",
+        "provider",
+        "edit_condition",
+        "policy",
+        "multi_config"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^op-[0-9]+$"},
+        "subject_action": {"enum": ["add", "remove", "keep"]},
+        "disposition": {"enum": ["apply", "keep", "suppress", "report"]},
+        "item_kind": {"enum": ["include", "forward_declaration"]},
+        "spelling": {"$ref": "#/$defs/nonempty_string"},
+        "source_range": {"$ref": "#/$defs/available_range"},
+        "reason_code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "reason": {"$ref": "#/$defs/nonempty_string"},
+        "symbols": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/symbol"}
+        },
+        "provider": {"$ref": "#/$defs/provider"},
+        "edit_condition": {"$ref": "#/$defs/condition"},
+        "policy": {"$ref": "#/$defs/policy"},
+        "multi_config": {"$ref": "#/$defs/multi_config"}
+      }
+    },
+    "desired_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_kind", "spelling", "symbols"],
+      "properties": {
+        "item_kind": {"enum": ["include", "forward_declaration"]},
+        "spelling": {"$ref": "#/$defs/nonempty_string"},
+        "symbols": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/nonempty_string"},
+          "uniqueItems": true
+        }
+      }
+    },
+    "desired_state": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "complete", "items"],
+          "properties": {
+            "status": {"const": "known"},
+            "complete": {"type": "boolean"},
+            "items": {
+              "type": "array",
+              "items": {"$ref": "#/$defs/desired_item"}
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "complete", "items"],
+          "properties": {
+            "status": {"enum": ["unknown", "unavailable", "not_applicable"]},
+            "complete": {"const": false},
+            "items": {"type": "null"}
+          }
+        }
+      ]
+    },
+    "declaration_fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["qualified_name", "kind", "declaration"],
+      "properties": {
+        "qualified_name": {"$ref": "#/$defs/nonempty_string"},
+        "kind": {"$ref": "#/$defs/declaration_kind"},
+        "declaration": {"$ref": "#/$defs/location"}
+      }
+    },
+    "conflicting_declaration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configuration", "kind"],
+      "properties": {
+        "configuration": {"$ref": "#/$defs/nonempty_string"},
+        "kind": {"$ref": "#/$defs/declaration_kind"}
+      }
+    },
+    "declaration_conflict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["qualified_name", "declarations"],
+      "properties": {
+        "qualified_name": {"$ref": "#/$defs/nonempty_string"},
+        "declarations": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/conflicting_declaration"}
+        }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["severity", "code", "message", "location"],
+      "properties": {
+        "severity": {"enum": ["note", "warning", "error"]},
+        "code": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+        "message": {"$ref": "#/$defs/nonempty_string"},
+        "location": {"$ref": "#/$defs/available_location"}
+      }
+    }
+  }
+}

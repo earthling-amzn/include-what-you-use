@@ -28,8 +28,8 @@ Example usage with CMake:
 
 Structured multi-configuration JSON:
 
-  $ iwyu_tool.py -o json --database server=build/server \
-      --database zero=build/zero
+  $ iwyu_tool.py -o json --output-schema 2 \
+      --database server=build/server --database zero=build/zero
 
 See iwyu_tool.py -h for more details on command-line arguments.
 """
@@ -50,6 +50,7 @@ from collections import OrderedDict
 JSON_FORMAT = 'json'
 RESERVED_JSON_OPTIONS = frozenset([
     '--output_format',
+    '--output_schema',
     '--invocation_index',
     '--invocation_id',
     '--command_digest',
@@ -83,6 +84,7 @@ IWYU_LONG_OPTIONS = frozenset([
     '--regex',
     '--experimental',
     '--output_format',
+    '--output_schema',
     '--invocation_index',
     '--invocation_id',
     '--command_digest',
@@ -90,6 +92,16 @@ IWYU_LONG_OPTIONS = frozenset([
     '--project_policy',
     '--configuration',
 ])
+
+DECLARATION_KINDS = frozenset([
+    'class', 'struct', 'union', 'scoped_enum', 'unscoped_enum',
+    'class_template', 'typedef', 'using_alias',
+])
+FORWARD_DECLARABLE_KINDS = frozenset([
+    'class', 'struct', 'union', 'scoped_enum', 'unscoped_enum',
+    'class_template',
+])
+ALIAS_KINDS = frozenset(['typedef', 'using_alias'])
 
 
 CORRECT_RE = re.compile(r'^\((.*?) has correct #includes/fwd-decls\)$')
@@ -516,7 +528,7 @@ class Invocation(object):
                  command_digest=None, invocation_id=None,
                  translation_unit=None, structured_output=False,
                  configuration=None, database_name=None,
-                 database_local_index=None):
+                 database_local_index=None, output_schema_version=1):
         self.command = command
         self.cwd = cwd
         self.database_index = database_index
@@ -527,6 +539,7 @@ class Invocation(object):
         self.configuration = configuration
         self.database_name = database_name
         self.database_local_index = database_local_index
+        self.output_schema_version = output_schema_version
 
     def __str__(self):
         return ' '.join(self.command)
@@ -534,7 +547,8 @@ class Invocation(object):
     @classmethod
     def from_compile_command(cls, entry, extra_args, database_index=None,
                              output_format=DEFAULT_FORMAT, configuration=None,
-                             database_name=None, database_local_index=None):
+                             database_name=None, database_local_index=None,
+                             output_schema_version=1):
         """ Parse a JSON compilation database entry into new Invocation. """
         if 'arguments' in entry:
             # arguments is a command-line in list form.
@@ -552,6 +566,8 @@ class Invocation(object):
             raise ValueError('Compilation command contains only a wrapper')
 
         structured_output = output_format == JSON_FORMAT
+        if type(output_schema_version) is not int or output_schema_version not in (1, 2):
+            raise ValueError('JSON output schema must be version 1 or 2')
         compile_command = command[0]
         windows_args = is_msvc_driver(compile_command)
         extra_args = list(extra_args)
@@ -613,6 +629,9 @@ class Invocation(object):
             '-Xiwyu', '--command_digest=%s' % digest,
             '-Xiwyu', '--translation_unit=%s' % translation_unit,
         ]
+        if output_schema_version != 1:
+            protocol_args.extend([
+                '-Xiwyu', '--output_schema=%d' % output_schema_version])
         if configuration is not None:
             validate_configuration_name(configuration)
             protocol_args.extend([
@@ -622,7 +641,8 @@ class Invocation(object):
         return cls(child_command, entry['directory'], database_index, digest,
                    invocation_id, translation_unit, structured_output=True,
                    configuration=configuration, database_name=database_name,
-                   database_local_index=database_local_index)
+                   database_local_index=database_local_index,
+                   output_schema_version=output_schema_version)
 
     def start(self, verbose):
         """ Run invocation and collect output. """
@@ -779,6 +799,65 @@ def _reject_duplicate_object_keys(pairs):
     return result
 
 
+def _is_location(value):
+    return (isinstance(value, dict) and set(value) == {'path', 'line', 'column'} and
+            isinstance(value['path'], str) and bool(value['path']) and
+            type(value['line']) is int and value['line'] >= 1 and
+            type(value['column']) is int and value['column'] >= 1)
+
+
+def _validate_kind_availability(value):
+    if not isinstance(value, dict) or set(value) != {'status', 'value'}:
+        return False
+    if value['status'] == 'known':
+        return value['value'] in DECLARATION_KINDS
+    return (value['status'] in ('unknown', 'unavailable', 'not_applicable') and
+            value['value'] is None)
+
+
+def _validate_declaration_facts(record):
+    facts = record.get('declaration_facts')
+    if not isinstance(facts, list):
+        raise ProtocolError('schema-v2 declaration_facts are missing')
+    keys = []
+    for fact in facts:
+        if not isinstance(fact, dict) or set(fact) != {
+                'qualified_name', 'kind', 'declaration'}:
+            raise ProtocolError('malformed schema-v2 declaration fact')
+        if not isinstance(fact['qualified_name'], str) or not fact['qualified_name']:
+            raise ProtocolError('declaration fact has invalid qualified_name')
+        if fact['kind'] not in DECLARATION_KINDS:
+            raise ProtocolError('declaration fact has invalid kind')
+        if not _is_location(fact['declaration']):
+            raise ProtocolError('declaration fact has invalid location')
+        keys.append((fact['qualified_name'], fact['kind']))
+    if len(keys) != len(set(keys)):
+        raise ProtocolError('duplicate schema-v2 declaration fact')
+    if keys != sorted(keys):
+        raise ProtocolError('schema-v2 declaration facts are not sorted')
+
+    conflicts = record.get('declaration_conflicts')
+    if conflicts != []:
+        raise ProtocolError(
+            'native schema-v2 declaration_conflicts must be an empty array')
+
+    operations = record.get('operations')
+    if not isinstance(operations, list):
+        raise ProtocolError('record operations are missing')
+    for operation in operations:
+        if not isinstance(operation, dict):
+            raise ProtocolError('record operation is not an object')
+        symbols = operation.get('symbols')
+        if not isinstance(symbols, list):
+            raise ProtocolError('operation symbols are missing')
+        for symbol in symbols:
+            if (not isinstance(symbol, dict) or
+                    not _validate_kind_availability(
+                        symbol.get('declaration_kind'))):
+                raise ProtocolError(
+                    'operation symbol has invalid declaration_kind')
+
+
 def _reject_nonfinite(value):
     raise ProtocolError("non-finite JSON number '%s'" % value)
 
@@ -834,8 +913,10 @@ def _parse_json_object(line):
 
 def _validate_record(record, invocation, previous_path, identities):
     if type(record.get('schema_version')) is not int or \
-            record['schema_version'] != 1:
-        raise ProtocolError('record has unsupported schema_version')
+            record['schema_version'] != invocation.output_schema_version:
+        raise ProtocolError('record has unsupported or unexpected schema_version')
+    if record['schema_version'] == 2:
+        _validate_declaration_facts(record)
     if record.get('record_type') != 'file_analysis':
         raise ProtocolError('record has invalid record_type')
 
@@ -909,6 +990,128 @@ def parse_json_output(output, invocation, identities=None):
             record, invocation, previous_path, identities)
     return lines
 
+
+
+
+def _operation_range_key(source_range):
+    rank = {'known': 0, 'unknown': 1, 'unavailable': 2,
+            'not_applicable': 3}
+    status = source_range['status']
+    if status != 'known':
+        return (rank[status], '', 0, 0, 0, 0)
+    start = source_range['value']['start']
+    end = source_range['value']['end']
+    return (rank[status], start['path'], start['line'], start['column'],
+            end['line'], end['column'])
+
+
+def _operation_sort_key(operation):
+    subject_rank = {'remove': 0, 'add': 1, 'keep': 2}
+    disposition_rank = {'apply': 0, 'keep': 1, 'suppress': 2, 'report': 3}
+    item_rank = {'include': 0, 'forward_declaration': 1}
+    return (subject_rank[operation['subject_action']],
+            disposition_rank[operation['disposition']],
+            item_rank[operation['item_kind']],
+            _operation_range_key(operation['source_range']),
+            operation['spelling'], operation['reason_code'])
+
+def _aggregate_declaration_conflicts(groups, invocations):
+    """Return schema-v2 groups with deterministic cross-config conflict facts.
+
+    Native records contribute only Clang-derived facts. The driver compares
+    stable qualified names for the same analyzed file. If an alias conflicts
+    with a forward-declarable declaration and any configuration proposes a
+    forward declaration, every edit in that record becomes report-only and the
+    desired state is unavailable, so a consumer cannot apply half of an unsafe
+    replacement.
+    """
+    parsed_groups = [
+        [_parse_json_object(line) for line in lines] for lines in groups]
+    by_file = {}
+    for invocation, records in zip(invocations, parsed_groups):
+        if invocation.configuration is None:
+            continue
+        for record in records:
+            by_file.setdefault(record['file']['path'], []).append(
+                (invocation.configuration, record))
+
+    for file_path, configured_records in by_file.items():
+        declarations = {}
+        for configuration, record in configured_records:
+            for fact in record['declaration_facts']:
+                declarations.setdefault(fact['qualified_name'], set()).add(
+                    (configuration, fact['kind']))
+
+        conflicts = []
+        dangerous_names = set()
+        for qualified_name, entries in declarations.items():
+            configurations = {configuration for configuration, _ in entries}
+            kinds = {kind for _, kind in entries}
+            if len(configurations) < 2 or len(kinds) < 2:
+                continue
+            ordered_entries = sorted(entries)
+            conflicts.append({
+                'qualified_name': qualified_name,
+                'declarations': [
+                    {'configuration': configuration, 'kind': kind}
+                    for configuration, kind in ordered_entries],
+            })
+            if kinds & ALIAS_KINDS and kinds & FORWARD_DECLARABLE_KINDS:
+                dangerous_names.add(qualified_name)
+        conflicts.sort(key=lambda conflict: conflict['qualified_name'])
+
+        for _, record in configured_records:
+            record['declaration_conflicts'] = conflicts
+            blocked = False
+            for operation in record['operations']:
+                if (operation.get('subject_action') != 'add' or
+                        operation.get('disposition') != 'apply' or
+                        operation.get('item_kind') != 'forward_declaration'):
+                    continue
+                for symbol in operation.get('symbols', []):
+                    qualified = symbol.get('qualified_name', {})
+                    kind = symbol.get('declaration_kind', {})
+                    if (qualified.get('status') == 'known' and
+                            qualified.get('value') in dangerous_names and
+                            kind.get('status') == 'known' and
+                            kind.get('value') in FORWARD_DECLARABLE_KINDS):
+                        blocked = True
+                        break
+                if blocked:
+                    break
+            if not blocked:
+                continue
+
+            for operation in record['operations']:
+                if operation['disposition'] != 'apply':
+                    continue
+                operation['disposition'] = 'report'
+                operation['reason_code'] = 'declaration_kind_conflict'
+                operation['reason'] = (
+                    'Cross-configuration declaration-kind conflict makes the '
+                    'record unsafe to apply.')
+                multi_config = operation.get('multi_config')
+                if multi_config.get('status') == 'known':
+                    for contribution in multi_config['value']:
+                        if contribution['disposition'] == 'apply':
+                            contribution['disposition'] = 'report'
+            record['operations'].sort(key=_operation_sort_key)
+            for index, operation in enumerate(record['operations'], 1):
+                operation['id'] = 'op-%d' % index
+            record['status'] = 'skipped'
+            record['desired_state'] = {
+                'status': 'unavailable', 'complete': False, 'items': None}
+            record['diagnostics'].append({
+                'severity': 'warning',
+                'code': 'declaration_kind_conflict',
+                'message': (
+                    'Cross-configuration declaration kinds conflict; no '
+                    'edits from this record may be applied.'),
+                'location': {'status': 'unavailable', 'value': None},
+            })
+
+    return [[_json_dumps_canonical(record) for record in records]
+            for records in parsed_groups]
 
 def _protocol_error_context(invocation):
     if invocation.database_name is None:
@@ -994,6 +1197,9 @@ def execute_json(invocations, verbose, jobs, max_load_average=0):
 
     if errors:
         return max(exit_code, 1)
+    if groups and all(invocation.output_schema_version == 2
+                      for invocation in ordered):
+        groups = _aggregate_declaration_conflicts(groups, ordered)
     for lines in groups:
         for line in lines:
             sys.stdout.write(line + '\n')
@@ -1013,7 +1219,7 @@ def _deduplicate_selected_entries(compilation_db):
 
 def main(compilation_db_path, source_files, verbose, formatter, jobs,
          max_load_average, extra_args, output_format=DEFAULT_FORMAT,
-         named_databases=None):
+         named_databases=None, output_schema_version=1):
     """Run IWYU for one legacy database or ordered named databases."""
 
     try:
@@ -1025,6 +1231,10 @@ def main(compilation_db_path, source_files, verbose, formatter, jobs,
     if not IWYU_EXECUTABLE:
         print('error: include-what-you-use executable not found',
               file=sys.stderr)
+        return 1
+
+    if output_format != JSON_FORMAT and output_schema_version != 1:
+        print('error: --output-schema requires JSON output', file=sys.stderr)
         return 1
 
     named_databases = list(named_databases or [])
@@ -1079,7 +1289,8 @@ def main(compilation_db_path, source_files, verbose, formatter, jobs,
                 invocations.append(Invocation.from_compile_command(
                     entry, extra_args, invocation_base + local_index,
                     output_format, configuration=name, database_name=name,
-                    database_local_index=local_index))
+                    database_local_index=local_index,
+                    output_schema_version=output_schema_version))
     except (KeyError, TypeError, ValueError) as why:
         print('error: failed to prepare IWYU invocation: %s' % why,
               file=sys.stderr)
@@ -1128,6 +1339,9 @@ def _bootstrap(sys_argv):
                         choices=list(FORMATTERS.keys()) + [JSON_FORMAT],
                         default=DEFAULT_FORMAT,
                         help='Output format (default: %s)' % DEFAULT_FORMAT)
+    parser.add_argument('--output-schema', type=int, choices=[1, 2], default=1,
+                        help=('Structured JSON schema version; version 2 adds '
+                              'declaration conflict aggregation'))
     parser.add_argument('-j', '--jobs', type=_positive_jobs, default=1,
                         help='Number of concurrent subprocesses')
     parser.add_argument('-l', '--load', type=float, default=0,
@@ -1159,7 +1373,8 @@ def _bootstrap(sys_argv):
     return main(args.dbpath, args.source, args.verbose,
                 FORMATTERS.get(args.output_format), args.jobs, args.load,
                 extra_args, args.output_format,
-                named_databases=args.databases)
+                named_databases=args.databases,
+                output_schema_version=args.output_schema)
 
 
 if __name__ == '__main__':

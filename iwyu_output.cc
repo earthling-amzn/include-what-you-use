@@ -60,6 +60,8 @@ using clang::SourceLocation;
 using clang::SourceRange;
 using clang::TagDecl;
 using clang::TemplateDecl;
+using clang::TypeAliasDecl;
+using clang::TypedefDecl;
 using clang::UsingDecl;
 using llvm::cast;
 using llvm::dyn_cast;
@@ -2504,6 +2506,28 @@ void IwyuFileInfo::ResolvePendingAnalysis() {
 
 namespace {
 
+string StructuredDeclarationKind(const NamedDecl* decl) {
+  if (!decl)
+    return string();
+  if (isa<ClassTemplateDecl>(decl))
+    return "class_template";
+  if (isa<TypeAliasDecl>(decl))
+    return "using_alias";
+  if (isa<TypedefDecl>(decl))
+    return "typedef";
+  if (const EnumDecl* enum_decl = dyn_cast<EnumDecl>(decl))
+    return enum_decl->isScoped() ? "scoped_enum" : "unscoped_enum";
+  if (const RecordDecl* record_decl = dyn_cast<RecordDecl>(decl)) {
+    if (record_decl->isUnion())
+      return "union";
+    if (record_decl->isStruct())
+      return "struct";
+    if (record_decl->isClass())
+      return "class";
+  }
+  return string();
+}
+
 llvm::json::Object UnavailableValue() {
   return llvm::json::Object{{"status", "unavailable"}, {"value", nullptr}};
 }
@@ -2771,13 +2795,16 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
                       {"expansion", NotApplicableValue()}}}}}});
         }
         const MacroFact& first = facts[begin];
-        symbols.push_back(llvm::json::Object{
+        llvm::json::Object symbol{
             {"name", first.fact->symbol_name},
             {"qualified_name", KnownString(first.fact->qualified_name)},
             {"declaration", llvm::json::Object{
                 {"status", "known"},
                 {"value", LocationObject(first.declaration)}}},
-            {"uses", std::move(uses)}});
+            {"uses", std::move(uses)}};
+        if (GlobalFlags().output_schema_version >= 2)
+          symbol["declaration_kind"] = UnavailableValue();
+        symbols.push_back(std::move(symbol));
         begin = end;
       }
       return symbols;
@@ -2882,6 +2909,13 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       symbol["declaration"] = declaration_fact
           ? AvailableLocation(declaration_fact->use->decl_loc(), false)
           : UnavailableValue();
+      if (GlobalFlags().output_schema_version >= 2) {
+        const string declaration_kind = declaration_fact
+            ? StructuredDeclarationKind(declaration_fact->use->decl())
+            : string();
+        symbol["declaration_kind"] = declaration_kind.empty()
+            ? UnavailableValue() : KnownString(declaration_kind);
+      }
       symbol["uses"] = std::move(uses);
       symbols.push_back(std::move(symbol));
       begin = end;
@@ -3297,8 +3331,48 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
     desired_state["items"] = std::move(desired_items);
   }
 
+  llvm::json::Array declaration_facts;
+  if (flags.output_schema_version >= 2) {
+    struct DeclarationFact {
+      string qualified_name;
+      string kind;
+      StructuredLocationValue declaration;
+    };
+    vector<DeclarationFact> facts;
+    for (const OneUse& use : symbol_uses_) {
+      if (!use.decl())
+        continue;
+      const string kind = StructuredDeclarationKind(use.decl());
+      if (kind.empty() || use.symbol_name().empty())
+        continue;
+      StructuredLocationValue declaration;
+      if (!StructuredLocation(use.decl_loc(), false, &declaration))
+        continue;
+      facts.push_back({use.symbol_name(), kind, declaration});
+    }
+    std::sort(facts.begin(), facts.end(), [](const DeclarationFact& lhs,
+                                             const DeclarationFact& rhs) {
+      return std::tie(lhs.qualified_name, lhs.kind, lhs.declaration.path,
+                      lhs.declaration.line, lhs.declaration.column) <
+             std::tie(rhs.qualified_name, rhs.kind, rhs.declaration.path,
+                      rhs.declaration.line, rhs.declaration.column);
+    });
+    facts.erase(std::unique(
+        facts.begin(), facts.end(), [](const DeclarationFact& lhs,
+                                      const DeclarationFact& rhs) {
+          return lhs.qualified_name == rhs.qualified_name &&
+                 lhs.kind == rhs.kind;
+        }), facts.end());
+    for (const DeclarationFact& fact : facts) {
+      declaration_facts.push_back(llvm::json::Object{
+          {"qualified_name", fact.qualified_name},
+          {"kind", fact.kind},
+          {"declaration", LocationObject(fact.declaration)}});
+    }
+  }
+
   llvm::json::Object record;
-  record["schema_version"] = 1;
+  record["schema_version"] = flags.output_schema_version;
   record["record_type"] = "file_analysis";
   record["tool"] = std::move(tool);
   record["invocation"] = std::move(invocation);
@@ -3324,6 +3398,10 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
   record["operations"] = std::move(operation_values);
   record["desired_state"] = std::move(desired_state);
   record["diagnostics"] = std::move(diagnostics);
+  if (flags.output_schema_version >= 2) {
+    record["declaration_facts"] = std::move(declaration_facts);
+    record["declaration_conflicts"] = llvm::json::Array{};
+  }
 
   llvm::outs() << llvm::json::Value(std::move(record)) << '\n';
 }

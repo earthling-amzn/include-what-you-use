@@ -126,6 +126,7 @@ struct CommandlineFlags {
   set<string> exp_flags;       // Experimental flags.
   RegexDialect regex_dialect;  // Dialect for regular expression processing.
   OutputFormat output_format;  // Human-readable text or JSON Lines.
+  int output_schema_version;  // Structured-output schema; defaults to v1.
   int64_t invocation_index;
   string invocation_id;
   string command_digest;
@@ -134,6 +135,7 @@ struct CommandlineFlags {
   bool has_command_digest;
   bool has_translation_unit;
   bool has_invocation_id;
+  bool has_output_schema;
   string project_policy_file;
   string configuration;
   bool has_project_policy;
