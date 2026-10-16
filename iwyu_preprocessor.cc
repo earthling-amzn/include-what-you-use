@@ -872,6 +872,31 @@ void IwyuPreprocessorInfo::MacroDefined(const Token& id,
     macros_definition_loc_[GetName(id)] = macro_loc;
 
   const string macro_name = GetName(id);
+  // A direct redefinition in the same entered file instance supersedes the
+  // prior definition even without an intervening #undef. A definition in a
+  // downstream file does not retire an exported header's earlier record.
+  if (macro_loc.isValid()) {
+    const auto& source_manager = preprocessor_->getSourceManager();
+    const SourceLocation new_loc = source_manager.getSpellingLoc(macro_loc);
+    if (new_loc.isValid() && new_loc.isFileID()) {
+      for (auto previous = macro_body_dependencies_.rbegin();
+           previous != macro_body_dependencies_.rend(); ++previous) {
+        if (previous->macro_name != macro_name ||
+            previous->retired_in_defining_instance) {
+          continue;
+        }
+        const SourceLocation previous_loc = source_manager.getSpellingLoc(
+            previous->definition_location);
+        if (previous_loc.isValid() && previous_loc.isFileID() &&
+            source_manager.getFileID(previous_loc) ==
+                source_manager.getFileID(new_loc)) {
+          previous->retired_in_defining_instance = true;
+        }
+        break;
+      }
+    }
+  }
+
   if (macro_loc.isValid() && macro->isFunctionLike()) {
     const set<const clang::IdentifierInfo*> parameters(macro->param_begin(),
                                                         macro->param_end());
@@ -1477,9 +1502,16 @@ struct MacroLookupFact {
   bool is_using_exposure;
 };
 
+struct NamespaceAliasFact {
+  string alias_name;
+  string target_name;
+  SourceLocation exposure_location;
+};
+
 struct MacroDeclarationIndex {
   map<string, vector<MacroLookupFact>> lookups;
   map<const NamedDecl*, vector<SourceLocation>> identity_locations;
+  vector<NamespaceAliasFact> namespace_aliases;
 };
 
 string AbsoluteQualifiedName(const NamedDecl* decl) {
@@ -1521,6 +1553,15 @@ void IndexMacroBodyDeclarations(const clang::DeclContext* context,
       }
     }
 
+    if (const auto* alias = clang::dyn_cast<clang::NamespaceAliasDecl>(decl)) {
+      const string alias_name = AbsoluteQualifiedName(alias);
+      const string target_name = AbsoluteQualifiedName(alias->getNamespace());
+      if (!alias_name.empty() && !target_name.empty()) {
+        index->namespace_aliases.push_back(
+            {alias_name, target_name, GetLocation(alias)});
+      }
+    }
+
     // Function bodies contain arbitrary local names that cannot establish the
     // declaration identity of an unexpanded macro. Namespace and record
     // contexts do carry qualified declaration and using-exposure identities.
@@ -1528,6 +1569,28 @@ void IndexMacroBodyDeclarations(const clang::DeclContext* context,
       continue;
     if (const auto* child = clang::dyn_cast<clang::DeclContext>(decl))
       IndexMacroBodyDeclarations(child, index);
+  }
+}
+
+void IndexNamespaceAliasLookups(MacroDeclarationIndex* index) {
+  // NamespaceAliasDecl::getNamespace returns the ultimate namespace target, so
+  // this projection also handles alias chains without parsing source text.
+  const auto direct_lookups = index->lookups;
+  for (const NamespaceAliasFact& alias : index->namespace_aliases) {
+    for (const auto& lookup : direct_lookups) {
+      if (lookup.first.size() <= alias.target_name.size() ||
+          !StartsWith(lookup.first, alias.target_name + "::")) {
+        continue;
+      }
+      const string exposed_name =
+          alias.alias_name + lookup.first.substr(alias.target_name.size());
+      for (const MacroLookupFact& fact : lookup.second) {
+        if (fact.is_using_exposure)
+          continue;
+        index->lookups[exposed_name].push_back(
+            {fact.identity, alias.exposure_location, true});
+      }
+    }
   }
 }
 
@@ -1572,15 +1635,23 @@ bool QualifiedLookupMatches(const string& indexed_name,
          EndsWith(indexed_name, "::" + reference);
 }
 
+struct MacroDependencyReport {
+  string macro_name;
+  string reference;
+  string resolved_name;
+  bool unavailable;
+};
+
 }  // namespace
 
 void IwyuPreprocessorInfo::ResolveMacroBodyDependencies(
     clang::ASTContext& context) {
   MacroDeclarationIndex declarations;
   IndexMacroBodyDeclarations(context.getTranslationUnitDecl(), &declarations);
+  IndexNamespaceAliasLookups(&declarations);
 
   const auto& source_manager = preprocessor_->getSourceManager();
-  set<pair<const FileEntry*, const FileEntry*>> reported;
+  map<pair<const FileEntry*, const FileEntry*>, MacroDependencyReport> reports;
 
   for (const MacroBodyDependency& body : macro_body_dependencies_) {
     if (body.retired_in_defining_instance)
@@ -1591,7 +1662,6 @@ void IwyuPreprocessorInfo::ResolveMacroBodyDependencies(
     const FileEntry* macro_file = GetFileEntry(macro_loc);
     if (!macro_file || macro_loc.isInvalid() || !macro_loc.isFileID())
       continue;
-    IwyuFileInfo* macro_file_info = GetFromFileInfoMap(macro_file);
     const FileID macro_file_id = source_manager.getFileID(macro_loc);
 
     vector<const DirectIncludeCondition*> direct_occurrences;
@@ -1613,27 +1683,13 @@ void IwyuPreprocessorInfo::ResolveMacroBodyDependencies(
 
     const auto instance_contains_location =
         [&](const DirectIncludeCondition* root, SourceLocation location) {
-          if (!root->includee_file_id.isValid())
-            return false;
-          if (FileIdContains(source_manager, root->includee_file_id, location))
-            return true;
-          const FileEntry* location_file = GetFileEntry(location);
-          if (!location_file)
-            return false;
-          for (const DirectIncludeCondition& nested :
-               direct_include_conditions_) {
-            if (nested.includee != location_file ||
-                !FileIdContains(source_manager, root->includee_file_id,
-                                nested.location)) {
-              continue;
-            }
-            return true;
-          }
-          return false;
+          return root->includee_file_id.isValid() &&
+                 FileIdContains(source_manager, root->includee_file_id,
+                                location);
         };
 
     for (const MacroBodyReference& reference : body.references) {
-      if (reference.was_macro || reference.components.empty())
+      if (reference.components.empty())
         continue;
       const string spelling = MacroReferenceSpelling(
           reference.components, reference.globally_qualified);
@@ -1672,26 +1728,17 @@ void IwyuPreprocessorInfo::ResolveMacroBodyDependencies(
                 instance_contains_location(include, fact.exposure_location);
           }
 
-          bool contains_declaration = false;
-          if (include->includee_file_id.isValid()) {
-            contains_declaration = std::any_of(
-                identity_locations.begin(), identity_locations.end(),
-                [&](SourceLocation location) {
-                  return instance_contains_location(include, location);
-                });
-          } else {
-            // A guard-skipped direct include has no entered FileID. Only an
-            // exact physical declaration provider is safe to infer here.
-            contains_declaration = std::any_of(
-                identity_locations.begin(), identity_locations.end(),
-                [&](SourceLocation location) {
-                  return GetFileEntry(location) == include->includee;
-                });
-            if (fact.is_using_exposure)
-              exposes_lookup = false;
-          }
+          const bool contains_declaration =
+              include->includee_file_id.isValid() &&
+              std::any_of(identity_locations.begin(), identity_locations.end(),
+                          [&](SourceLocation location) {
+                            return instance_contains_location(include, location);
+                          });
           if (exposes_lookup && contains_declaration) {
-            providers.insert(include->includee);
+            if (reference.was_macro)
+              uncertain_providers.insert(include->includee);
+            else
+              providers.insert(include->includee);
             continue;
           }
 
@@ -1740,37 +1787,50 @@ void IwyuPreprocessorInfo::ResolveMacroBodyDependencies(
       if (unique)
         resolved_name = AbsoluteQualifiedName(*identities.begin());
       for (const FileEntry* provider : providers) {
-        if (!reported.insert({macro_file, provider}).second)
-          continue;
-        if (unique) {
-          macro_file_info->ReportKnownDesiredFile(
-              provider, "macro_body_dependency",
-              "Function-like macro " + body.macro_name + " reference " +
-                  spelling + " resolves uniquely to declaration " +
-                  resolved_name +
-                  " through this direct effective provider.");
-          ERRSYM(macro_file)
-              << "Keep #include " << provider->getName() << " in "
-              << macro_file->getName() << " because function-like macro "
-              << body.macro_name << " reference " << spelling
-              << " resolves uniquely to " << resolved_name
-              << " through that direct effective provider.\n";
-        } else {
-          macro_file_info->ReportKnownDesiredFile(
-              provider, "macro_body_dependency_unavailable",
-              "Function-like macro " + body.macro_name + " reference " +
-                  spelling +
-                  " has ambiguous declaration or provider identity; schema-v1 "
-                  "provenance is unavailable, so the present candidate is "
-                  "retained conservatively.");
-          ERRSYM(macro_file)
-              << "Keep #include " << provider->getName() << " in "
-              << macro_file->getName() << " because function-like macro "
-              << body.macro_name << " reference " << spelling
-              << " is ambiguous; retain the candidate with unavailable "
-                 "provenance.\n";
+        const auto key = make_pair(macro_file, provider);
+        const bool unavailable = !unique;
+        auto report = reports.find(key);
+        if (report == reports.end() ||
+            (unavailable && !report->second.unavailable)) {
+          reports[key] =
+              {body.macro_name, spelling, resolved_name, unavailable};
         }
       }
+    }
+  }
+
+  for (const auto& entry : reports) {
+    const FileEntry* macro_file = entry.first.first;
+    const FileEntry* provider = entry.first.second;
+    const MacroDependencyReport& report = entry.second;
+    IwyuFileInfo* macro_file_info = GetFromFileInfoMap(macro_file);
+    if (!report.unavailable) {
+      macro_file_info->ReportKnownDesiredFile(
+          provider, "macro_body_dependency",
+          "Function-like macro " + report.macro_name + " reference " +
+              report.reference + " resolves uniquely to declaration " +
+              report.resolved_name +
+              " through this direct effective provider.");
+      ERRSYM(macro_file)
+          << "Keep #include " << provider->getName() << " in "
+          << macro_file->getName() << " because function-like macro "
+          << report.macro_name << " reference " << report.reference
+          << " resolves uniquely to " << report.resolved_name
+          << " through that direct effective provider.\n";
+    } else {
+      macro_file_info->ReportKnownDesiredFile(
+          provider, "macro_body_dependency_unavailable",
+          "Function-like macro " + report.macro_name + " reference " +
+              report.reference +
+              " has ambiguous declaration or provider identity; schema-v1 "
+              "provenance is unavailable, so the present candidate is "
+              "retained conservatively.");
+      ERRSYM(macro_file)
+          << "Keep #include " << provider->getName() << " in "
+          << macro_file->getName() << " because function-like macro "
+          << report.macro_name << " reference " << report.reference
+          << " is ambiguous; retain the candidate with unavailable "
+             "provenance.\n";
     }
   }
 }

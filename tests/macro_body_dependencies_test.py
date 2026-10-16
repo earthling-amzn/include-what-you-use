@@ -52,7 +52,7 @@ def write_sources(root, sources):
 
 def run_reviewer_case(*, root, analyzer, compiler, fixer, name, sources,
                       retained=(), removed=(), provenance=None,
-                      consumers=("future.cpp",)):
+                      consumers=("future.cpp",), link_sources=()):
     case_root = root / "reviewer" / name
     case_root.mkdir(parents=True)
     write_sources(case_root, sources)
@@ -77,25 +77,36 @@ def run_reviewer_case(*, root, analyzer, compiler, fixer, name, sources,
         for operation in record["operations"]
     ]
     macro_operations = {
-        operation["spelling"]: operation["reason_code"]
+        operation["spelling"]: operation
         for operation in operations
         if operation["reason_code"].startswith("macro_body_dependency")
     }
-    for operation in operations:
-        if operation["reason_code"] != "macro_body_dependency_unavailable":
-            continue
+    for operation in macro_operations.values():
+        reason_code = operation["reason_code"]
+        expected_status = (
+            "unavailable"
+            if reason_code == "macro_body_dependency_unavailable"
+            else "not_applicable"
+        )
+        if (operation["disposition"], operation["subject_action"],
+                operation["item_kind"]) != ("keep", "remove", "include"):
+            raise AssertionError(
+                f"{name}: malformed macro keep operation: {operation}"
+            )
         for field in ("selected", "candidates", "chain"):
-            if operation["provider"][field]["status"] != "unavailable":
+            if operation["provider"][field]["status"] != expected_status:
                 raise AssertionError(
-                    f"{name}: ambiguous {field} provenance was not unavailable"
+                    f"{name}: {reason_code} {field} provenance was not "
+                    f"{expected_status}: {operation}"
                 )
     if provenance is not None:
         for header, reason_code in provenance.items():
             matches = [
-                code for spelling, code in macro_operations.items()
+                operation for spelling, operation in macro_operations.items()
                 if header in spelling
             ]
-            if matches != [reason_code]:
+            if (len(matches) != 1 or
+                    matches[0]["reason_code"] != reason_code):
                 raise AssertionError(
                     f"{name}: expected {header} provenance {reason_code}, "
                     f"got {macro_operations}"
@@ -122,7 +133,7 @@ def run_reviewer_case(*, root, analyzer, compiler, fixer, name, sources,
     for index, consumer in enumerate(consumers):
         executable = case_root / f"future-{index}"
         run([compiler, "-std=c++17", "-I", ".", consumer,
-             "-o", str(executable)], cwd=case_root)
+             *link_sources, "-o", str(executable)], cwd=case_root)
         run([str(executable)], cwd=case_root)
 
 
@@ -334,6 +345,152 @@ def run_reviewer_reproducers(*, root, analyzer, compiler, fixer):
             },
             "removed": ("size-provider.h",),
             "provenance": {},
+        },
+        {
+            "name": "namespace-alias-chain",
+            "sources": {
+                "impl.h": (
+                    "#pragma once\nnamespace implementation {\n"
+                    "int select(int value);\n}\n"
+                ),
+                "impl.cpp": (
+                    "#include \"impl.h\"\nnamespace implementation {\n"
+                    "int select(int value) { return value + 10; }\n}\n"
+                ),
+                "wrapper.h": (
+                    "#pragma once\n#include \"impl.h\"\n"
+                    "namespace internal_api = implementation;\n"
+                    "namespace api = internal_api;\n"
+                ),
+                "decoy.h": "#pragma once\nstruct AliasDecoy {};\n",
+                "export.h": (
+                    "#pragma once\n#include \"wrapper.h\"\n"
+                    "#include \"decoy.h\"\n"
+                    "#define ALIAS_SELECT(value) ::api::select(value)\n"
+                ),
+                "analysis.cc": "#include \"export.h\"\nint analysis_anchor;\n",
+                "future.cpp": (
+                    "#include \"export.h\"\nint main() { "
+                    "return ALIAS_SELECT(1) == 11 ? 0 : 1; }\n"
+                ),
+            },
+            "retained": ("wrapper.h",),
+            "removed": ("decoy.h",),
+            "provenance": {"wrapper.h": "macro_body_dependency"},
+            "link_sources": ("impl.cpp",),
+        },
+        {
+            "name": "nested-macro-later-undef",
+            "sources": {
+                "function-provider.h": (
+                    "#pragma once\nint INNER_SELECT(int value);\n"
+                ),
+                "function-provider.cpp": (
+                    "#include \"function-provider.h\"\n"
+                    "int INNER_SELECT(int value) { return value + 2; }\n"
+                ),
+                "nested-macro.h": (
+                    "#pragma once\n#define INNER_SELECT(value) ((value) + 20)\n"
+                ),
+                "export.h": (
+                    "#pragma once\n#include \"function-provider.h\"\n"
+                    "#include \"nested-macro.h\"\n"
+                    "#define OUTER_SELECT(value) INNER_SELECT(value)\n"
+                    "#ifdef EXPOSE_INNER_FUNCTION\n#undef INNER_SELECT\n#endif\n"
+                ),
+                "analysis.cc": "#include \"export.h\"\nint analysis_anchor;\n",
+                "future-macro.cpp": (
+                    "#include \"export.h\"\nint main() { "
+                    "return OUTER_SELECT(1) == 21 ? 0 : 1; }\n"
+                ),
+                "future-function.cpp": (
+                    "#define EXPOSE_INNER_FUNCTION\n#include \"export.h\"\n"
+                    "int main() { return OUTER_SELECT(1) == 3 ? 0 : 1; }\n"
+                ),
+            },
+            "retained": ("function-provider.h", "nested-macro.h"),
+            "provenance": {
+                "function-provider.h":
+                    "macro_body_dependency_unavailable",
+            },
+            "consumers": ("future-macro.cpp", "future-function.cpp"),
+            "link_sources": ("function-provider.cpp",),
+        },
+        {
+            "name": "guard-skipped-nested-include",
+            "sources": {
+                "provider.h": (
+                    "#pragma once\nnamespace guard_skipped {\n"
+                    "inline int select(int value) { return value + 12; }\n}\n"
+                ),
+                "wrapper.h": "#pragma once\n#include \"provider.h\"\n",
+                "export.h": (
+                    "#pragma once\n#include \"wrapper.h\"\n"
+                    "#define GUARD_SKIPPED_SELECT(value) "
+                    "::guard_skipped::select(value)\n"
+                ),
+                "analysis.cc": (
+                    "#include \"provider.h\"\n#include \"export.h\"\n"
+                    "int analysis_anchor;\n"
+                ),
+                "future.cpp": (
+                    "#include \"export.h\"\nint main() { "
+                    "return GUARD_SKIPPED_SELECT(1) == 13 ? 0 : 1; }\n"
+                ),
+            },
+            "retained": ("wrapper.h",),
+            "provenance": {
+                "wrapper.h": "macro_body_dependency_unavailable",
+            },
+        },
+        {
+            "name": "same-file-direct-redefine",
+            "sources": {
+                "old.h": (
+                    "#pragma once\nstruct RedefOld { int value = 1; };\n"
+                ),
+                "new.h": (
+                    "#pragma once\nstruct RedefNew { int value = 2; };\n"
+                ),
+                "export.h": (
+                    "#pragma once\n#include \"old.h\"\n#include \"new.h\"\n"
+                    "#define DIRECT_REDEFINE() RedefOld{}\n"
+                    "#define DIRECT_REDEFINE() RedefNew{}\n"
+                ),
+                "analysis.cc": "#include \"export.h\"\nint analysis_anchor;\n",
+                "future.cpp": (
+                    "#include \"export.h\"\nint main() { "
+                    "return DIRECT_REDEFINE().value == 2 ? 0 : 1; }\n"
+                ),
+            },
+            "retained": ("new.h",),
+            "removed": ("old.h",),
+            "provenance": {"new.h": "macro_body_dependency"},
+        },
+        {
+            "name": "downstream-direct-redefine",
+            "sources": {
+                "provider.h": (
+                    "#pragma once\nnamespace downstream_direct {\n"
+                    "inline int select(int value) { return value + 13; }\n}\n"
+                ),
+                "export.h": (
+                    "#pragma once\n#include \"provider.h\"\n"
+                    "#define DOWNSTREAM_DIRECT(value) "
+                    "::downstream_direct::select(value)\n"
+                ),
+                "analysis.cc": (
+                    "#include \"export.h\"\n"
+                    "#define DOWNSTREAM_DIRECT(value) (value)\n"
+                    "int analysis_anchor;\n"
+                ),
+                "future.cpp": (
+                    "#include \"export.h\"\nint main() { "
+                    "return DOWNSTREAM_DIRECT(1) == 14 ? 0 : 1; }\n"
+                ),
+            },
+            "retained": ("provider.h",),
+            "provenance": {"provider.h": "macro_body_dependency"},
         },
         {
             "name": "ambiguous-unqualified",
