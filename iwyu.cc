@@ -92,6 +92,7 @@
 #include <cstdlib>                      // for atoi, exit
 #include <cstring>
 #include <deque>                        // for swap
+#include <functional>                   // for function
 #include <iterator>                     // for find
 #include <list>                         // for swap
 #include <map>                          // for map, swap, etc
@@ -124,9 +125,11 @@
 #include "clang/AST/DeclBase.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclTemplate.h"
+#include "clang/AST/EvaluatedExprVisitor.h"
 #include "clang/AST/ExprConcepts.h"
 #include "clang/AST/NestedNameSpecifier.h"
 #include "clang/AST/OperationKinds.h"
+#include "clang/AST/ParentMapContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/TemplateBase.h"
 #include "clang/AST/Type.h"
@@ -1952,6 +1955,10 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     // TODO(csilvers): we should be reporting a fwd-decl use for
     // GetTypeOf(expr), not on deref_base_type.
     ReportTypeUse(CurrentLoc(), deref_base_type);
+    if (auto* function = dyn_cast<FunctionDecl>(expr->getMemberDecl())) {
+      if (HandleInlineDefinitionOdrUse(function, expr))
+        ReportDeclUse(expr->getExprLoc(), function);
+    }
     return true;
   }
 
@@ -2284,6 +2291,191 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     return true;
   }
 
+  class PotentiallyEvaluatedExprFinder
+      : public clang::ConstEvaluatedExprVisitor<
+            PotentiallyEvaluatedExprFinder> {
+    using EvalBase =
+        clang::ConstEvaluatedExprVisitor<PotentiallyEvaluatedExprFinder>;
+
+   public:
+    PotentiallyEvaluatedExprFinder(const ASTContext& context,
+                                   const Stmt* target)
+        : EvalBase(context), target_(target) {}
+
+    bool shouldVisitDiscardedStmt() const { return false; }
+
+    void VisitStmt(const Stmt* stmt) {
+      if (stmt == target_)
+        found_ = true;
+      EvalBase::VisitStmt(stmt);
+    }
+
+    void VisitDeclRefExpr(const DeclRefExpr* expr) {
+      if (expr == target_)
+        found_ = true;
+    }
+
+    void VisitMemberExpr(const MemberExpr* expr) {
+      if (expr == target_)
+        found_ = true;
+      EvalBase::VisitMemberExpr(expr);
+    }
+
+    bool found() const { return found_; }
+
+   private:
+    const Stmt* target_;
+    bool found_ = false;
+  };
+
+  // Clang's EvaluatedExprVisitor encodes sizeof/noexcept and discarded
+  // if-constexpr semantics. Climb Clang's semantic parent map to the complete
+  // expression owned by a declaration; the traversal stack alone omits
+  // wrappers reached through TypeLocs, such as decltype.
+  bool IsPotentiallyEvaluated(const Expr* expr) {
+    if (!expr)
+      return false;
+    if (current_ast_node()->
+            template HasAncestorOfType<clang::DecltypeType>() ||
+        current_ast_node()->
+            template HasAncestorOfType<clang::TypeOfExprType>()) {
+      return false;
+    }
+    ASTContext& context = compiler()->getASTContext();
+    using clang::DynTypedNode;
+    std::function<bool(DynTypedNode, const Stmt*, unsigned)> evaluate_from =
+        [&](DynTypedNode node, const Stmt* root, unsigned depth) {
+          if (depth > 128)
+            return false;
+          const auto parents = context.getParents(node);
+          if (parents.empty())
+            return false;
+          for (const DynTypedNode& parent : parents) {
+            if (parent.get<clang::DecltypeType>() ||
+                parent.get<clang::TypeOfExprType>()) {
+              continue;
+            }
+            if (const Decl* owner = parent.get<Decl>()) {
+              if (!root || isa<ParmVarDecl>(owner))
+                continue;
+              if (const auto* function = dyn_cast<FunctionDecl>(owner)) {
+                if (function->isDeleted() || function->isDefaulted())
+                  continue;
+              }
+              PotentiallyEvaluatedExprFinder finder(context, expr);
+              finder.Visit(root);
+              if (finder.found())
+                return true;
+              continue;
+            }
+            const Stmt* next_root = root;
+            if (const Stmt* parent_stmt = parent.get<Stmt>())
+              next_root = parent_stmt;
+            if (evaluate_from(parent, next_root, depth + 1))
+              return true;
+          }
+          return false;
+        };
+    return evaluate_from(DynTypedNode::create(*expr), expr, 0);
+  }
+
+  bool IsPureVirtualDispatch(const FunctionDecl* callee,
+                             const Expr* calling_expr) {
+    const auto* method = dyn_cast<CXXMethodDecl>(callee);
+    if (!method || !method->isPure())
+      return false;
+
+    const clang::CXXMemberCallExpr* call =
+        dyn_cast_or_null<clang::CXXMemberCallExpr>(calling_expr);
+    if (!call && llvm::isa_and_nonnull<MemberExpr>(calling_expr)) {
+      call = current_ast_node()->
+          template GetAncestorAs<clang::CXXMemberCallExpr>();
+    }
+    if (!call)
+      return false;
+    const auto* member = dyn_cast<MemberExpr>(
+        call->getCallee()->IgnoreParenImpCasts());
+    return member && member->performsVirtualDispatch(
+                         compiler()->getLangOpts());
+  }
+
+  bool IsInlineDefinitionEligible(const FunctionDecl* callee) const {
+    if (callee->getTemplatedKind() == FunctionDecl::TK_NonTemplate)
+      return true;
+    return callee->getTemplatedKind() ==
+               FunctionDecl::TK_FunctionTemplateSpecialization &&
+           callee->getTemplateSpecializationKind() ==
+               clang::TSK_ExplicitSpecialization;
+  }
+
+  bool IsPotentiallyEvaluatedOdrUse(const FunctionDecl* callee,
+                                    const Expr* expr) {
+    if (!callee || callee->isDeleted() || callee->isDefaulted() ||
+        !IsPotentiallyEvaluated(expr) ||
+        IsPureVirtualDispatch(callee, expr)) {
+      return false;
+    }
+    if (const auto* decl_ref = dyn_cast<DeclRefExpr>(expr)) {
+      if (decl_ref->isNonOdrUse() != clang::NOUR_None)
+        return false;
+    }
+    if (const auto* member = dyn_cast<MemberExpr>(expr)) {
+      if (member->isNonOdrUse() != clang::NOUR_None)
+        return false;
+    }
+    return true;
+  }
+
+  bool HandleInlineDefinitionOdrUse(FunctionDecl* callee,
+                                    const Expr* expr) {
+    if (!IsPotentiallyEvaluatedOdrUse(callee, expr))
+      return false;
+
+    const SourceLocation use_loc = expr->getExprLoc();
+    const FileEntry* use_file = GetFileEntry(use_loc);
+    if (!use_file)
+      return true;
+
+    if (const FunctionDecl* definition = callee->getDefinition()) {
+      const FileEntry* definition_file = GetFileEntry(definition);
+      if (definition_file && definition_file != use_file &&
+          GlobalIncludePicker().IsVerifiedDottedInlineEndpoint(
+              GetFilePath(definition_file)) &&
+          ContainsKey(preprocessor_info()
+                          .FileInfoOrEmptyFor(use_file)
+                          .direct_includes_as_fileentries(),
+                      definition_file)) {
+        // The ODR-use needs the selected definition, not only the declaration
+        // in the dotted inline header's plain counterpart.
+        ReportDeclUse(use_loc, definition, "(for inline definition)");
+        return true;
+      }
+      return false;
+    }
+
+    if (!IsInlineDefinitionEligible(callee))
+      return false;
+    const bool declared_inline = std::any_of(
+        callee->redecls_begin(), callee->redecls_end(),
+        [](const FunctionDecl* redecl) { return redecl->isInlineSpecified(); });
+    if (!declared_inline)
+      return false;
+
+    const string name = callee->getQualifiedNameAsString();
+    const string message =
+        "Inline function '" + name +
+        "' is odr-used, but no definition is visible; include its "
+        "inline-definition provider before linking.";
+    IwyuFileInfo* file_info = preprocessor_info().FileInfoFor(use_file);
+    if (file_info && file_info->AddStructuredDiagnostic(
+                         use_loc, "missing_inline_definition", message) &&
+        GlobalFlags().output_format == CommandlineFlags::kTextOutput) {
+      errs() << PrintableLoc(use_loc)
+             << ": warning: missing_inline_definition: " << message << '\n';
+    }
+    return true;
+  }
+
   bool VisitDeclRefExpr(clang::DeclRefExpr* expr) {
     if (CanIgnoreCurrentASTNode())
       return true;
@@ -2300,6 +2492,9 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
         ReportDeclUse(CurrentLoc(), enum_decl);
       else
         ReportDeclUse(CurrentLoc(), enum_constant_decl);
+    } else if (auto* function = dyn_cast<FunctionDecl>(expr->getDecl())) {
+      if (HandleInlineDefinitionOdrUse(function, expr))
+        ReportDeclUse(expr->getExprLoc(), function);
     }
     return true;
   }
@@ -2317,60 +2512,15 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     if (!IsImplicitlyInstantiatedDfn(callee) && !IsTemplatizedType(parent_type))
       HandleFnReturnOnCallSite(callee);
 
+    const Expr* odr_expr = calling_expr;
+    if (!odr_expr)
+      odr_expr = current_ast_node()->template GetAs<Expr>();
+    HandleInlineDefinitionOdrUse(callee, odr_expr);
+
     // We may have already been checked in a previous
     // VisitOverloadExpr() call.  Don't check again in that case.
     if (IsProcessedOverloadLoc(CurrentLoc()))
       return true;
-
-    SourceLocation use_loc = calling_expr ? calling_expr->getExprLoc()
-                                          : CurrentLoc();
-    const FileEntry* use_file = GetFileEntry(use_loc);
-    if (use_file) {
-      if (const FunctionDecl* definition = callee->getDefinition()) {
-        const FileEntry* definition_file = GetFileEntry(definition);
-        if (definition_file && definition_file != use_file &&
-            GlobalIncludePicker().IsVerifiedDottedInlineEndpoint(
-                GetFilePath(definition_file)) &&
-            ContainsKey(preprocessor_info()
-                            .FileInfoOrEmptyFor(use_file)
-                            .direct_includes_as_fileentries(),
-                        definition_file)) {
-          // A call needs the selected definition, not only the declaration in
-          // the dotted inline header's plain counterpart. Recording the Clang-
-          // resolved definition prevents removal without guessing a provider.
-          ReportDeclUse(use_loc, definition, "(for inline definition)");
-        }
-      } else {
-        bool ordinary_function =
-            callee->getTemplatedKind() == FunctionDecl::TK_NonTemplate;
-        if (const auto* parent = dyn_cast<CXXRecordDecl>(
-                callee->getDeclContext())) {
-          ordinary_function = ordinary_function &&
-              !parent->getDescribedClassTemplate() &&
-              !isa<ClassTemplateSpecializationDecl>(parent);
-        }
-        const bool declared_inline = ordinary_function && std::any_of(
-            callee->redecls_begin(), callee->redecls_end(),
-            [](const FunctionDecl* redecl) {
-              return redecl->isInlineSpecified();
-            });
-        if (declared_inline) {
-          const string name = callee->getQualifiedNameAsString();
-          const string message =
-              "Inline function '" + name +
-              "' is odr-used, but no definition is visible; include its "
-              "inline-definition provider before linking.";
-          IwyuFileInfo* file_info = preprocessor_info().FileInfoFor(use_file);
-          if (file_info && file_info->AddStructuredDiagnostic(
-                               use_loc, "missing_inline_definition", message) &&
-              GlobalFlags().output_format == CommandlineFlags::kTextOutput) {
-            errs() << PrintableLoc(use_loc)
-                   << ": warning: missing_inline_definition: " << message
-                   << '\n';
-          }
-        }
-      }
-    }
 
     ReportDeclUse(CurrentLoc(), callee);
 

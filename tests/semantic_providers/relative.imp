@@ -1,0 +1,3 @@
+[
+  { include: ["\"relative_private.hpp\"", private, "\"../public/relative_public.hpp\"", public] },
+]

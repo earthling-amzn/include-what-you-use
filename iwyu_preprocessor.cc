@@ -13,7 +13,6 @@
 #include <cctype>
 #include <cstddef>                      // for size_t
 #include <cstring>
-#include <deque>
 #include <iterator>
 #include <map>
 #include <string>                       // for string, basic_string, etc
@@ -2213,62 +2212,112 @@ bool IwyuPreprocessorInfo::FileTransitivelyIncludes(
   return false;
 }
 
-vector<string> IwyuPreprocessorInfo::ShortestIncludeChain(
-    const FileEntry* includer,
-    const string& normalized_includee_path) const {
-  if (!includer)
+string IwyuPreprocessorInfo::ResolveIncludePath(
+    const FileEntry* includer, const string& quoted_include) const {
+  if (!includer || quoted_include.size() < 3)
     return {};
+  const bool is_angled = quoted_include.front() == '<';
+  const char closing = is_angled ? '>' : '"';
+  if ((!is_angled && quoted_include.front() != '"') ||
+      quoted_include.back() != closing) {
+    return {};
+  }
 
-  const string target = NormalizeFilePath(
-      MakeAbsolutePath(normalized_includee_path));
-  std::deque<const FileEntry*> pending;
-  set<const FileEntry*> visited;
-  map<const FileEntry*, const FileEntry*> predecessor;
-  pending.push_back(includer);
-  visited.insert(includer);
+  const FileID includer_id =
+      preprocessor_->getSourceManager().translateFile(includer);
+  if (includer_id.isInvalid())
+    return {};
+  const SourceLocation includer_loc =
+      preprocessor_->getSourceManager().getLocForStartOfFile(includer_id);
+  const llvm::StringRef filename(quoted_include.data() + 1,
+                                 quoted_include.size() - 2);
+  clang::OptionalFileEntryRef resolved = preprocessor_->LookupFile(
+      includer_loc, filename, is_angled, nullptr, includer, nullptr, nullptr,
+      nullptr, nullptr, nullptr, nullptr,
+      /*SkipCache=*/true);
+  if (!resolved)
+    return {};
+  return NormalizeFilePath(
+      MakeAbsolutePath(GetFilePath(&resolved->getFileEntry())));
+}
 
-  const FileEntry* endpoint = nullptr;
-  while (!pending.empty()) {
-    const FileEntry* current = pending.front();
-    pending.pop_front();
-    if (NormalizeFilePath(MakeAbsolutePath(GetFilePath(current))) == target) {
-      endpoint = current;
+bool IwyuPreprocessorInfo::PathIsOnIncludeAncestry(
+    SourceLocation declaration_loc, const string& normalized_path) const {
+  const auto& source_manager = preprocessor_->getSourceManager();
+  declaration_loc = source_manager.getSpellingLoc(declaration_loc);
+  if (declaration_loc.isInvalid() || !declaration_loc.isFileID())
+    return false;
+
+  const string target =
+      NormalizeFilePath(MakeAbsolutePath(normalized_path));
+  FileID current = source_manager.getFileID(declaration_loc);
+  set<unsigned> visited;
+  while (current.isValid() && visited.insert(current.getHashValue()).second) {
+    const FileEntry* file = source_manager.getFileEntryForID(current);
+    if (!file)
+      return false;
+    if (NormalizeFilePath(MakeAbsolutePath(GetFilePath(file))) == target)
+      return true;
+    const SourceLocation include_loc = source_manager.getIncludeLoc(current);
+    if (include_loc.isInvalid())
+      break;
+    const SourceLocation parent_loc = source_manager.getSpellingLoc(include_loc);
+    if (parent_loc.isInvalid() || !parent_loc.isFileID())
+      break;
+    current = source_manager.getFileID(parent_loc);
+  }
+  return false;
+}
+
+vector<string> IwyuPreprocessorInfo::IncludeChainForUse(
+    SourceLocation use_loc, SourceLocation declaration_loc,
+    const string& normalized_selected_path) const {
+  const auto& source_manager = preprocessor_->getSourceManager();
+  use_loc = source_manager.getExpansionLoc(use_loc);
+  declaration_loc = source_manager.getSpellingLoc(declaration_loc);
+  if (use_loc.isInvalid() || declaration_loc.isInvalid() ||
+      !use_loc.isFileID() || !declaration_loc.isFileID()) {
+    return {};
+  }
+
+  const FileID use_id = source_manager.getFileID(use_loc);
+  const string selected_path = NormalizeFilePath(
+      MakeAbsolutePath(normalized_selected_path));
+  vector<std::pair<FileID, string>> declaration_ancestry;
+  set<unsigned> visited;
+  FileID current = source_manager.getFileID(declaration_loc);
+  while (current.isValid() && visited.insert(current.getHashValue()).second) {
+    const FileEntry* file = source_manager.getFileEntryForID(current);
+    if (!file)
+      return {};
+    declaration_ancestry.push_back({
+        current, NormalizeFilePath(MakeAbsolutePath(GetFilePath(file)))});
+    if (current == use_id)
+      break;
+    const SourceLocation include_loc = source_manager.getIncludeLoc(current);
+    if (include_loc.isInvalid())
+      return {};
+    const SourceLocation parent_loc = source_manager.getSpellingLoc(include_loc);
+    if (parent_loc.isInvalid() || !parent_loc.isFileID())
+      return {};
+    current = source_manager.getFileID(parent_loc);
+  }
+  if (declaration_ancestry.empty() ||
+      declaration_ancestry.back().first != use_id) {
+    return {};
+  }
+
+  vector<string> chain;
+  bool found_selected = false;
+  for (auto it = declaration_ancestry.rbegin();
+       it != declaration_ancestry.rend(); ++it) {
+    chain.push_back(it->second);
+    if (it->second == selected_path) {
+      found_selected = true;
       break;
     }
-
-    vector<const FileEntry*> direct(
-        FileInfoOrEmptyFor(current).direct_includes_as_fileentries().begin(),
-        FileInfoOrEmptyFor(current).direct_includes_as_fileentries().end());
-    std::sort(direct.begin(), direct.end(),
-              [](const FileEntry* lhs, const FileEntry* rhs) {
-                return NormalizeFilePath(MakeAbsolutePath(GetFilePath(lhs))) <
-                       NormalizeFilePath(MakeAbsolutePath(GetFilePath(rhs)));
-              });
-    for (const FileEntry* next : direct) {
-      if (!visited.insert(next).second)
-        continue;
-      predecessor[next] = current;
-      pending.push_back(next);
-    }
   }
-  if (!endpoint)
-    return {};
-
-  vector<string> reverse_chain;
-  for (const FileEntry* current = endpoint; current;
-       current = GetOrDefault(predecessor, current,
-                              static_cast<const FileEntry*>(nullptr))) {
-    reverse_chain.push_back(
-        NormalizeFilePath(MakeAbsolutePath(GetFilePath(current))));
-    if (current == includer)
-      break;
-  }
-  if (reverse_chain.empty() ||
-      NormalizeFilePath(MakeAbsolutePath(GetFilePath(includer))) !=
-          reverse_chain.back()) {
-    return {};
-  }
-  return vector<string>(reverse_chain.rbegin(), reverse_chain.rend());
+  return found_selected ? chain : vector<string>{};
 }
 
 bool IwyuPreprocessorInfo::IncludeIsInhibited(

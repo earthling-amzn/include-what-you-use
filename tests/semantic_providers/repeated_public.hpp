@@ -1,0 +1,6 @@
+#ifndef TESTS_SEMANTIC_PROVIDERS_REPEATED_PUBLIC_HPP_
+#define TESTS_SEMANTIC_PROVIDERS_REPEATED_PUBLIC_HPP_
+
+struct RepeatedPublicDecoy {};
+
+#endif

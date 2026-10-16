@@ -1,0 +1,6 @@
+#ifndef TESTS_SEMANTIC_PROVIDERS_RELATIVE_CARRIER_HPP_
+#define TESTS_SEMANTIC_PROVIDERS_RELATIVE_CARRIER_HPP_
+
+#include "relative_private.hpp"
+
+#endif

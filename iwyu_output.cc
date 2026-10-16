@@ -2790,37 +2790,56 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
     set<string> selected_paths;
     map<string, string> path_by_spelling;
     bool candidates_available = true;
+    bool selected_available = true;
     bool saw_candidate = false;
+    bool saw_selected = false;
     for (const OneUse* use : motivating_uses) {
       const vector<string>& spellings = use->computed_public_headers();
       const vector<string>& paths = use->computed_public_header_paths();
       if (spellings.size() != paths.size()) {
         candidates_available = false;
+        selected_available = false;
         continue;
       }
       for (size_t index = 0; index < spellings.size(); ++index) {
         saw_candidate = true;
-        if (paths[index].empty()) {
+        const bool is_selected =
+            spellings[index] == operation.line->quoted_include();
+        saw_selected = saw_selected || is_selected;
+        const string resolved_path =
+            preprocessor_info_->ResolveIncludePath(file_, spellings[index]);
+        const string advertised_path = paths[index].empty()
+            ? string()
+            : NormalizeFilePath(MakeAbsolutePath(paths[index]));
+        const bool context_matches =
+            !resolved_path.empty() &&
+            (advertised_path.empty() || advertised_path == resolved_path) &&
+            preprocessor_info_->PathIsOnIncludeAncestry(
+                use->decl_loc(), resolved_path);
+        if (!context_matches) {
           candidates_available = false;
+          if (is_selected)
+            selected_available = false;
           continue;
         }
-        const ProviderRef ref = {
-            NormalizeFilePath(MakeAbsolutePath(paths[index])),
-            spellings[index]};
+
+        const ProviderRef ref = {resolved_path, spellings[index]};
         const auto existing = path_by_spelling.find(ref.spelling);
         if (existing != path_by_spelling.end() &&
             existing->second != ref.path) {
           candidates_available = false;
+          if (is_selected)
+            selected_available = false;
         } else {
           path_by_spelling[ref.spelling] = ref.path;
         }
         refs.push_back(ref);
-        if (ref.spelling == operation.line->quoted_include())
+        if (is_selected)
           selected_paths.insert(ref.path);
       }
     }
 
-    if (selected_paths.size() != 1)
+    if (!saw_selected || !selected_available || selected_paths.size() != 1)
       return provider;
     const string selected_path = *selected_paths.begin();
     provider["selected"] = llvm::json::Object{
@@ -2829,14 +2848,28 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
             {"spelling", operation.line->quoted_include()},
             {"path", selected_path}}}};
 
-    vector<string> chain = preprocessor_info_->ShortestIncludeChain(
-        file_, selected_path);
-    if (!chain.empty()) {
+    vector<string> common_chain;
+    bool chain_available = true;
+    for (const OneUse* use : motivating_uses) {
+      vector<string> chain = preprocessor_info_->IncludeChainForUse(
+          use->use_loc(), use->decl_loc(), selected_path);
+      if (chain.empty()) {
+        chain_available = false;
+        break;
+      }
+      if (common_chain.empty()) {
+        common_chain = std::move(chain);
+      } else if (common_chain != chain) {
+        chain_available = false;
+        break;
+      }
+    }
+    if (chain_available && !common_chain.empty()) {
       // Records use a worktree-relative analyzed-file identity while provider
       // references are absolute. Preserve both schema identities at the ends.
-      chain.front() = file_path();
+      common_chain.front() = file_path();
       llvm::json::Array chain_value;
-      for (const string& path : chain)
+      for (const string& path : common_chain)
         chain_value.push_back(path);
       provider["chain"] = llvm::json::Object{
           {"status", "known"}, {"value", std::move(chain_value)}};

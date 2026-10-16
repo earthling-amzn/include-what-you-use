@@ -1566,15 +1566,10 @@ vector<CandidateHeader> IncludePicker::BestCandidateHeaderRefsForIncluder(
     if (!mapped_include.path.empty()) {
       paths.insert(NormalizeFilePath(MakeAbsolutePath(mapped_include.path)));
     }
-    // A mapping can select a public spelling not used directly by this
-    // includer. Reuse globally observed resolution only when every occurrence
-    // of that exact spelling names one physical file; ambiguity remains empty.
-    for (const auto& observed : includer_and_includee_to_include_as_written_) {
-      if (observed.second == spelling) {
-        paths.insert(NormalizeFilePath(
-            MakeAbsolutePath(observed.first.second)));
-      }
-    }
+    // Do not resolve a quoted mapping from observations in unrelated
+    // includers. The output layer resolves this spelling in the analyzed
+    // includer's exact lookup context and checks it against a concrete
+    // declaration ancestry before publishing provider evidence.
     for (const auto& relationship : verified_dotted_inline_exports_) {
       const MappedInclude plain(ConvertToQuotedInclude(relationship.first),
                                 relationship.first);

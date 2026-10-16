@@ -167,12 +167,24 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
   bool FileTransitivelyIncludes(const string& quoted_includer,
                                 const clang::FileEntry* includee) const;
 
-  // Returns the shortest observed include path from includer to the normalized
-  // includee path. This is evidence only: callers must not use it to make an
-  // edit safe. Equal-length paths are resolved by normalized path order.
-  vector<string> ShortestIncludeChain(
-      const clang::FileEntry* includer,
-      const string& normalized_includee_path) const;
+  // Resolve one quoted include exactly as it would be resolved from includer.
+  // Returns an empty path when the spelling is malformed or cannot be found.
+  string ResolveIncludePath(const clang::FileEntry* includer,
+                            const string& quoted_include) const;
+
+  // Returns true only when one concrete declaration FileID ancestry contains
+  // normalized_path. Physical FileEntry reachability is deliberately ignored.
+  bool PathIsOnIncludeAncestry(
+      clang::SourceLocation declaration_loc,
+      const string& normalized_path) const;
+
+  // Returns the concrete include-instance chain from use_loc to the selected
+  // path on declaration_loc's FileID ancestry. The use FileID must itself be
+  // an ancestor of that declaration instance; otherwise no chain is known.
+  vector<string> IncludeChainForUse(
+      clang::SourceLocation use_loc,
+      clang::SourceLocation declaration_loc,
+      const string& normalized_selected_path) const;
 
   // Returns true when the preprocessor branch active at provider_loc is also
   // active at use_loc. An unconditional provider dominates every use in the

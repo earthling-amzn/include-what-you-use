@@ -44,9 +44,10 @@ def assert_analyzer_contracts():
         "item_kind": "include",
         "spelling": '#include "api.inline.hpp"',
         "symbols": [
-            "InlineFree", "InlineLifecycle",
+            "InlineAddress", "InlineFree", "InlineLifecycle",
+            "InlineLifecycle::AddressMember",
             "InlineLifecycle::InlineLifecycle", "InlineLifecycle::Member",
-            "InlineLifecycle::~InlineLifecycle",
+            "InlineLifecycle::~InlineLifecycle", "InlineTemplate",
         ],
     }]
 
@@ -64,14 +65,28 @@ def assert_analyzer_contracts():
          "but no definition is visible; include its inline-definition "
          "provider before linking.",
          {"column": 19, "line": 4, "path": "missing.cc"}),
+        ("Inline function 'InlineAddress' is odr-used, but no definition is "
+         "visible; include its inline-definition provider before linking.",
+         {"column": 29, "line": 5, "path": "missing.cc"}),
+        ("Inline function 'InlineLifecycle::AddressMember' is odr-used, but "
+         "no definition is visible; include its inline-definition provider "
+         "before linking.",
+         {"column": 26, "line": 6, "path": "missing.cc"}),
         ("Inline function 'InlineLifecycle::Member' is odr-used, but no "
          "definition is visible; include its inline-definition provider "
          "before linking.",
-         {"column": 16, "line": 5, "path": "missing.cc"}),
+         {"column": 16, "line": 7, "path": "missing.cc"}),
         ("Inline function 'InlineFree' is odr-used, but no definition is "
          "visible; include its inline-definition provider before linking.",
-         {"column": 27, "line": 5, "path": "missing.cc"}),
+         {"column": 27, "line": 7, "path": "missing.cc"}),
+        ("Inline function 'InlineTemplate' is odr-used, but no definition is "
+         "visible; include its inline-definition provider before linking.",
+         {"column": 38, "line": 8, "path": "missing.cc"}),
     ]
+
+    contexts = analyze("contexts.cc")
+    assert not [diagnostic for diagnostic in contexts["diagnostics"]
+                if diagnostic["code"] == "missing_inline_definition"]
 
     control = analyze("control.cc")
     assert not [diagnostic for diagnostic in control["diagnostics"]
@@ -103,16 +118,23 @@ def assert_gcc_backstop(corpus=CORPUS):
         assert link.returncode != 0, link.stdout + link.stderr
         linker_output = link.stdout + link.stderr
         for symbol in ("InlineLifecycle::InlineLifecycle()",
-                       "InlineLifecycle::Member() const", "InlineFree(int)",
+                       "InlineLifecycle::AddressMember() const",
+                       "InlineLifecycle::Member() const", "InlineAddress(int)",
+                       "InlineFree(int)", "int InlineTemplate<int>(int)",
                        "InlineLifecycle::~InlineLifecycle()"):
             assert symbol in linker_output, linker_output
+
+        contexts = out / "contexts"
+        run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "contexts.cc",
+             "-o", contexts], cwd=corpus)
+        run([contexts], cwd=corpus)
 
 
 def assert_fixer_idempotence():
     with tempfile.TemporaryDirectory(prefix="sem004-fix-", dir=ROOT / "build") as tmp:
         corpus = Path(tmp) / "inline_definition_availability"
         shutil.copytree(CORPUS, corpus)
-        for filename in ("available.cc", "control.cc"):
+        for filename in ("available.cc", "contexts.cc", "control.cc"):
             first = run([IWYU, "-I", ".", "-std=c++17", filename], cwd=corpus)
             run([sys.executable, ROOT / "fix_includes.py", "--nosafe_headers",
                  "--nocomments", "--noblank_lines"], cwd=corpus,

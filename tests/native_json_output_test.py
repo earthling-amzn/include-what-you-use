@@ -857,18 +857,10 @@ rules:
     extra_record = by_path(records(extra_result), "assoc003_provider_extra.cc")
     extra_add = next(op for op in extra_record["operations"]
                      if op["subject_action"] == "add")
-    extra_ref = {
-        "path": str((ROOT / "tests/native_json/assoc003_extra_provider.hpp")
-                    .resolve()).replace(os.sep, "/"),
-        "spelling": '"tests/native_json/assoc003_extra_provider.hpp"',
-    }
     assert extra_add["provider"]["selected"] == {
         "status": "known", "value": pair_inline_ref}
     assert extra_add["provider"]["candidates"] == {
-        "status": "known",
-        "value": sorted([pair_plain_ref, pair_inline_ref, extra_ref],
-                        key=lambda ref: (ref["path"], ref["spelling"])),
-    }
+        "status": "unavailable", "value": None}
 
     unresolved_result = run(
         "tests/native_json/assoc003_provider_unresolved.cc",

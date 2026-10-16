@@ -1,0 +1,6 @@
+#ifndef TESTS_SEMANTIC_PROVIDERS_PUBLIC_RELATIVE_PUBLIC_HPP_
+#define TESTS_SEMANTIC_PROVIDERS_PUBLIC_RELATIVE_PUBLIC_HPP_
+
+#include "../relative/relative_private.hpp"
+
+#endif

@@ -2,5 +2,8 @@
 
 int main() {
   InlineLifecycle value;
-  return value.Member() + InlineFree(1);
+  auto* function_address = &InlineAddress;
+  auto member_pointer = &InlineLifecycle::AddressMember;
+  return value.Member() + InlineFree(1) + function_address(2) +
+         (value.*member_pointer)() + InlineTemplate<int>(3);
 }
