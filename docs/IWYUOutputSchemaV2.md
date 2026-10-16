@@ -7,9 +7,16 @@ remains the default and is unchanged. Select version 2 with
 
 ## Declaration facts
 
-Every version-2 record has `declaration_facts` and `declaration_conflicts`.
+Every version-2 record has `source_digest`, `declaration_facts`, and
+`declaration_conflicts`. `source_digest` is SHA-256 over the exact bytes in
+Clang's analyzed source buffer. The driver verifies it against the source before
+emission and requires every named configuration for one canonical path to
+report the same digest.
+
 `declaration_facts` is a sorted, unique list of declarations observed in
-semantic uses of the analyzed file. A fact contains:
+non-ignored semantic uses of the analyzed file. Function-local declarations are
+excluded because a qualified spelling alone is not a stable identity across
+lexical scopes. A fact contains:
 
 - `qualified_name`: the stable qualified entity name reported by Clang;
 - `kind`: `class`, `struct`, `union`, `scoped_enum`, `unscoped_enum`,
@@ -23,16 +30,22 @@ must not infer a kind from a rendered declaration or diagnostic text.
 
 A direct analyzer invocation emits an empty `declaration_conflicts` array.
 The named-database driver validates all child facts before producing conflicts.
-For each analyzed file and stable qualified name, it reports a conflict when at
-least two named configurations observe at least two different kinds. Conflict
+For each analyzed file and stable qualified name, the driver compares all
+observed kinds. `class` and `struct` are compatible class-keys under Clang's C++
+redeclaration semantics. Every other multi-kind set is incompatible, including
+union/record, scoped/unscoped enum, enum/record, template/non-template, and all
+alias conflicts. Each reported conflict carries the record's `source_digest`;
 entries and their `(configuration, kind)` declarations are sorted and exact.
 
-If one side is a `typedef` or `using_alias`, another side is forward-declarable,
-and a configuration proposes a forward declaration for the entity, that
-configuration's complete record is made report-only. The record has `skipped`
-status, unavailable desired state, and no applied operation. Holding the whole
-record prevents an include removal from being applied without the now-blocked
-forward declaration.
+When a configuration proposes a forward declaration for an incompatible entity,
+the driver changes only that addition and the matching provider removal to
+`report`. Schema-v2 producers attach the same Clang entity identity to both
+operations, so unrelated removals with similar include spellings are untouched. It
+keeps unrelated unanimous operations applicable, preserves a known complete
+desired state with the provider retained and the unsafe declaration absent, and
+sets record status from the remaining applicable edits. Class-template
+primaries and specializations use one canonical primary-template name, kind,
+and declaration location.
 
 ## Compatibility and protocol
 
@@ -41,10 +54,13 @@ objects reject additional properties, and no existing typed field has this
 meaning. Adding kinds to v1 would violate its strict versioning contract.
 
 The analyzer and driver therefore keep version 1 as the default. A driver that
-requests version 2 rejects version-1 children, malformed facts, unknown kinds,
-duplicate or unsorted facts, and non-empty native conflict claims before it
-emits any stdout. Version-1 output is passed through unchanged and receives no
-new aggregation behavior.
+requests version 2 validates the complete child structure and cross-field
+semantics before emitting any stdout. It rejects version-1 children, missing or
+extra fields at any depth, malformed operations and desired states, unknown
+kinds, duplicate or unsorted facts, non-empty native conflict claims, source
+digest mismatches, and same-path records produced from different bytes.
+Version-1 output is passed through unchanged and receives no new aggregation
+behavior.
 
 All stream framing, invocation identity, operation, desired-state, and ordering
 rules not replaced above are inherited unchanged from

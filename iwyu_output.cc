@@ -29,8 +29,12 @@
 #include "iwyu_string_util.h"
 #include "iwyu_verrs.h"
 #include "iwyu_version.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
@@ -2506,7 +2510,31 @@ void IwyuFileInfo::ResolvePendingAnalysis() {
 
 namespace {
 
-string StructuredDeclarationKind(const NamedDecl* decl) {
+bool HasStableDeclarationIdentity(const OneUse& use) {
+  if (use.ignore_use() || !use.decl() || use.symbol_name().empty())
+    return false;
+  for (const DeclContext* context = use.decl()->getDeclContext(); context;
+       context = context->getParent()) {
+    if (context->isFunctionOrMethod())
+      return false;
+  }
+  return true;
+}
+
+const NamedDecl* StructuredDeclarationIdentity(const NamedDecl* decl) {
+  if (const ClassTemplateSpecializationDecl* specialization =
+          dyn_cast<ClassTemplateSpecializationDecl>(decl)) {
+    return specialization->getSpecializedTemplate();
+  }
+  if (const CXXRecordDecl* record = dyn_cast<CXXRecordDecl>(decl)) {
+    if (record->getDescribedClassTemplate())
+      return record->getDescribedClassTemplate();
+  }
+  return decl;
+}
+
+string StructuredDeclarationKind(const NamedDecl* input_decl) {
+  const NamedDecl* decl = StructuredDeclarationIdentity(input_decl);
   if (!decl)
     return string();
   if (isa<ClassTemplateDecl>(decl))
@@ -2517,7 +2545,9 @@ string StructuredDeclarationKind(const NamedDecl* decl) {
     return "typedef";
   if (const EnumDecl* enum_decl = dyn_cast<EnumDecl>(decl))
     return enum_decl->isScoped() ? "scoped_enum" : "unscoped_enum";
-  if (const RecordDecl* record_decl = dyn_cast<RecordDecl>(decl)) {
+  if (const CXXRecordDecl* record_decl = dyn_cast<CXXRecordDecl>(decl)) {
+    if (record_decl->getDescribedClassTemplate())
+      return "class_template";
     if (record_decl->isUnion())
       return "union";
     if (record_decl->isStruct())
@@ -2526,6 +2556,17 @@ string StructuredDeclarationKind(const NamedDecl* decl) {
       return "class";
   }
   return string();
+}
+
+string StructuredSourceDigest(const FileEntry* file) {
+  clang::SourceManager& source_manager = *GlobalSourceManager();
+  const clang::FileID file_id = source_manager.translateFile(file);
+  bool invalid = false;
+  const llvm::StringRef buffer = source_manager.getBufferData(file_id, &invalid);
+  CHECK_(!invalid && "analyzed source buffer must remain available");
+  const auto bytes = llvm::ArrayRef<uint8_t>(
+      reinterpret_cast<const uint8_t*>(buffer.data()), buffer.size());
+  return "sha256:" + llvm::toHex(llvm::SHA256::hash(bytes), true);
 }
 
 llvm::json::Object UnavailableValue() {
@@ -2826,6 +2867,15 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       if (operation.line->IsIncludeLine()) {
         motivates = use.has_suggested_header() &&
             use.suggested_header() == operation.line->quoted_include();
+        if (!motivates && GlobalFlags().output_schema_version >= 2 &&
+            operation.subject_action == "remove" && !use.is_full_use() &&
+            !use.has_suggested_header() &&
+            use.decl_file() == operation.line->included_file()) {
+          // A direct provider removed in favor of a forward declaration must
+          // carry that entity identity so a multi-config driver can suppress
+          // the exact paired removal without path-spelling heuristics.
+          motivates = true;
+        }
       } else {
         motivates = !use.is_full_use() && !use.has_suggested_header() &&
             use.decl() == operation.line->fwd_decl();
@@ -2839,9 +2889,15 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       }
       const string name = use.short_symbol_name().empty()
           ? use.symbol_name() : use.short_symbol_name();
-      facts.push_back({&use, name, use.decl() != nullptr,
-                       use.symbol_name(), location,
-                       preprocessor_info_->ActiveConditionAt(use.use_loc())});
+      const bool canonical_declaration_identity =
+          GlobalFlags().output_schema_version >= 2 && use.decl();
+      facts.push_back({
+          &use, name, use.decl() != nullptr,
+          canonical_declaration_identity
+              ? internal::GetQualifiedNameAsString(
+                    StructuredDeclarationIdentity(use.decl()))
+              : use.symbol_name(),
+          location, preprocessor_info_->ActiveConditionAt(use.use_loc())});
     }
     const auto fact_key = [](const UseFact& fact) {
       const string primary = fact.has_qualified_name
@@ -2907,7 +2963,12 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       symbol["qualified_name"] = declaration_fact
           ? KnownString(declaration_fact->qualified_name) : UnavailableValue();
       symbol["declaration"] = declaration_fact
-          ? AvailableLocation(declaration_fact->use->decl_loc(), false)
+          ? AvailableLocation(
+                GlobalFlags().output_schema_version >= 2
+                    ? GetLocation(StructuredDeclarationIdentity(
+                          declaration_fact->use->decl()))
+                    : declaration_fact->use->decl_loc(),
+                false)
           : UnavailableValue();
       if (GlobalFlags().output_schema_version >= 2) {
         const string declaration_kind = declaration_fact
@@ -3340,15 +3401,17 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
     };
     vector<DeclarationFact> facts;
     for (const OneUse& use : symbol_uses_) {
-      if (!use.decl())
+      if (!HasStableDeclarationIdentity(use))
         continue;
-      const string kind = StructuredDeclarationKind(use.decl());
-      if (kind.empty() || use.symbol_name().empty())
+      const NamedDecl* identity = StructuredDeclarationIdentity(use.decl());
+      const string kind = StructuredDeclarationKind(identity);
+      if (kind.empty())
         continue;
       StructuredLocationValue declaration;
-      if (!StructuredLocation(use.decl_loc(), false, &declaration))
+      if (!StructuredLocation(GetLocation(identity), false, &declaration))
         continue;
-      facts.push_back({use.symbol_name(), kind, declaration});
+      facts.push_back({internal::GetQualifiedNameAsString(identity), kind,
+                       declaration});
     }
     std::sort(facts.begin(), facts.end(), [](const DeclarationFact& lhs,
                                              const DeclarationFact& rhs) {
@@ -3399,6 +3462,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
   record["desired_state"] = std::move(desired_state);
   record["diagnostics"] = std::move(diagnostics);
   if (flags.output_schema_version >= 2) {
+    record["source_digest"] = StructuredSourceDigest(file_);
     record["declaration_facts"] = std::move(declaration_facts);
     record["declaration_conflicts"] = llvm::json::Array{};
   }

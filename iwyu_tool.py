@@ -35,6 +35,7 @@ See iwyu_tool.py -h for more details on command-line arguments.
 """
 from __future__ import print_function
 import os
+import posixpath
 import re
 import sys
 import json
@@ -92,17 +93,6 @@ IWYU_LONG_OPTIONS = frozenset([
     '--project_policy',
     '--configuration',
 ])
-
-DECLARATION_KINDS = frozenset([
-    'class', 'struct', 'union', 'scoped_enum', 'unscoped_enum',
-    'class_template', 'typedef', 'using_alias',
-])
-FORWARD_DECLARABLE_KINDS = frozenset([
-    'class', 'struct', 'union', 'scoped_enum', 'unscoped_enum',
-    'class_template',
-])
-ALIAS_KINDS = frozenset(['typedef', 'using_alias'])
-
 
 CORRECT_RE = re.compile(r'^\((.*?) has correct #includes/fwd-decls\)$')
 SHOULD_ADD_RE = re.compile(r'^(.*?) should add these lines:$')
@@ -799,63 +789,461 @@ def _reject_duplicate_object_keys(pairs):
     return result
 
 
-def _is_location(value):
-    return (isinstance(value, dict) and set(value) == {'path', 'line', 'column'} and
-            isinstance(value['path'], str) and bool(value['path']) and
-            type(value['line']) is int and value['line'] >= 1 and
-            type(value['column']) is int and value['column'] >= 1)
+_OUTPUT_V2_SCHEMA = None
 
 
-def _validate_kind_availability(value):
-    if not isinstance(value, dict) or set(value) != {'status', 'value'}:
+def _output_v2_schema():
+    global _OUTPUT_V2_SCHEMA
+    if _OUTPUT_V2_SCHEMA is None:
+        schema_path = os.path.join(
+            os.path.dirname(os.path.realpath(__file__)),
+            'docs', 'output-v2.schema.json')
+        try:
+            with open(schema_path, 'r', encoding='utf-8') as schema_file:
+                _OUTPUT_V2_SCHEMA = json.load(
+                    schema_file, object_pairs_hook=_reject_duplicate_object_keys,
+                    parse_constant=_reject_nonfinite)
+        except (OSError, ValueError) as why:
+            raise ProtocolError('cannot load output-v2 schema: %s' % why)
+    return _OUTPUT_V2_SCHEMA
+
+
+def _json_type_matches(value, expected):
+    if expected == 'object':
+        return isinstance(value, dict)
+    if expected == 'array':
+        return isinstance(value, list)
+    if expected == 'string':
+        return isinstance(value, str)
+    if expected == 'integer':
+        return type(value) is int
+    if expected == 'boolean':
+        return type(value) is bool
+    if expected == 'null':
+        return value is None
+    return False
+
+
+def _schema_path(path, component):
+    return '%s.%s' % (path, component) if path else str(component)
+
+
+def _validate_schema_value(value, schema, root, path='record'):
+    """Validate the complete subset of draft 2020-12 used by output-v2."""
+    if '$ref' in schema:
+        reference = schema['$ref']
+        if not reference.startswith('#/$defs/'):
+            raise ProtocolError('%s: unsupported schema reference' % path)
+        name = reference[len('#/$defs/'):]
+        definition = root.get('$defs', {}).get(name)
+        if definition is None:
+            raise ProtocolError('%s: unresolved schema reference' % path)
+        _validate_schema_value(value, definition, root, path)
+        return
+
+    if 'oneOf' in schema:
+        matches = 0
+        for alternative in schema['oneOf']:
+            try:
+                _validate_schema_value(value, alternative, root, path)
+                matches += 1
+            except ProtocolError:
+                pass
+        if matches != 1:
+            raise ProtocolError('%s: does not match exactly one schema shape' % path)
+        return
+
+    if 'type' in schema and not _json_type_matches(value, schema['type']):
+        raise ProtocolError('%s: expected %s' % (path, schema['type']))
+    if 'const' in schema and value != schema['const']:
+        raise ProtocolError('%s: value does not match schema constant' % path)
+    if 'enum' in schema and value not in schema['enum']:
+        raise ProtocolError('%s: value is outside schema enum' % path)
+
+    if isinstance(value, dict):
+        required = schema.get('required', [])
+        missing = [key for key in required if key not in value]
+        if missing:
+            raise ProtocolError('%s: missing required field %s' %
+                                (path, missing[0]))
+        properties = schema.get('properties', {})
+        if schema.get('additionalProperties') is False:
+            extras = sorted(set(value) - set(properties))
+            if extras:
+                raise ProtocolError('%s: unexpected field %s' %
+                                    (path, extras[0]))
+        for key, child in value.items():
+            if key in properties:
+                _validate_schema_value(
+                    child, properties[key], root, _schema_path(path, key))
+
+    if isinstance(value, list):
+        if len(value) < schema.get('minItems', 0):
+            raise ProtocolError('%s: array has too few items' % path)
+        if schema.get('uniqueItems'):
+            canonical = [_json_dumps_canonical(item) for item in value]
+            if len(canonical) != len(set(canonical)):
+                raise ProtocolError('%s: array items are not unique' % path)
+        if 'items' in schema:
+            for index, child in enumerate(value):
+                _validate_schema_value(
+                    child, schema['items'], root,
+                    _schema_path(path, index))
+
+    if isinstance(value, str):
+        if len(value) < schema.get('minLength', 0):
+            raise ProtocolError('%s: string is too short' % path)
+        if 'pattern' in schema and not re.search(schema['pattern'], value):
+            raise ProtocolError('%s: string does not match schema pattern' % path)
+
+    if type(value) is int and 'minimum' in schema and value < schema['minimum']:
+        raise ProtocolError('%s: integer is below schema minimum' % path)
+
+
+
+def _normalized_output_path(path):
+    if ('\\' in path or '//' in path or path.startswith('./') or
+            (path != '/' and path.endswith('/'))):
         return False
-    if value['status'] == 'known':
-        return value['value'] in DECLARATION_KINDS
-    return (value['status'] in ('unknown', 'unavailable', 'not_applicable') and
-            value['value'] is None)
+    components = [part for part in path.split('/') if part]
+    return (not any(part in ('.', '..') for part in components) and
+            posixpath.normpath(path) == path)
 
 
-def _validate_declaration_facts(record):
-    facts = record.get('declaration_facts')
-    if not isinstance(facts, list):
-        raise ProtocolError('schema-v2 declaration_facts are missing')
-    keys = []
+def _use_sort_key(use):
+    origin_rank = {'ast': 0, 'macro': 1, 'heuristic': 2, 'unknown': 3}
+    requirement_rank = {
+        'full': 0, 'forward_declaration': 1, 'none': 2, 'unknown': 3}
+    location = use['location']
+    return (location['path'], location['line'], location['column'],
+            origin_rank[use['origin']], requirement_rank[use['requirement']],
+            use['condition']['status'],
+            _json_dumps_canonical(use['condition']),
+            use['macro']['status'], _json_dumps_canonical(use['macro']))
+
+
+def _known_location_in_file(availability, file_path):
+    return (availability['status'] != 'known' or
+            availability['value']['path'] == file_path)
+
+def _validate_schema_v2(record):
+    schema = _output_v2_schema()
+    _validate_schema_value(record, schema, schema)
+
+
+def _validate_declaration_facts(record, native_conflicts=True):
+    _validate_schema_v2(record)
+
+    facts = record['declaration_facts']
+    fact_keys = []
+    facts_by_name = {}
     for fact in facts:
-        if not isinstance(fact, dict) or set(fact) != {
-                'qualified_name', 'kind', 'declaration'}:
-            raise ProtocolError('malformed schema-v2 declaration fact')
-        if not isinstance(fact['qualified_name'], str) or not fact['qualified_name']:
-            raise ProtocolError('declaration fact has invalid qualified_name')
-        if fact['kind'] not in DECLARATION_KINDS:
-            raise ProtocolError('declaration fact has invalid kind')
-        if not _is_location(fact['declaration']):
-            raise ProtocolError('declaration fact has invalid location')
-        keys.append((fact['qualified_name'], fact['kind']))
-    if len(keys) != len(set(keys)):
+        key = (fact['qualified_name'], fact['kind'])
+        fact_keys.append(key)
+        if not _normalized_output_path(fact['declaration']['path']):
+            raise ProtocolError('declaration fact path is not normalized')
+        facts_by_name.setdefault(fact['qualified_name'], set()).add(
+            (fact['kind'], _json_dumps_canonical(fact['declaration'])))
+    if len(fact_keys) != len(set(fact_keys)):
         raise ProtocolError('duplicate schema-v2 declaration fact')
-    if keys != sorted(keys):
+    if fact_keys != sorted(fact_keys):
         raise ProtocolError('schema-v2 declaration facts are not sorted')
-
-    conflicts = record.get('declaration_conflicts')
-    if conflicts != []:
+    if native_conflicts and record['declaration_conflicts'] != []:
         raise ProtocolError(
             'native schema-v2 declaration_conflicts must be an empty array')
-
-    operations = record.get('operations')
-    if not isinstance(operations, list):
-        raise ProtocolError('record operations are missing')
-    for operation in operations:
-        if not isinstance(operation, dict):
-            raise ProtocolError('record operation is not an object')
-        symbols = operation.get('symbols')
-        if not isinstance(symbols, list):
-            raise ProtocolError('operation symbols are missing')
-        for symbol in symbols:
-            if (not isinstance(symbol, dict) or
-                    not _validate_kind_availability(
-                        symbol.get('declaration_kind'))):
+    if not native_conflicts:
+        conflict_names = []
+        for conflict in record['declaration_conflicts']:
+            if conflict['source_digest'] != record['source_digest']:
+                raise ProtocolError('declaration conflict source_digest differs')
+            conflict_names.append(conflict['qualified_name'])
+            declarations = conflict['declarations']
+            declaration_keys = [(item['configuration'], item['kind'])
+                                for item in declarations]
+            if (len(declaration_keys) != len(set(declaration_keys)) or
+                    declaration_keys != sorted(declaration_keys)):
                 raise ProtocolError(
-                    'operation symbol has invalid declaration_kind')
+                    'conflicting declarations are duplicate or unsorted')
+            configurations = set(item['configuration'] for item in declarations)
+            kinds = set(item['kind'] for item in declarations)
+            if (len(configurations) < 2 or len(kinds) < 2 or
+                    kinds <= set(['class', 'struct'])):
+                raise ProtocolError(
+                    'declaration conflict does not describe incompatible kinds')
+        if (len(conflict_names) != len(set(conflict_names)) or
+                conflict_names != sorted(conflict_names)):
+            raise ProtocolError('declaration conflicts are duplicate or unsorted')
+
+    file_path = record['file']['path']
+    if not _normalized_output_path(file_path):
+        raise ProtocolError('file.path is not normalized')
+    analyzed = record['analyzed_configurations']
+    selected_configuration = record['invocation']['configuration']
+    if analyzed['status'] == 'known':
+        configurations = analyzed['value']
+        if (not configurations or
+                len(configurations) != len(set(configurations)) or
+                configurations != sorted(configurations)):
+            raise ProtocolError(
+                'analyzed configurations are empty, duplicate, or unsorted')
+        if (selected_configuration['status'] == 'known' and
+                selected_configuration['value'] not in configurations):
+            raise ProtocolError(
+                'selected configuration is outside analyzed configurations')
+    operations = record['operations']
+    desired = record['desired_state']
+    status = record['status']
+    diagnostics = record['diagnostics']
+    applied = [operation for operation in operations
+               if operation['disposition'] == 'apply' and
+               operation['subject_action'] in ('add', 'remove')]
+    if status == 'correct' and applied:
+        raise ProtocolError('correct record contains an applied edit')
+    if status == 'changes' and not applied:
+        raise ProtocolError('changes record contains no applied edit')
+    if status in ('skipped', 'error') and applied:
+        raise ProtocolError('%s record contains an applied edit' % status)
+    if status == 'skipped' and not diagnostics:
+        raise ProtocolError('skipped record contains no diagnostic')
+    if status == 'error' and not any(
+            diagnostic['severity'] == 'error' for diagnostic in diagnostics):
+        raise ProtocolError('error record contains no error diagnostic')
+    if status in ('correct', 'changes') and (
+            desired['status'] != 'known' or not desired['complete']):
+        raise ProtocolError('%s record lacks complete desired state' % status)
+
+    operation_ids = [operation['id'] for operation in operations]
+    expected_ids = ['op-%d' % index
+                    for index in range(1, len(operations) + 1)]
+    if operation_ids != expected_ids:
+        raise ProtocolError('operation IDs are not sequential in output order')
+    if operations != sorted(operations, key=_operation_sort_key):
+        raise ProtocolError('operations are not deterministically sorted')
+    identities = [
+        (operation['subject_action'], operation['item_kind'],
+         operation['spelling'],
+         _json_dumps_canonical(operation['source_range']))
+        for operation in operations]
+    if len(identities) != len(set(identities)):
+        raise ProtocolError('duplicate semantic operation identity')
+
+    associations = record['associated_headers']
+    association_keys = [(association['path'], association['relationship'],
+                         association['reason_code'])
+                        for association in associations]
+    if (len(association_keys) != len(set(association_keys)) or
+            association_keys != sorted(association_keys)):
+        raise ProtocolError('associated headers are duplicate or unsorted')
+    if any(not _normalized_output_path(association['path'])
+           for association in associations):
+        raise ProtocolError('associated header path is not normalized')
+
+    allowed = {
+        'add': set(['apply', 'suppress', 'report']),
+        'remove': set(['apply', 'keep', 'suppress', 'report']),
+        'keep': set(['keep', 'report']),
+    }
+    policy_disposition = {
+        'allow': 'apply', 'deny': 'suppress',
+        'keep': 'keep', 'report': 'report',
+    }
+    for operation in operations:
+        subject = operation['subject_action']
+        disposition = operation['disposition']
+        if disposition not in allowed[subject]:
+            raise ProtocolError('%s has invalid subject/disposition pair' %
+                                operation['id'])
+        source_range = operation['source_range']
+        if subject == 'add' and source_range['status'] != 'not_applicable':
+            raise ProtocolError('%s add range is not_applicable' % operation['id'])
+        if subject in ('remove', 'keep') and \
+                source_range['status'] == 'not_applicable':
+            raise ProtocolError('%s present range is not_applicable' %
+                                operation['id'])
+        if source_range['status'] == 'known':
+            start = source_range['value']['start']
+            end = source_range['value']['end']
+            if (start['path'] != file_path or end['path'] != file_path or
+                    (end['line'], end['column']) <
+                    (start['line'], start['column'])):
+                raise ProtocolError('%s has inconsistent source range' %
+                                    operation['id'])
+
+        symbols = operation['symbols']
+        symbol_keys = []
+        for symbol in symbols:
+            qualified = symbol['qualified_name']
+            identity = (qualified['value'] if qualified['status'] == 'known'
+                        else symbol['name'])
+            symbol_keys.append((identity, symbol['name']))
+            declaration = symbol['declaration']
+            kind = symbol['declaration_kind']
+            if qualified['status'] == 'known' and kind['status'] == 'known':
+                candidates = facts_by_name.get(qualified['value'], set())
+                if declaration['status'] == 'known':
+                    expected = (kind['value'],
+                                _json_dumps_canonical(declaration['value']))
+                    if candidates and expected not in candidates:
+                        raise ProtocolError(
+                            '%s symbol kind/location contradicts declaration fact' %
+                            operation['id'])
+            use_keys = []
+            for use in symbol['uses']:
+                location = use['location']
+                if location['path'] != file_path:
+                    raise ProtocolError('%s symbol use is outside analyzed file' %
+                                        operation['id'])
+                use_keys.append(_use_sort_key(use))
+                macro = use['macro']
+                if (use['origin'] == 'macro' and
+                        macro['status'] == 'not_applicable'):
+                    raise ProtocolError('%s macro use lacks provenance' %
+                                        operation['id'])
+                if use['origin'] != 'macro' and macro['status'] == 'known':
+                    raise ProtocolError('%s non-macro use has macro provenance' %
+                                        operation['id'])
+                if macro['status'] == 'known':
+                    expansion = macro['value']['expansion']
+                    if (expansion['status'] == 'known' and
+                            expansion['value'] != location):
+                        raise ProtocolError('%s macro expansion differs from use' %
+                                            operation['id'])
+                condition = use['condition']
+                if (condition['status'] == 'known' and
+                        not _known_location_in_file(
+                            condition['value']['location'], file_path)):
+                    raise ProtocolError('%s use condition is outside file' %
+                                        operation['id'])
+            if (len(use_keys) != len(set(use_keys)) or
+                    use_keys != sorted(use_keys)):
+                raise ProtocolError('%s symbol uses are duplicate or unsorted' %
+                                    operation['id'])
+        if (len(symbol_keys) != len(set(symbol_keys)) or
+                symbol_keys != sorted(symbol_keys)):
+            raise ProtocolError('%s symbols are duplicate or unsorted' %
+                                operation['id'])
+
+        provider = operation['provider']
+        selected = provider['selected']
+        candidates = provider['candidates']
+        chain = provider['chain']
+        provider_refs = []
+        if selected['status'] == 'known':
+            provider_refs.append(selected['value'])
+        if candidates['status'] == 'known':
+            provider_refs.extend(candidates['value'])
+        for provider_ref in provider_refs:
+            if (not re.match(r'^(?:<[^>]+>|"[^"]+")$',
+                             provider_ref['spelling']) or
+                    not _normalized_output_path(provider_ref['path'])):
+                raise ProtocolError('%s has invalid provider reference' %
+                                    operation['id'])
+        if (chain['status'] == 'known' and
+                any(not _normalized_output_path(path)
+                    for path in chain['value'])):
+            raise ProtocolError('%s has non-normalized provider chain' %
+                                operation['id'])
+        if candidates['status'] == 'known':
+            candidate_keys = [(item['path'], item['spelling'])
+                              for item in candidates['value']]
+            if (len(candidate_keys) != len(set(candidate_keys)) or
+                    candidate_keys != sorted(candidate_keys)):
+                raise ProtocolError('%s provider candidates are duplicate or unsorted' %
+                                    operation['id'])
+            if (selected['status'] == 'known' and
+                    selected['value'] not in candidates['value']):
+                raise ProtocolError('%s selected provider is absent from candidates' %
+                                    operation['id'])
+        if selected['status'] == 'known' and operation['item_kind'] == 'include':
+            include = re.match(r'^#include\s+(<[^>]+>|"[^"]+")$',
+                               operation['spelling'])
+            if (not include or
+                    include.group(1) != selected['value']['spelling']):
+                raise ProtocolError('%s selected provider contradicts include' %
+                                    operation['id'])
+        if chain['status'] == 'known':
+            if (selected['status'] != 'known' or not chain['value'] or
+                    chain['value'][0] != file_path or
+                    chain['value'][-1] != selected['value']['path']):
+                raise ProtocolError('%s provider chain is inconsistent' %
+                                    operation['id'])
+
+        edit_condition = operation['edit_condition']
+        if (edit_condition['status'] == 'known' and
+                not _known_location_in_file(
+                    edit_condition['value']['location'], file_path)):
+            raise ProtocolError('%s edit condition is outside file' %
+                                operation['id'])
+        policy = operation['policy']
+        if (policy['status'] == 'known' and
+                policy_disposition[policy['value']['decision']] != disposition):
+            raise ProtocolError('%s policy contradicts disposition' %
+                                operation['id'])
+        multi = operation['multi_config']
+        if (analyzed['status'] == 'known' and
+                len(analyzed['value']) > 1 and multi['status'] != 'known'):
+            raise ProtocolError('%s lacks multi-config contributions' %
+                                operation['id'])
+        if multi['status'] == 'known':
+            contributions = multi['value']
+            configurations = [item['configuration'] for item in contributions]
+            if (len(configurations) != len(set(configurations)) or
+                    configurations != sorted(configurations)):
+                raise ProtocolError('%s contributions are duplicate or unsorted' %
+                                    operation['id'])
+            if (analyzed['status'] != 'known' or
+                    configurations != analyzed['value']):
+                raise ProtocolError('%s contribution coverage differs' %
+                                    operation['id'])
+            for contribution in contributions:
+                none = contribution['subject_action'] == 'none'
+                if none != (contribution['disposition'] == 'not_applicable'):
+                    raise ProtocolError('%s contribution is inconsistent' %
+                                        operation['id'])
+                if not none and contribution['subject_action'] != subject:
+                    raise ProtocolError('%s contribution subject differs' %
+                                        operation['id'])
+                contribution_condition = contribution['condition']
+                if (contribution_condition['status'] == 'known' and
+                        not _known_location_in_file(
+                            contribution_condition['value']['location'],
+                            file_path)):
+                    raise ProtocolError('%s contribution condition is outside file' %
+                                        operation['id'])
+                if none and contribution_condition['status'] != 'not_applicable':
+                    raise ProtocolError('%s none contribution has a condition' %
+                                        operation['id'])
+                if not none and contribution_condition != edit_condition:
+                    raise ProtocolError('%s contribution condition differs' %
+                                        operation['id'])
+            if disposition in ('apply', 'keep', 'suppress') and any(
+                    item['subject_action'] != subject or
+                    item['disposition'] != disposition
+                    for item in contributions):
+                raise ProtocolError('%s contribution disposition differs' %
+                                    operation['id'])
+            if disposition == 'report' and not any(
+                    item['disposition'] == 'report'
+                    for item in contributions):
+                raise ProtocolError('%s reported operation lacks report contribution' %
+                                    operation['id'])
+
+    if desired['status'] == 'known':
+        desired_keys = [(item['item_kind'], item['spelling'])
+                        for item in desired['items']]
+        if len(desired_keys) != len(set(desired_keys)):
+            raise ProtocolError('duplicate desired-state item')
+        desired_set = set(desired_keys)
+        for operation in operations:
+            key = (operation['item_kind'], operation['spelling'])
+            present = ((operation['subject_action'] == 'add' and
+                        operation['disposition'] == 'apply') or
+                       (operation['subject_action'] == 'remove' and
+                        operation['disposition'] != 'apply') or
+                       operation['subject_action'] == 'keep')
+            if present != (key in desired_set):
+                raise ProtocolError('%s contradicts desired state' %
+                                    operation['id'])
 
 
 def _reject_nonfinite(value):
@@ -911,7 +1299,8 @@ def _parse_json_object(line):
     return value
 
 
-def _validate_record(record, invocation, previous_path, identities):
+def _validate_record(record, invocation, previous_path, identities,
+                     source_digests=None):
     if type(record.get('schema_version')) is not int or \
             record['schema_version'] != invocation.output_schema_version:
         raise ProtocolError('record has unsupported or unexpected schema_version')
@@ -951,6 +1340,30 @@ def _validate_record(record, invocation, previous_path, identities):
     if previous_path is not None and path < previous_path:
         raise ProtocolError('records are not in normalized target-file order')
 
+    if record['schema_version'] == 2:
+        canonical_source = path if os.path.isabs(path) else os.path.join(
+            invocation.cwd, path)
+        canonical_source = os.path.abspath(os.path.normpath(canonical_source))
+        try:
+            with open(canonical_source, 'rb') as source_file:
+                current_digest = 'sha256:' + hashlib.sha256(
+                    source_file.read()).hexdigest()
+        except OSError as why:
+            raise ProtocolError('cannot verify source_digest for %s: %s' %
+                                (path, why))
+        producer_digest = record['source_digest']
+        if source_digests is not None:
+            previous_digest = source_digests.get(canonical_source)
+            if (previous_digest is not None and
+                    previous_digest != producer_digest):
+                raise ProtocolError(
+                    'same source path has different producer-computed bytes')
+        if producer_digest != current_digest:
+            raise ProtocolError(
+                'source_digest does not match current source bytes for %s' % path)
+        if source_digests is not None:
+            source_digests[canonical_source] = producer_digest
+
     identity = (record['schema_version'], metadata['index'], metadata['id'],
                 metadata['translation_unit'], path)
     if identity in identities:
@@ -959,7 +1372,8 @@ def _validate_record(record, invocation, previous_path, identities):
     return path
 
 
-def parse_json_output(output, invocation, identities=None):
+def parse_json_output(output, invocation, identities=None,
+                      source_digests=None):
     """Parse and validate one child's complete LF-framed stdout atomically.
 
     Return the original JSON records so driver emission does not alter native
@@ -968,6 +1382,8 @@ def parse_json_output(output, invocation, identities=None):
     """
     if identities is None:
         identities = set()
+    if source_digests is None:
+        source_digests = {}
     if output == '':
         return []
     if '\r' in output:
@@ -987,7 +1403,7 @@ def parse_json_output(output, invocation, identities=None):
             raise ProtocolError('JSON Lines output contains a whitespace record')
         record = _parse_json_object(line)
         previous_path = _validate_record(
-            record, invocation, previous_path, identities)
+            record, invocation, previous_path, identities, source_digests)
     return lines
 
 
@@ -1016,15 +1432,7 @@ def _operation_sort_key(operation):
             operation['spelling'], operation['reason_code'])
 
 def _aggregate_declaration_conflicts(groups, invocations):
-    """Return schema-v2 groups with deterministic cross-config conflict facts.
-
-    Native records contribute only Clang-derived facts. The driver compares
-    stable qualified names for the same analyzed file. If an alias conflicts
-    with a forward-declarable declaration and any configuration proposes a
-    forward declaration, every edit in that record becomes report-only and the
-    desired state is unavailable, so a consumer cannot apply half of an unsafe
-    replacement.
-    """
+    """Aggregate incompatible declarations and suppress only unsafe pairs."""
     parsed_groups = [
         [_parse_json_object(line) for line in lines] for lines in groups]
     by_file = {}
@@ -1035,80 +1443,125 @@ def _aggregate_declaration_conflicts(groups, invocations):
             by_file.setdefault(record['file']['path'], []).append(
                 (invocation.configuration, record))
 
-    for file_path, configured_records in by_file.items():
+    def incompatible(kinds):
+        # C++ permits class/struct redeclarations of the same class-key. Every
+        # other cross-kind set changes entity semantics or declaration syntax.
+        return len(kinds) > 1 and not kinds <= set(['class', 'struct'])
+
+    def symbol_names(operation):
+        names = set()
+        for symbol in operation['symbols']:
+            qualified = symbol['qualified_name']
+            if qualified['status'] == 'known':
+                names.add(qualified['value'])
+        return names
+
+    for _, configured_records in by_file.items():
         declarations = {}
         for configuration, record in configured_records:
             for fact in record['declaration_facts']:
-                declarations.setdefault(fact['qualified_name'], set()).add(
+                name = fact['qualified_name']
+                declarations.setdefault(name, set()).add(
                     (configuration, fact['kind']))
 
         conflicts = []
         dangerous_names = set()
+        source_digest = configured_records[0][1]['source_digest']
         for qualified_name, entries in declarations.items():
-            configurations = {configuration for configuration, _ in entries}
-            kinds = {kind for _, kind in entries}
-            if len(configurations) < 2 or len(kinds) < 2:
+            configurations = set(configuration for configuration, _ in entries)
+            kinds = set(kind for _, kind in entries)
+            if len(configurations) < 2 or not incompatible(kinds):
                 continue
-            ordered_entries = sorted(entries)
+            dangerous_names.add(qualified_name)
             conflicts.append({
                 'qualified_name': qualified_name,
+                'source_digest': source_digest,
                 'declarations': [
                     {'configuration': configuration, 'kind': kind}
-                    for configuration, kind in ordered_entries],
+                    for configuration, kind in sorted(entries)],
             })
-            if kinds & ALIAS_KINDS and kinds & FORWARD_DECLARABLE_KINDS:
-                dangerous_names.add(qualified_name)
         conflicts.sort(key=lambda conflict: conflict['qualified_name'])
 
         for _, record in configured_records:
             record['declaration_conflicts'] = conflicts
-            blocked = False
+            blocked_adds = []
+            blocked_names = set()
             for operation in record['operations']:
-                if (operation.get('subject_action') != 'add' or
-                        operation.get('disposition') != 'apply' or
-                        operation.get('item_kind') != 'forward_declaration'):
-                    continue
-                for symbol in operation.get('symbols', []):
-                    qualified = symbol.get('qualified_name', {})
-                    kind = symbol.get('declaration_kind', {})
-                    if (qualified.get('status') == 'known' and
-                            qualified.get('value') in dangerous_names and
-                            kind.get('status') == 'known' and
-                            kind.get('value') in FORWARD_DECLARABLE_KINDS):
-                        blocked = True
-                        break
-                if blocked:
-                    break
-            if not blocked:
+                if (operation['subject_action'] == 'add' and
+                        operation['disposition'] == 'apply' and
+                        operation['item_kind'] == 'forward_declaration'):
+                    names = symbol_names(operation) & dangerous_names
+                    if names:
+                        blocked_adds.append(operation)
+                        blocked_names.update(names)
+            if not blocked_adds:
+                _validate_declaration_facts(record, native_conflicts=False)
                 continue
 
+            paired_removals = []
             for operation in record['operations']:
-                if operation['disposition'] != 'apply':
+                if (operation['subject_action'] != 'remove' or
+                        operation['disposition'] != 'apply' or
+                        operation['item_kind'] != 'include'):
                     continue
+                if symbol_names(operation) & blocked_names:
+                    paired_removals.append(operation)
+
+            blocked_operations = blocked_adds + paired_removals
+            for operation in blocked_operations:
                 operation['disposition'] = 'report'
                 operation['reason_code'] = 'declaration_kind_conflict'
                 operation['reason'] = (
-                    'Cross-configuration declaration-kind conflict makes the '
-                    'record unsafe to apply.')
-                multi_config = operation.get('multi_config')
-                if multi_config.get('status') == 'known':
+                    'Cross-configuration declaration kinds make this '
+                    'forward-declaration replacement unsafe.')
+                if operation['policy']['status'] == 'known':
+                    operation['policy'] = {
+                        'status': 'unavailable', 'value': None}
+                multi_config = operation['multi_config']
+                if multi_config['status'] == 'known':
                     for contribution in multi_config['value']:
                         if contribution['disposition'] == 'apply':
                             contribution['disposition'] = 'report'
+
+            desired = record['desired_state']
+            if desired['status'] != 'known' or not desired['complete']:
+                raise ProtocolError(
+                    'unsafe replacement lacks a complete desired state')
+            blocked_add_keys = set(
+                (operation['item_kind'], operation['spelling'])
+                for operation in blocked_adds)
+            desired['items'] = [
+                item for item in desired['items']
+                if (item['item_kind'], item['spelling']) not in blocked_add_keys]
+            desired_keys = set((item['item_kind'], item['spelling'])
+                               for item in desired['items'])
+            for operation in paired_removals:
+                key = (operation['item_kind'], operation['spelling'])
+                if key not in desired_keys:
+                    desired['items'].append({
+                        'item_kind': operation['item_kind'],
+                        'spelling': operation['spelling'],
+                        'symbols': sorted(symbol_names(operation)),
+                    })
+                    desired_keys.add(key)
+
             record['operations'].sort(key=_operation_sort_key)
             for index, operation in enumerate(record['operations'], 1):
                 operation['id'] = 'op-%d' % index
-            record['status'] = 'skipped'
-            record['desired_state'] = {
-                'status': 'unavailable', 'complete': False, 'items': None}
+            has_applied_edit = any(
+                operation['disposition'] == 'apply' and
+                operation['subject_action'] in ('add', 'remove')
+                for operation in record['operations'])
+            record['status'] = 'changes' if has_applied_edit else 'correct'
             record['diagnostics'].append({
                 'severity': 'warning',
                 'code': 'declaration_kind_conflict',
                 'message': (
-                    'Cross-configuration declaration kinds conflict; no '
-                    'edits from this record may be applied.'),
+                    'An unsafe forward-declaration replacement was reported; '
+                    'unrelated safe edits remain applicable.'),
                 'location': {'status': 'unavailable', 'value': None},
             })
+            _validate_declaration_facts(record, native_conflicts=False)
 
     return [[_json_dumps_canonical(record) for record in records]
             for records in parsed_groups]
@@ -1165,6 +1618,7 @@ def execute_json(invocations, verbose, jobs, max_load_average=0):
 
     # Validate all groups before writing any structured stdout.
     identities = set()
+    source_digests = {}
     groups = []
     errors = []
     exit_code = 0
@@ -1178,7 +1632,8 @@ def execute_json(invocations, verbose, jobs, max_load_average=0):
             groups.append([])
             continue
         try:
-            lines = parse_json_output(stdout, invocation, identities)
+            lines = parse_json_output(
+                stdout, invocation, identities, source_digests)
             if returncode == 0 and not lines:
                 raise ProtocolError('successful child produced no records')
             groups.append(lines)
@@ -1199,7 +1654,11 @@ def execute_json(invocations, verbose, jobs, max_load_average=0):
         return max(exit_code, 1)
     if groups and all(invocation.output_schema_version == 2
                       for invocation in ordered):
-        groups = _aggregate_declaration_conflicts(groups, ordered)
+        try:
+            groups = _aggregate_declaration_conflicts(groups, ordered)
+        except ProtocolError as why:
+            print('error: IWYU JSON aggregation: %s' % why, file=sys.stderr)
+            return max(exit_code, 1)
     for lines in groups:
         for line in lines:
             sys.stdout.write(line + '\n')

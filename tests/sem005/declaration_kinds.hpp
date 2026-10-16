@@ -9,6 +9,8 @@ union UnionKind { int value; };
 enum class ScopedEnumKind { value };
 enum UnscopedEnumKind { unscoped_value };
 template <typename T> class ClassTemplateKind {};
+template <> class ClassTemplateKind<int> {};
+template <typename T> class ClassTemplateKind<T*> {};
 typedef int TypedefKind;
 using UsingAliasKind = int;
 
