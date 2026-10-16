@@ -1701,14 +1701,18 @@ void CalculateIwyuForForwardDeclareUse(
           direct_coverage ==
               IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse ||
           associated_provider_covers_use(header, GetLocation(dfn));
-      const bool new_direct_provider_covers =
+      // Preserve established one-pass behavior for a newly selected spelling
+      // of the definition's physical file. A mapped public provider has a
+      // different path and must have an entered occurrence before it can cover
+      // the declaration.
+      const bool new_physical_provider_covers =
           direct_coverage ==
               IwyuPreprocessorInfo::DirectIncludeCoverage::
                   kNoDirectOccurrence &&
-          !header.path.empty() &&
+          header.path == physical_header.path &&
           ContainsKey(direct_desired_includes, header.spelling);
       if (ContainsKey(desired_includes, header.spelling) &&
-          (present_provider_covers || new_direct_provider_covers)) {
+          (present_provider_covers || new_physical_provider_covers)) {
         dfn_is_in_desired_includes = true;
         if (desired_provider.empty())
           desired_provider = header.spelling;

@@ -38,11 +38,13 @@ extern template class Template<char>;
 
 tests/cxx/explicit_instantiation.cc should add these lines:
 #include "explicit_instantiation-template.h"
+template <typename T> class Template;
 
 tests/cxx/explicit_instantiation.cc should remove these lines:
 - #include "explicit_instantiation-template_direct.h"  // lines XX-XX
 
 The full include-list for tests/cxx/explicit_instantiation.cc:
 #include "explicit_instantiation-template.h"  // for Template
+template <typename T> class Template;
 
 ***** IWYU_SUMMARY */

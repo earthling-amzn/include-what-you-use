@@ -91,6 +91,7 @@ tests/cxx/explicit_instantiation2.cc should add these lines:
 #include "explicit_instantiation-template.h"
 #include "explicit_instantiation2-template_bool.h"
 #include "explicit_instantiation2-template_short.h"
+template <class T> class Template;
 
 tests/cxx/explicit_instantiation2.cc should remove these lines:
 - #include "explicit_instantiation-template_direct.h"  // lines XX-XX
@@ -101,5 +102,6 @@ The full include-list for tests/cxx/explicit_instantiation2.cc:
 #include "explicit_instantiation2-template_bool.h"  // for Template
 #include "explicit_instantiation2-template_helpers.h"  // for FullUseArg, FwdDeclUseArg, TemplateAsDefaultFull, TemplateAsDefaultFullProvided, TemplateAsDefaultFwd, TemplateTemplateArgShortFull, TemplateTemplateArgShortFwd
 #include "explicit_instantiation2-template_short.h"  // for Template
+template <class T> class Template;
 
 ***** IWYU_SUMMARY */

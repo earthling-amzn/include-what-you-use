@@ -129,6 +129,33 @@ CASES = [
         ],
     },
     {
+        "name": "mapped-dynamic-new-provider",
+        "source": "fwd004_mapped_dynamic.cc",
+        "target": "fwd004_mapped_dynamic.cc",
+        "decl": "class Fwd004Hidden;",
+        "present": True,
+        "mapping": "fwd004_mapped_dynamic.imp",
+        "operations": [
+            operation(
+                "remove", "include",
+                '#include "tests/fwd_order/'
+                'fwd004_mapped_dynamic_private.hpp"'),
+            operation(
+                "add", "include",
+                '#include "tests/fwd_order/'
+                'fwd004_mapped_dynamic_public.hpp"',
+                reason="desired_item_missing"),
+        ],
+        "items": [
+            include("fwd004_mapped_dynamic_public.hpp", ["Fwd004Public"]),
+            declaration("class Fwd004Hidden;"),
+        ],
+        "hoisted_include": (
+            '#include "tests/fwd_order/'
+            'fwd004_mapped_dynamic_public.hpp"'),
+        "hoisted_before": "#define FWD004_ENABLE_HIDDEN 1",
+    },
+    {
         "name": "mapped-direct",
         "source": "fwd004_mapped.cc",
         "target": "fwd004_mapped.cc",
@@ -330,8 +357,16 @@ def assert_fixer_idempotence(case):
         compile_case(case, temporary_root)
 
         target = temporary_root / "tests" / "fwd_order" / case["target"]
-        assert (case["decl"] in target.read_text()) == case["present"], (
-            case["name"], target.read_text())
+        target_text = target.read_text()
+        assert (case["decl"] in target_text) == case["present"], (
+            case["name"], target_text)
+        if "hoisted_include" in case:
+            assert case["hoisted_include"] in target_text, (
+                case["name"], target_text)
+            assert target_text.index(case["hoisted_include"]) < target_text.index(
+                case["hoisted_before"]), (case["name"], target_text)
+            assert "fwd004_mapped_dynamic_private.hpp" not in target_text, (
+                case["name"], target_text)
 
         before_second = tree_digest(temporary_root)
         second = analyze(case, temporary_root)

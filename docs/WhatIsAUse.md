@@ -181,7 +181,9 @@ bind the selected provider to an exact preprocessor occurrence. The occurrence
 must precede the use in the same entered `FileID`, and its active condition must
 dominate the use condition. The entered provider `FileID` must contain the
 definition. A mapped public header may instead have one exact, unconditional
-direct include whose entered `FileID` contains the definition.
+direct include whose entered `FileID` contains the definition. A newly desired
+mapped provider with no entered direct occurrence does not cover the declaration;
+IWYU retains the declaration until a later pass can analyze that occurrence.
 
 Associated headers use the same proof from the source file into the exact
 associated-header instance. Their selected provider must be a direct,
