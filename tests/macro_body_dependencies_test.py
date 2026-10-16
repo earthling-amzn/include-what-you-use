@@ -50,8 +50,17 @@ def write_sources(root, sources):
         path.write_text(content)
 
 
+def source_location(path, content, needle):
+    offset = content.index(needle)
+    return {
+        "path": path,
+        "line": content.count("\n", 0, offset) + 1,
+        "column": offset - content.rfind("\n", 0, offset),
+    }
+
+
 def run_reviewer_case(*, root, analyzer, compiler, fixer, name, sources,
-                      retained=(), removed=(), provenance=None,
+                      retained=(), removed=(), provenance=None, evidence=None,
                       consumers=("future.cpp",), link_sources=()):
     case_root = root / "reviewer" / name
     case_root.mkdir(parents=True)
@@ -86,7 +95,7 @@ def run_reviewer_case(*, root, analyzer, compiler, fixer, name, sources,
         expected_status = (
             "unavailable"
             if reason_code == "macro_body_dependency_unavailable"
-            else "not_applicable"
+            else "known"
         )
         if (operation["disposition"], operation["subject_action"],
                 operation["item_kind"]) != ("keep", "remove", "include"):
@@ -99,6 +108,58 @@ def run_reviewer_case(*, root, analyzer, compiler, fixer, name, sources,
                     f"{name}: {reason_code} {field} provenance was not "
                     f"{expected_status}: {operation}"
                 )
+        if reason_code == "macro_body_dependency_unavailable":
+            if operation["symbols"]:
+                raise AssertionError(
+                    f"{name}: ambiguous macro dependency fabricated symbols: "
+                    f"{operation}"
+                )
+            continue
+
+        selected = operation["provider"]["selected"]["value"]
+        candidates = operation["provider"]["candidates"]["value"]
+        chain = operation["provider"]["chain"]["value"]
+        include_token = operation["spelling"].split(None, 1)[1]
+        if (selected["spelling"] != include_token or
+                candidates != [selected] or
+                chain != ["export.h", selected["path"]]):
+            raise AssertionError(
+                f"{name}: inconsistent exact direct provider: {operation}"
+            )
+        if not operation["symbols"]:
+            raise AssertionError(
+                f"{name}: exact macro dependency has no symbols: {operation}"
+            )
+        seen_uses = set()
+        for symbol in operation["symbols"]:
+            if (symbol["qualified_name"]["status"] != "known" or
+                    symbol["declaration"]["status"] != "known"):
+                raise AssertionError(
+                    f"{name}: exact declaration identity unavailable: {symbol}"
+                )
+            for use in symbol["uses"]:
+                macro = use["macro"]
+                identity = json.dumps(
+                    [symbol["qualified_name"]["value"], use],
+                    sort_keys=True,
+                )
+                if identity in seen_uses:
+                    raise AssertionError(
+                        f"{name}: duplicate macro use evidence: {operation}"
+                    )
+                seen_uses.add(identity)
+                if (use["origin"] != "macro" or
+                        use["requirement"] != "unknown" or
+                        use["location"]["path"] != "export.h" or
+                        macro["status"] != "known" or
+                        macro["value"]["definition"]["status"] != "known" or
+                        macro["value"]["definition"]["value"]["path"] !=
+                            "export.h" or
+                        macro["value"]["expansion"]["status"] !=
+                            "not_applicable"):
+                    raise AssertionError(
+                        f"{name}: malformed unexpanded macro use: {use}"
+                    )
     if provenance is not None:
         for header, reason_code in provenance.items():
             matches = [
@@ -119,6 +180,63 @@ def run_reviewer_case(*, root, analyzer, compiler, fixer, name, sources,
             raise AssertionError(
                 f"{name}: unexpected macro provenance {unexpected}"
             )
+
+    for header, expected in (evidence or {}).items():
+        matches = [
+            operation for spelling, operation in macro_operations.items()
+            if header in spelling
+        ]
+        if len(matches) != 1:
+            raise AssertionError(
+                f"{name}: missing evidence operation for {header}: "
+                f"{macro_operations}"
+            )
+        operation = matches[0]
+        symbols = [
+            symbol for symbol in operation["symbols"]
+            if symbol["qualified_name"] == {
+                "status": "known", "value": expected["qualified"]
+            }
+        ]
+        if len(symbols) != 1 or symbols[0]["name"] != expected["symbol"]:
+            raise AssertionError(
+                f"{name}: declaration identity differs: {operation['symbols']}"
+            )
+        symbol = symbols[0]
+        declaration_path, declaration_needle = expected["declaration"]
+        expected_declaration = source_location(
+            declaration_path, sources[declaration_path], declaration_needle
+        )
+        if symbol["declaration"] != {
+                "status": "known", "value": expected_declaration}:
+            raise AssertionError(
+                f"{name}: declaration location differs: {symbol}"
+            )
+        if len(symbol["uses"]) != 1:
+            raise AssertionError(
+                f"{name}: expected one deduplicated use: {symbol}"
+            )
+        use = symbol["uses"][0]
+        expected_reference = source_location(
+            "export.h", sources["export.h"], expected["reference"]
+        )
+        expected_definition = source_location(
+            "export.h", sources["export.h"], expected["macro"]
+        )
+        if (use["location"] != expected_reference or
+                use["macro"]["value"]["name"] != expected["macro"] or
+                use["macro"]["value"]["definition"] != {
+                    "status": "known", "value": expected_definition
+                }):
+            raise AssertionError(f"{name}: macro locations differ: {use}")
+        condition = use["condition"]
+        if condition["status"] != expected.get("condition_status",
+                                                "not_applicable"):
+            raise AssertionError(f"{name}: macro condition differs: {use}")
+        if ("condition_expression" in expected and
+                condition["value"]["expression"] !=
+                    expected["condition_expression"]):
+            raise AssertionError(f"{name}: macro condition differs: {use}")
 
     run([fixer, "--nosafe_headers", "--nocomments"], cwd=case_root,
         input_text=advice)
@@ -213,6 +331,15 @@ def run_reviewer_reproducers(*, root, analyzer, compiler, fixer):
             "retained": ("a.h",),
             "removed": ("b.h",),
             "provenance": {"a.h": "macro_body_dependency"},
+            "evidence": {
+                "a.h": {
+                    "macro": "QUALIFIED_SELECT",
+                    "reference": "qualified_a",
+                    "symbol": "select",
+                    "qualified": "::qualified_a::select",
+                    "declaration": ("a.h", "select(int value)"),
+                },
+            },
         },
         {
             "name": "type-qualified-member",
@@ -302,6 +429,15 @@ def run_reviewer_reproducers(*, root, analyzer, compiler, fixer):
             },
             "retained": ("wrapper.h",),
             "provenance": {"wrapper.h": "macro_body_dependency"},
+            "evidence": {
+                "wrapper.h": {
+                    "macro": "USING_SELECT",
+                    "reference": "using_api",
+                    "symbol": "select",
+                    "qualified": "::using_impl::select",
+                    "declaration": ("impl.h", "select(int value)"),
+                },
+            },
         },
         {
             "name": "transitive-wrapper",
@@ -324,6 +460,44 @@ def run_reviewer_reproducers(*, root, analyzer, compiler, fixer):
             },
             "retained": ("wrapper.h",),
             "provenance": {"wrapper.h": "macro_body_dependency"},
+        },
+        {
+            "name": "conditional-definition-provenance",
+            "sources": {
+                "provider.h": (
+                    "#pragma once\nnamespace conditional_definition {\n"
+                    "inline int select(int value) { return value + 15; }\n}\n"
+                ),
+                "export.h": (
+                    "#pragma once\n#if defined(ENABLE_STRUCTURED_MACRO)\n"
+                    "#include \"provider.h\"\n"
+                    "#define CONDITIONAL_DEFINITION(value) "
+                    "::conditional_definition::select(value)\n#endif\n"
+                ),
+                "analysis.cc": (
+                    "#define ENABLE_STRUCTURED_MACRO\n#include \"export.h\"\n"
+                    "int analysis_anchor;\n"
+                ),
+                "future.cpp": (
+                    "#define ENABLE_STRUCTURED_MACRO\n#include \"export.h\"\n"
+                    "int main() { return CONDITIONAL_DEFINITION(1) == 16 "
+                    "? 0 : 1; }\n"
+                ),
+            },
+            "retained": ("provider.h",),
+            "provenance": {"provider.h": "macro_body_dependency"},
+            "evidence": {
+                "provider.h": {
+                    "macro": "CONDITIONAL_DEFINITION",
+                    "reference": "conditional_definition",
+                    "symbol": "select",
+                    "qualified": "::conditional_definition::select",
+                    "declaration": ("provider.h", "select(int value)"),
+                    "condition_status": "known",
+                    "condition_expression":
+                        "defined(ENABLE_STRUCTURED_MACRO)",
+                },
+            },
         },
         {
             "name": "generic-size",
@@ -377,6 +551,15 @@ def run_reviewer_reproducers(*, root, analyzer, compiler, fixer):
             "retained": ("wrapper.h",),
             "removed": ("decoy.h",),
             "provenance": {"wrapper.h": "macro_body_dependency"},
+            "evidence": {
+                "wrapper.h": {
+                    "macro": "ALIAS_SELECT",
+                    "reference": "api",
+                    "symbol": "select",
+                    "qualified": "::implementation::select",
+                    "declaration": ("impl.h", "select(int value)"),
+                },
+            },
             "link_sources": ("impl.cpp",),
         },
         {

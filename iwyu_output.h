@@ -423,6 +423,16 @@ class IwyuFileInfo {
                                  const string& reason_code,
                                  const string& reason);
 
+  // Retains an exact, unexpanded function-like macro body dependency for
+  // schema-v1 output. The reference and macro definition locations are both
+  // spelling locations in the macro's defining file; no expansion occurred.
+  void ReportMacroBodyDependency(
+      const clang::FileEntry* included_file, const string& macro_name,
+      clang::SourceLocation macro_definition_location,
+      clang::SourceLocation reference_location, const string& symbol_name,
+      const string& qualified_name,
+      clang::SourceLocation declaration_location);
+
   // Retains a recoverable analysis diagnostic for schema-v1 JSON output.
   // Returns true when a new diagnostic was inserted.
   bool AddStructuredDiagnostic(clang::SourceLocation location,
@@ -467,6 +477,14 @@ class IwyuFileInfo {
   struct KeepReason {
     string reason_code;
     string reason;
+  };
+  struct MacroBodyDependencyFact {
+    string macro_name;
+    clang::SourceLocation macro_definition_location;
+    clang::SourceLocation reference_location;
+    string symbol_name;
+    string qualified_name;
+    clang::SourceLocation declaration_location;
   };
 
   const set<string>& direct_includes() const {
@@ -548,6 +566,8 @@ class IwyuFileInfo {
   // Holds files forced to be kept and the decision that forced each one.
   set<const clang::FileEntry*> kept_includes_;
   map<const clang::FileEntry*, KeepReason> kept_include_reasons_;
+  map<const clang::FileEntry*, vector<MacroBodyDependencyFact>>
+      macro_body_dependency_facts_;
   vector<StructuredDiagnostic> structured_diagnostics_;
 
   // Holds files using macros defined in this file.

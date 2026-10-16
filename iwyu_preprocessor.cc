@@ -923,7 +923,7 @@ void IwyuPreprocessorInfo::MacroDefined(const Token& id,
         continue;
       }
 
-      MacroBodyReference reference{{}, false, false};
+      MacroBodyReference reference{{}, token.getLocation(), false, false};
       if (index > 0 && tokens[index - 1].is(clang::tok::coloncolon) &&
           (index < 2 || !tokens[index - 2].is(clang::tok::identifier))) {
         reference.globally_qualified = true;
@@ -1637,11 +1637,20 @@ bool QualifiedLookupMatches(const string& indexed_name,
          EndsWith(indexed_name, "::" + reference);
 }
 
+struct ResolvedMacroDependencyFact {
+  string macro_name;
+  SourceLocation macro_definition_location;
+  SourceLocation reference_location;
+  string reference;
+  const NamedDecl* identity;
+};
+
 struct MacroDependencyReport {
   string macro_name;
   string reference;
   string resolved_name;
-  bool unavailable;
+  bool unavailable = false;
+  vector<ResolvedMacroDependencyFact> facts;
 };
 
 }  // namespace
@@ -1786,17 +1795,35 @@ void IwyuPreprocessorInfo::ResolveMacroBodyDependencies(
       const bool unique = uncertain_providers.empty() &&
                           identities.size() == 1 && providers.size() == 1;
       string resolved_name;
-      if (unique)
-        resolved_name = AbsoluteQualifiedName(*identities.begin());
+      const NamedDecl* resolved_identity = nullptr;
+      if (unique) {
+        resolved_identity = *identities.begin();
+        resolved_name = AbsoluteQualifiedName(resolved_identity);
+      }
       for (const FileEntry* provider : providers) {
         const auto key = make_pair(macro_file, provider);
         const bool unavailable = !unique;
-        auto report = reports.find(key);
-        if (report == reports.end() ||
-            (unavailable && !report->second.unavailable)) {
-          reports[key] =
-              {body.macro_name, spelling, resolved_name, unavailable};
+        MacroDependencyReport& report = reports[key];
+        if (unavailable) {
+          if (!report.unavailable) {
+            report.macro_name = body.macro_name;
+            report.reference = spelling;
+            report.resolved_name.clear();
+            report.facts.clear();
+          }
+          report.unavailable = true;
+          continue;
         }
+        if (report.unavailable)
+          continue;
+        if (report.facts.empty()) {
+          report.macro_name = body.macro_name;
+          report.reference = spelling;
+          report.resolved_name = resolved_name;
+        }
+        report.facts.push_back(
+            {body.macro_name, body.definition_location, reference.location,
+             spelling, resolved_identity});
       }
     }
   }
@@ -1813,6 +1840,12 @@ void IwyuPreprocessorInfo::ResolveMacroBodyDependencies(
               report.reference + " resolves uniquely to declaration " +
               report.resolved_name +
               " through this direct effective provider.");
+      for (const ResolvedMacroDependencyFact& fact : report.facts) {
+        macro_file_info->ReportMacroBodyDependency(
+            provider, fact.macro_name, fact.macro_definition_location,
+            fact.reference_location, fact.identity->getNameAsString(),
+            AbsoluteQualifiedName(fact.identity), GetLocation(fact.identity));
+      }
       ERRSYM(macro_file)
           << "Keep #include " << provider->getName() << " in "
           << macro_file->getName() << " because function-like macro "

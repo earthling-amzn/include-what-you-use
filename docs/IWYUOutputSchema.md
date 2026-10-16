@@ -350,9 +350,14 @@ physical spelling for present-item operations, grouped motivating symbol uses,
 associated-header reasons, and recoverable IWYU/Clang diagnostics. It emits
 source-derived per-use and edit conditions, known policy provenance for native
 policy decisions, exact optional invocation configuration names, and known
-singleton contributions for configured runs. Unsupported provider chains,
-macro-origin details, and exact source ranges use typed unavailable values; an
-individual condition that cannot be recovered safely uses `unknown`.
+singleton contributions for configured runs. Exact unexpanded function-like
+macro-body declaration dependencies emit macro-origin uses, definition and
+reference locations, definition-site conditions, and direct effective provider
+facts when declaration and provider identity are unique. Ambiguous macro
+identities/providers, unsupported provider chains, and exact source ranges use
+typed unavailable values; an individual condition that cannot be recovered
+safely uses `unknown`. The external macro-provider guard remains authoritative
+for broader fixer protection.
 
 Native output sorts file records and operations deterministically. The driver
 expands response files using the compiler's GNU or clang-cl tokenization,
@@ -366,9 +371,10 @@ and native stderr in database-index order.
 The producer still leaves these fields unavailable until later semantic and
 policy tasks retain them without inference:
 
-- exact macro-versus-AST origin and macro definition/expansion provenance;
-- normalized selected/candidate provider paths and provider chains outside the
-  currently verified dotted-inline endpoint;
+- macro origin and macro definition/expansion provenance outside exact,
+  unexpanded function-like macro-body declaration dependencies;
+- normalized selected/candidate provider paths and provider chains outside exact
+  direct macro dependencies and the currently verified dotted-inline endpoint;
 - exact source ranges for edits;
 - active-condition project-policy matching with explicit indeterminate
   first-match behavior;

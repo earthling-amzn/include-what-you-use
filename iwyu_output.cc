@@ -790,6 +790,16 @@ void IwyuFileInfo::ReportProtectedFileReason(
       std::make_pair(included_file, KeepReason{reason_code, reason}));
 }
 
+void IwyuFileInfo::ReportMacroBodyDependency(
+    const FileEntry* included_file, const string& macro_name,
+    SourceLocation macro_definition_location, SourceLocation reference_location,
+    const string& symbol_name, const string& qualified_name,
+    SourceLocation declaration_location) {
+  macro_body_dependency_facts_[included_file].push_back(
+      {macro_name, macro_definition_location, reference_location, symbol_name,
+       qualified_name, declaration_location});
+}
+
 bool IwyuFileInfo::AddStructuredDiagnostic(SourceLocation location,
                                            const string& code,
                                            const string& message,
@@ -2677,6 +2687,102 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
   };
 
   const auto operation_symbols = [&](const OperationRef& operation) {
+    if (operation.reason_code == "macro_body_dependency_unavailable")
+      return llvm::json::Array{};
+    if (operation.reason_code == "macro_body_dependency") {
+      struct MacroFact {
+        const MacroBodyDependencyFact* fact;
+        StructuredLocationValue declaration;
+        StructuredLocationValue reference;
+        StructuredLocationValue definition;
+        IwyuPreprocessorInfo::ActiveCondition condition;
+      };
+      vector<MacroFact> facts;
+      const auto found = macro_body_dependency_facts_.find(
+          operation.line->included_file());
+      if (found != macro_body_dependency_facts_.end()) {
+        for (const MacroBodyDependencyFact& fact : found->second) {
+          StructuredLocationValue declaration;
+          StructuredLocationValue reference;
+          StructuredLocationValue definition;
+          if (!StructuredLocation(fact.declaration_location, false,
+                                  &declaration) ||
+              !StructuredLocation(fact.reference_location, false, &reference) ||
+              !StructuredLocation(fact.macro_definition_location, false,
+                                  &definition) ||
+              reference.path != file_path() || definition.path != file_path()) {
+            continue;
+          }
+          facts.push_back(
+              {&fact, declaration, reference, definition,
+               preprocessor_info_->ActiveConditionAt(
+                   fact.macro_definition_location)});
+        }
+      }
+      const auto fact_key = [](const MacroFact& fact) {
+        return std::make_tuple(
+            fact.fact->qualified_name, fact.fact->symbol_name,
+            fact.declaration.path, fact.declaration.line,
+            fact.declaration.column, fact.reference.path, fact.reference.line,
+            fact.reference.column, fact.fact->macro_name,
+            fact.definition.path, fact.definition.line, fact.definition.column,
+            static_cast<int>(fact.condition.status), fact.condition.expression);
+      };
+      std::sort(facts.begin(), facts.end(),
+                [&](const MacroFact& lhs, const MacroFact& rhs) {
+                  return fact_key(lhs) < fact_key(rhs);
+                });
+      facts.erase(std::unique(
+          facts.begin(), facts.end(), [&](const MacroFact& lhs,
+                                          const MacroFact& rhs) {
+            return fact_key(lhs) == fact_key(rhs);
+          }), facts.end());
+
+      llvm::json::Array symbols;
+      size_t begin = 0;
+      while (begin < facts.size()) {
+        size_t end = begin + 1;
+        while (end < facts.size() &&
+               facts[end].fact->qualified_name ==
+                   facts[begin].fact->qualified_name &&
+               facts[end].fact->symbol_name ==
+                   facts[begin].fact->symbol_name &&
+               facts[end].declaration.path == facts[begin].declaration.path &&
+               facts[end].declaration.line == facts[begin].declaration.line &&
+               facts[end].declaration.column ==
+                   facts[begin].declaration.column) {
+          ++end;
+        }
+        llvm::json::Array uses;
+        for (size_t index = begin; index < end; ++index) {
+          const MacroFact& fact = facts[index];
+          uses.push_back(llvm::json::Object{
+              {"location", LocationObject(fact.reference)},
+              {"requirement", "unknown"},
+              {"origin", "macro"},
+              {"condition", ConditionObject(fact.condition)},
+              {"macro", llvm::json::Object{
+                  {"status", "known"},
+                  {"value", llvm::json::Object{
+                      {"name", fact.fact->macro_name},
+                      {"definition", llvm::json::Object{
+                          {"status", "known"},
+                          {"value", LocationObject(fact.definition)}}},
+                      {"expansion", NotApplicableValue()}}}}}});
+        }
+        const MacroFact& first = facts[begin];
+        symbols.push_back(llvm::json::Object{
+            {"name", first.fact->symbol_name},
+            {"qualified_name", KnownString(first.fact->qualified_name)},
+            {"declaration", llvm::json::Object{
+                {"status", "known"},
+                {"value", LocationObject(first.declaration)}}},
+            {"uses", std::move(uses)}});
+        begin = end;
+      }
+      return symbols;
+    }
+
     struct UseFact {
       const OneUse* use;
       string name;
@@ -2789,6 +2895,34 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       provider["selected"] = UnavailableValue();
       provider["candidates"] = UnavailableValue();
       provider["chain"] = UnavailableValue();
+      return provider;
+    }
+    if (operation.reason_code == "macro_body_dependency") {
+      const auto found = macro_body_dependency_facts_.find(
+          operation.line->included_file());
+      if (found == macro_body_dependency_facts_.end() ||
+          found->second.empty()) {
+        provider["selected"] = UnavailableValue();
+        provider["candidates"] = UnavailableValue();
+        provider["chain"] = UnavailableValue();
+        return provider;
+      }
+      const string path = NormalizeFilePath(
+          GetFilePath(operation.line->included_file()));
+      llvm::json::Object selected{
+          {"spelling", operation.line->quoted_include()}, {"path", path}};
+      llvm::json::Array candidates;
+      candidates.push_back(llvm::json::Object{
+          {"spelling", operation.line->quoted_include()}, {"path", path}});
+      llvm::json::Array chain;
+      chain.push_back(file_path());
+      chain.push_back(path);
+      provider["selected"] = llvm::json::Object{
+          {"status", "known"}, {"value", std::move(selected)}};
+      provider["candidates"] = llvm::json::Object{
+          {"status", "known"}, {"value", std::move(candidates)}};
+      provider["chain"] = llvm::json::Object{
+          {"status", "known"}, {"value", std::move(chain)}};
       return provider;
     }
     if (operation.subject_action != "add" ||

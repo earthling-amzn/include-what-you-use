@@ -497,6 +497,7 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
 
   struct MacroBodyReference {
     vector<const clang::IdentifierInfo*> components;
+    clang::SourceLocation location;
     bool globally_qualified;
     bool was_macro;
   };
