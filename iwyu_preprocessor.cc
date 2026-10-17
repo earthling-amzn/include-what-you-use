@@ -2494,7 +2494,19 @@ IwyuPreprocessorInfo::ActiveConditionAt(SourceLocation loc) const {
     return result;
   }
 
-  size_t begin = 0;
+  // Preserve the complete lexical ancestry for schema-v2 branch identity.
+  // A controlling include guard is semantic framing, but it remains a real
+  // parent in conditional_regions and cannot be dropped from an edit anchor.
+  ActiveCondition result;
+  result.active_branch = true;
+  for (const ActiveConditionalState& branch : path) {
+    result.source_region_path.push_back(branch.source_region_id);
+    if (branch.activity != BranchActivity::kActive)
+      result.active_branch = false;
+  }
+  result.source_region_id = result.source_region_path.back();
+
+  size_t semantic_begin = 0;
   const ActiveConditionalState& outer = path.front();
   if (outer.branch_index == 0) {
     const FileEntry* file = GetFileEntry(outer.directive_location);
@@ -2506,35 +2518,30 @@ IwyuPreprocessorInfo::ActiveConditionAt(SourceLocation loc) const {
       if (controlling_macro &&
           (!outer.macro ||
            (outer.is_ifndef && outer.macro == controlling_macro))) {
-        begin = 1;
+        semantic_begin = 1;
       }
     }
   }
-  if (begin == path.size()) {
-    ActiveCondition result;
+  if (semantic_begin == path.size()) {
     result.status = ActiveCondition::Status::kNotApplicable;
+    result.source_region_id.clear();
+    result.source_region_path.clear();
     return result;
   }
 
-  ActiveCondition result;
   result.directive_location = path.back().directive_location;
-  result.active_branch = true;
-  for (size_t index = begin; index < path.size(); ++index) {
+  for (size_t index = semantic_begin; index < path.size(); ++index) {
     const ActiveConditionalState& branch = path[index];
-    result.source_region_path.push_back(branch.source_region_id);
-    if (branch.activity != BranchActivity::kActive)
-      result.active_branch = false;
     if (branch.expression.empty())
       return result;
     if (!result.expression.empty())
       result.expression += " && ";
-    if (path.size() - begin == 1) {
+    if (path.size() - semantic_begin == 1) {
       result.expression += branch.expression;
     } else {
       result.expression += "(" + branch.expression + ")";
     }
   }
-  result.source_region_id = result.source_region_path.back();
   result.status = ActiveCondition::Status::kKnown;
   return result;
 }

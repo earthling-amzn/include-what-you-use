@@ -31,13 +31,17 @@ have one opening branch, ordered contiguous alternatives, at most one final
 every known child body within its known parent body.
 
 Known operation, use, and contribution conditions carry `source_region_id` and
-the complete outer-to-inner `source_region_path`; expression text alone is not
-an identity. Every known anchor must resolve through that exact parent path.
-For known edit anchors and non-`none` contribution anchors, every region in the
-path must be active and have `lexical_scope: file`, and `active_branch` must be
-true. Use-only provenance may legitimately resolve through `non_file` regions,
-but every ancestor's activity must make the complete path agree with
-`active_branch`. `lexical_scope` is `file`
+the complete outer-to-inner lexical `source_region_path`; expression text alone
+is not an identity. Every known anchor must resolve through that exact parent
+path. A Clang-proved controlling include guard remains in this lexical path when
+a nested real condition supplies the anchor, but the guard is omitted from the
+semantic `expression` and project-policy `active_condition`. An operation
+controlled only by that guard remains semantically unconditional and therefore
+has a `not_applicable` condition. For known edit anchors and non-`none`
+contribution anchors, every region in the path must be active and have
+`lexical_scope: file`, and `active_branch` must be true. Use-only provenance may
+legitimately resolve through `non_file` regions, but every ancestor's activity
+must make the complete path agree with `active_branch`. `lexical_scope` is `file`
 only when both the final macro-expanded token stream and completed AST ranges
 prove that the directive can accept a file-scope include. Function, class,
 namespace-block, macro-expanded, declaration-embedded, malformed, and uncertain

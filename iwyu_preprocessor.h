@@ -210,8 +210,10 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
     string expression;
     clang::SourceLocation directive_location;
     bool active_branch = false;
-    // Source-derived identity. Unlike expression text, this binds a condition
-    // to exact directive offsets and its complete nesting path.
+    // Source-derived lexical identity. Unlike expression text, this binds a
+    // semantic condition to its exact directive offsets and complete census
+    // ancestry. A controlling include guard may occur in this path even though
+    // it is excluded from expression and project-policy active_condition.
     string source_region_id;
     vector<string> source_region_path;
   };

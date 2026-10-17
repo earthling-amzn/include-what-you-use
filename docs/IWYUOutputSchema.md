@@ -218,8 +218,12 @@ The native producer computes source-derived active conditions for AST uses and
 operations. Unconditional source emits `not_applicable`, a complete branch path
 emits `known`, and a location or expression that cannot be recovered safely
 emits `unknown`; it never treats unknown provenance as unconditional. A
-Clang-proved controlling include guard is framing and is omitted from the
-condition.
+Clang-proved controlling include guard is semantic framing: it is omitted from
+the condition expression and project-policy matching. When a real condition is
+nested inside the guard, however, `source_region_path` retains the guard as the
+lexical root required to identify the nested branch in `conditional_regions`.
+A location controlled only by the guard remains semantically unconditional and
+emits `not_applicable`.
 
 Condition expressions preserve source tokens with whitespace runs collapsed;
 macros are not expanded. `#ifdef X` is rendered as `defined(X)` and `#ifndef X`

@@ -20,6 +20,8 @@ SOURCE = "tests/conditional_regions/conditional.cc"
 SCOPE_SOURCE = "tests/conditional_regions/scope.cc"
 SPLICED_SOURCE = "tests/conditional_regions/spliced.cc"
 NESTED_SOURCE = "tests/conditional_regions/nested.cc"
+GUARDED_SOURCE = "tests/conditional_regions/guarded.cc"
+GUARDED_HEADER = "tests/conditional_regions/guarded.hpp"
 DRIVER = ROOT / "iwyu_tool.py"
 
 CONFIGS = {
@@ -43,18 +45,21 @@ EXPECTED_ADDS = {
 }
 
 
-def analyze(configuration, flags, source=SOURCE):
+def analyze(configuration, flags, source=SOURCE, target=None, iwyu_args=()):
     command = [str(IWYU), "-Xiwyu", "--output_format=json", "-Xiwyu",
                "--output_schema=2", "-Xiwyu",
-               "--configuration=" + configuration, "-I", ".", "-std=c++17",
-               *flags, source]
+               "--configuration=" + configuration]
+    for argument in iwyu_args:
+        command.extend(["-Xiwyu", argument])
+    command.extend(["-I", ".", "-std=c++17", *flags, source])
     result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
     records = [json.loads(line) for line in result.stdout.splitlines()]
     for record in records:
         VALIDATOR.validate(record)
+    selected = target or source
     return next(record for record in records
-                if record["file"]["path"].endswith(source.rsplit("/", 1)[-1]))
+                if record["file"]["path"].endswith(selected.rsplit("/", 1)[-1]))
 
 
 def main():
@@ -209,6 +214,110 @@ def main():
          str(ROOT / NESTED_SOURCE)], text=True, capture_output=True)
     assert nested_compile.returncode == 0, nested_compile.stderr
 
+    # A real included-header guard is semantic framing, not a configuration
+    # condition. It remains the lexical root of a nested branch anchor so the
+    # exact source path resolves through the complete census. Operations inside
+    # only the guard stay unconditional; nested add/remove operations carry the
+    # guard plus target branch but only the target expression.
+    guarded_flags = ["-DGUARDED_FEATURE"]
+    guarded = analyze(
+        "guarded", guarded_flags, GUARDED_SOURCE, GUARDED_HEADER,
+        ("--check_also=" + GUARDED_HEADER,))
+    guarded_regions = guarded["conditional_regions"]
+    assert [(region["source_region_id"],
+             region["parent_source_region_id"],
+             region["directive_kind"], region["expression"],
+             region["activity"], region["lexical_scope"])
+            for region in guarded_regions] == [
+        ("branch-1-0-1", {"status": "not_applicable", "value": None},
+         "ifndef", "!defined(TESTS_CONDITIONAL_REGIONS_GUARDED_HPP_)",
+         "active", "file"),
+        ("branch-199-0-199", {"status": "known",
+                              "value": "branch-1-0-1"},
+         "if", "defined(GUARDED_FEATURE)", "active", "file"),
+    ]
+    guarded_operations = {
+        (operation["subject_action"], operation["spelling"]): operation
+        for operation in guarded["operations"]
+    }
+    nested_keys = {
+        ("remove", '#include "tests/conditional_regions/all.hpp"'),
+        ("add", '#include "tests/conditional_regions/jit.hpp"'),
+    }
+    guard_only_keys = {
+        ("remove", '#include "tests/cxx/direct.h"'),
+        ("add", '#include "tests/cxx/indirect.h"'),
+    }
+    assert set(guarded_operations) == nested_keys | guard_only_keys
+    nested_condition = {
+        "status": "known",
+        "value": {
+            "expression": "defined(GUARDED_FEATURE)",
+            "location": {
+                "status": "known",
+                "value": {"path": GUARDED_HEADER, "line": 10, "column": 2},
+            },
+            "active_branch": True,
+            "source_region_id": "branch-199-0-199",
+            "source_region_path": ["branch-1-0-1", "branch-199-0-199"],
+        },
+    }
+    for key in nested_keys:
+        operation = guarded_operations[key]
+        assert operation["edit_condition"] == nested_condition
+        assert operation["multi_config"]["value"][0]["condition"] == \
+            nested_condition
+    for key in guard_only_keys:
+        operation = guarded_operations[key]
+        assert operation["edit_condition"] == {
+            "status": "not_applicable", "value": None}
+        assert operation["multi_config"]["value"][0]["condition"] == {
+            "status": "not_applicable", "value": None}
+
+    guard_policy = """schema_version: 1
+rules:
+  - id: nested-condition-without-guard
+    action: deny_add
+    match:
+      includee: { glob: "*tests/conditional_regions/jit.hpp" }
+      active_condition: "defined(GUARDED_FEATURE)"
+  - id: guard-is-not-an-active-condition
+    action: deny_add
+    match:
+      includee: { glob: "*tests/cxx/indirect.h" }
+      active_condition: "!defined(TESTS_CONDITIONAL_REGIONS_GUARDED_HPP_)"
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", dir=ROOT,
+                                     delete=False) as policy_stream:
+        policy_stream.write(guard_policy)
+        policy_path = Path(policy_stream.name).resolve()
+    try:
+        guarded_policy = analyze(
+            "guarded", guarded_flags, GUARDED_SOURCE, GUARDED_HEADER,
+            ("--check_also=" + GUARDED_HEADER,
+             "--project_policy=" + str(policy_path)))
+    finally:
+        policy_path.unlink()
+    guarded_policy_operations = {
+        (operation["subject_action"], operation["spelling"]): operation
+        for operation in guarded_policy["operations"]
+    }
+    nested_add = guarded_policy_operations[
+        ("add", '#include "tests/conditional_regions/jit.hpp"')]
+    assert nested_add["reason_code"] == "project_policy_deny_add"
+    assert nested_add["policy"]["value"]["rule_id"] == \
+        "nested-condition-without-guard"
+    guard_only_add = guarded_policy_operations[
+        ("add", '#include "tests/cxx/indirect.h"')]
+    assert guard_only_add["disposition"] == "apply"
+    assert guard_only_add["policy"]["status"] == "unavailable"
+
+    guarded_compile = subprocess.run(
+        [CXX, "-std=c++17", "-I", str(ROOT), *guarded_flags,
+         "-fsyntax-only", str(ROOT / GUARDED_SOURCE)],
+        text=True, capture_output=True)
+    assert guarded_compile.returncode == 0, guarded_compile.stderr
+
     with tempfile.TemporaryDirectory() as temporary:
         database = Path(temporary)
         entry = {
@@ -253,6 +362,53 @@ def main():
         nested_driven_record = nested_driven_records[0]
         VALIDATOR.validate(nested_driven_record)
         assert nested_driven_record["conditional_regions"] == nested_regions
+
+        guarded_entry = {
+            "directory": str(ROOT),
+            "file": GUARDED_SOURCE,
+            "arguments": [CXX, "-I", str(ROOT), "-std=c++17",
+                          *guarded_flags, "-c", GUARDED_SOURCE],
+        }
+        (database / "compile_commands.json").write_text(
+            json.dumps([guarded_entry]))
+        guarded_driven = subprocess.run(
+            [sys.executable, str(DRIVER), "-o", "json", "--output-schema",
+             "2", "--database", "guarded=" + str(database)],
+            cwd=ROOT, env=environment, text=True, capture_output=True)
+        assert guarded_driven.returncode == 0, guarded_driven.stderr
+        assert guarded_driven.stderr == ""
+        guarded_driven_records = [
+            json.loads(line) for line in guarded_driven.stdout.splitlines()]
+        guarded_driven_record = next(
+            record for record in guarded_driven_records
+            if record["file"]["path"].endswith("guarded.hpp"))
+        VALIDATOR.validate(guarded_driven_record)
+        assert [(region["source_region_id"],
+                 region["parent_source_region_id"],
+                 region["directive_kind"], region["expression"],
+                 region["activity"], region["lexical_scope"])
+                for region in guarded_driven_record["conditional_regions"]] == [
+            (region["source_region_id"], region["parent_source_region_id"],
+             region["directive_kind"], region["expression"],
+             region["activity"], region["lexical_scope"])
+            for region in guarded_regions
+        ]
+        driven_operations = {
+            (operation["subject_action"], operation["spelling"]): operation
+            for operation in guarded_driven_record["operations"]
+        }
+        assert set(driven_operations) == nested_keys | guard_only_keys
+        driven_nested_condition = json.loads(json.dumps(nested_condition))
+        driven_nested_condition["value"]["location"]["value"]["path"] = \
+            str((ROOT / GUARDED_HEADER).resolve()).replace(os.sep, "/")
+        for key in nested_keys:
+            assert driven_operations[key]["edit_condition"] == \
+                driven_nested_condition
+            assert driven_operations[key]["multi_config"]["value"][0][
+                "condition"] == driven_nested_condition
+        for key in guard_only_keys:
+            assert driven_operations[key]["edit_condition"] == {
+                "status": "not_applicable", "value": None}
 
     print("PASS: MC-002 complete conditional-region census and scope facts")
 
