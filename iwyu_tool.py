@@ -1437,15 +1437,16 @@ def _validate_conditional_regions(record, source_bytes):
 
     for operation in record['operations']:
         context = operation['id']
-        # An include removal edits the present include occurrence itself. Its
-        # conditional anchor must therefore remain in active file scope. Add
-        # and keep conditions describe provenance, not an insertion/removal
-        # point, and may honestly originate in a function, class, namespace,
-        # or declaration scope. Consumers decide whether such provenance is an
-        # safe insertion site.
+        # Only an applied removal edits the present include occurrence. Its
+        # conditional anchor must therefore remain in active file scope.
+        # Kept, reported, and suppressed removals are no-edit provenance and
+        # may honestly originate in a function, class, namespace, or
+        # declaration scope. The same is true of add and keep provenance;
+        # consumers decide whether it describes a safe insertion site.
         require_file_scope = (
             operation['subject_action'] == 'remove' and
-            operation['item_kind'] == 'include')
+            operation['item_kind'] == 'include' and
+            operation['disposition'] == 'apply')
         resolve_condition(operation['edit_condition'], context, True,
                           require_file_scope)
         multi_config = operation['multi_config']

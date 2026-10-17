@@ -21,6 +21,10 @@ VALIDATOR = jsonschema.Draft202012Validator(SCHEMA)
 SOURCE = "tests/conditional_regions/conditional.cc"
 SCOPE_SOURCE = "tests/conditional_regions/scope.cc"
 NON_FILE_SOURCE = "tests/conditional_regions/non_file.cc"
+NON_FILE_KEEP_SOURCES = {
+    scope: f"tests/conditional_regions/non_file_keep_{scope}.cc"
+    for scope in ("function", "class", "namespace", "declaration")
+}
 SPLICED_SOURCE = "tests/conditional_regions/spliced.cc"
 NESTED_SOURCE = "tests/conditional_regions/nested.cc"
 GUARDED_SOURCE = "tests/conditional_regions/guarded.cc"
@@ -63,6 +67,40 @@ def analyze(configuration, flags, source=SOURCE, target=None, iwyu_args=()):
     selected = target or source
     return next(record for record in records
                 if record["file"]["path"].endswith(selected.rsplit("/", 1)[-1]))
+
+
+def assert_non_file_keep(record, source):
+    assert record["status"] == "correct"
+    assert record["diagnostics"] == []
+    assert len(record["conditional_regions"]) == 1
+    region = record["conditional_regions"][0]
+    assert (region["activity"], region["lexical_scope"]) == \
+        ("active", "non_file")
+
+    assert len(record["operations"]) == 1
+    operation = record["operations"][0]
+    assert (operation["subject_action"], operation["item_kind"],
+            operation["disposition"], operation["reason_code"]) == \
+        ("remove", "include", "keep", "pragma_keep")
+    assert operation["spelling"] == \
+        '#include "tests/conditional_regions/empty.hpp"  // IWYU pragma: keep'
+    condition = operation["edit_condition"]
+    assert condition["status"] == "known"
+    assert condition["value"]["active_branch"] is True
+    assert condition["value"]["source_region_id"] == \
+        region["source_region_id"]
+    assert condition["value"]["source_region_path"] == \
+        [region["source_region_id"]]
+    assert condition["value"]["location"]["value"]["path"].endswith(source)
+    assert operation["multi_config"]["value"] == [{
+        "condition": condition,
+        "configuration": "zero",
+        "disposition": "keep",
+        "subject_action": "remove",
+    }]
+    assert operation["spelling"] in {
+        item["spelling"] for item in record["desired_state"]["items"]}
+    return operation
 
 
 def main():
@@ -162,6 +200,22 @@ def main():
             for region_id in non_file_path] == ["non_file"]
     assert non_file_add["multi_config"]["value"][0]["condition"] == \
         non_file_condition
+
+    # A present include retained by an IWYU keep pragma is no-edit provenance.
+    # Its active condition remains exact and schema-valid in function, class,
+    # namespace, and declaration scopes even though none is an edit location.
+    non_file_keeps = {
+        scope: analyze("zero", ["-DNON_FILE_KEEP"], source)
+        for scope, source in NON_FILE_KEEP_SOURCES.items()
+    }
+    for scope, record in non_file_keeps.items():
+        source = NON_FILE_KEEP_SOURCES[scope]
+        assert_non_file_keep(record, source)
+        keep_compile = subprocess.run(
+            [CXX, "-std=c++17", "-I", str(ROOT), "-DNON_FILE_KEEP",
+             "-fsyntax-only", str(ROOT / source)],
+            text=True, capture_output=True)
+        assert keep_compile.returncode == 0, (scope, keep_compile.stderr)
 
     # Legal phase-2 splicing can separate the hash from every directive
     # keyword. The producer reports keyword offsets and physical locations,
@@ -351,6 +405,34 @@ rules:
         environment = os.environ.copy()
         environment["IWYU_BINARY"] = str(IWYU)
 
+        keep_entries = [{
+            "directory": str(ROOT),
+            "file": source,
+            "arguments": [CXX, "-I", str(ROOT), "-std=c++17",
+                          "-DNON_FILE_KEEP", "-c", source],
+        } for source in NON_FILE_KEEP_SOURCES.values()]
+        (database / "compile_commands.json").write_text(
+            json.dumps(keep_entries))
+        keep_driven = subprocess.run(
+            [sys.executable, str(DRIVER), "-o", "json", "--output-schema",
+             "2", "--database", "zero=" + str(database)],
+            cwd=ROOT, env=environment, text=True, capture_output=True)
+        assert keep_driven.returncode == 0, keep_driven.stderr
+        assert keep_driven.stderr == ""
+        keep_driven_records = [
+            json.loads(line) for line in keep_driven.stdout.splitlines()]
+        assert len(keep_driven_records) == len(NON_FILE_KEEP_SOURCES)
+        keep_records_by_name = {
+            Path(record["file"]["path"]).name: record
+            for record in keep_driven_records
+        }
+        assert set(keep_records_by_name) == {
+            Path(source).name for source in NON_FILE_KEEP_SOURCES.values()}
+        for scope, source in NON_FILE_KEEP_SOURCES.items():
+            record = keep_records_by_name[Path(source).name]
+            VALIDATOR.validate(record)
+            assert_non_file_keep(record, source)
+
         non_file_entry = {
             "directory": str(ROOT),
             "file": NON_FILE_SOURCE,
@@ -473,11 +555,15 @@ rules:
             assert driven_operations[key]["edit_condition"] == {
                 "status": "not_applicable", "value": None}
 
-        # A remove/include condition anchors the present include occurrence,
-        # unlike add/keep provenance. The producer guarantees that this actual
-        # edit site is active file scope, so a claimed non-file occurrence must
-        # still fail protocol validation.
+        # An applied remove/include condition anchors the present include
+        # occurrence. The producer guarantees that this actual edit site is
+        # active file scope, so a claimed non-file occurrence must still fail
+        # protocol validation. No-edit remove/keep operations above are valid.
         forged_removal_scope = copy.deepcopy(guarded_driven_record)
+        forged_operation = driven_operations[
+            ("remove", '#include "tests/conditional_regions/all.hpp"')]
+        assert (forged_operation["item_kind"],
+                forged_operation["disposition"]) == ("include", "apply")
         forged_target = next(
             region for region in forged_removal_scope["conditional_regions"]
             if region["source_region_id"] == "branch-199-0-199")
