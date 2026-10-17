@@ -37,15 +37,21 @@ path. A Clang-proved controlling include guard remains in this lexical path when
 a nested real condition supplies the anchor, but the guard is omitted from the
 semantic `expression` and project-policy `active_condition`. An operation
 controlled only by that guard remains semantically unconditional and therefore
-has a `not_applicable` condition. For known edit anchors and non-`none`
-contribution anchors, every region in the path must be active and have
-`lexical_scope: file`, and `active_branch` must be true. Use-only provenance may
-legitimately resolve through `non_file` regions, but every ancestor's activity
-must make the complete path agree with `active_branch`. `lexical_scope` is `file`
-only when both the final macro-expanded token stream and completed AST ranges
-prove that the directive can accept a file-scope include. Function, class,
-namespace-block, macro-expanded, declaration-embedded, malformed, and uncertain
-locations are `non_file` or `unknown`.
+has a `not_applicable` condition. For every known operation, use, and
+non-`none` contribution anchor, every region in the path must exist, and the
+complete path activity must agree with `active_branch`. Operation and non-`none`
+contribution anchors must describe an active branch. Their `lexical_scope`
+remains honest provenance and may be `non_file` or `unknown`; schema validity
+does not turn that provenance into an insertion site. A conditional include
+removal is the narrower exception because its edit anchor is the present include
+occurrence itself: every region in that path must have `lexical_scope: file`.
+Consumers that insert a missing item must independently require an
+include-capable file-scope preamble before applying it.
+`lexical_scope` is `file` only when both the final macro-expanded token stream
+and completed AST ranges prove that the directive can accept a file-scope
+include. Function, class, namespace-block, macro-expanded,
+declaration-embedded, malformed, and uncertain locations are `non_file` or
+`unknown`.
 
 ## Declaration facts
 

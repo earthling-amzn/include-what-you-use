@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Opaque MC-002 conditional-region census contract."""
 
+import copy
+import importlib.util
 import json
 import hashlib
 import os
@@ -18,6 +20,7 @@ SCHEMA = json.loads((ROOT / "docs/output-v2.schema.json").read_text())
 VALIDATOR = jsonschema.Draft202012Validator(SCHEMA)
 SOURCE = "tests/conditional_regions/conditional.cc"
 SCOPE_SOURCE = "tests/conditional_regions/scope.cc"
+NON_FILE_SOURCE = "tests/conditional_regions/non_file.cc"
 SPLICED_SOURCE = "tests/conditional_regions/spliced.cc"
 NESTED_SOURCE = "tests/conditional_regions/nested.cc"
 GUARDED_SOURCE = "tests/conditional_regions/guarded.cc"
@@ -134,6 +137,31 @@ def main():
          "-fsyntax-only", str(ROOT / SCOPE_SOURCE)],
         text=True, capture_output=True)
     assert scope_compile.returncode == 0, scope_compile.stderr
+
+    # A type used only as a pointer in an active class-body branch produces a
+    # forward-declaration add whose provenance is the class-body condition.
+    # This matches real HotSpot records: the condition is valid and active but
+    # is not itself a legal file-scope insertion anchor.
+    non_file = analyze(
+        "non-file", ["-DNON_FILE_CONDITION"], NON_FILE_SOURCE)
+    non_file_regions = {
+        region["source_region_id"]: region
+        for region in non_file["conditional_regions"]
+    }
+    non_file_add = next(
+        operation for operation in non_file["operations"]
+        if operation["subject_action"] == "add" and
+           operation["item_kind"] == "forward_declaration" and
+           operation["spelling"] == "class NonFileConditionalType;")
+    non_file_condition = non_file_add["edit_condition"]
+    assert non_file_condition["status"] == "known"
+    non_file_path = non_file_condition["value"]["source_region_path"]
+    assert [non_file_regions[region_id]["activity"]
+            for region_id in non_file_path] == ["active"]
+    assert [non_file_regions[region_id]["lexical_scope"]
+            for region_id in non_file_path] == ["non_file"]
+    assert non_file_add["multi_config"]["value"][0]["condition"] == \
+        non_file_condition
 
     # Legal phase-2 splicing can separate the hash from every directive
     # keyword. The producer reports keyword offsets and physical locations,
@@ -320,6 +348,43 @@ rules:
 
     with tempfile.TemporaryDirectory() as temporary:
         database = Path(temporary)
+        environment = os.environ.copy()
+        environment["IWYU_BINARY"] = str(IWYU)
+
+        non_file_entry = {
+            "directory": str(ROOT),
+            "file": NON_FILE_SOURCE,
+            "arguments": [CXX, "-I", str(ROOT), "-std=c++17",
+                          "-DNON_FILE_CONDITION", "-c", NON_FILE_SOURCE],
+        }
+        (database / "compile_commands.json").write_text(
+            json.dumps([non_file_entry]))
+        non_file_driven = subprocess.run(
+            [sys.executable, str(DRIVER), "-o", "json", "--output-schema",
+             "2", "--database", "non-file=" + str(database)],
+            cwd=ROOT, env=environment, text=True, capture_output=True)
+        assert non_file_driven.returncode == 0, non_file_driven.stderr
+        assert non_file_driven.stderr == ""
+        non_file_driven_records = [
+            json.loads(line)
+            for line in non_file_driven.stdout.splitlines()]
+        assert len(non_file_driven_records) == 1
+        driven_non_file = non_file_driven_records[0]
+        driven_regions = {
+            region["source_region_id"]: region
+            for region in driven_non_file["conditional_regions"]
+        }
+        driven_add = next(
+            operation for operation in driven_non_file["operations"]
+            if operation["subject_action"] == "add" and
+               operation["item_kind"] == "forward_declaration")
+        driven_path = driven_add["edit_condition"]["value"][
+            "source_region_path"]
+        assert [driven_regions[region_id]["lexical_scope"]
+                for region_id in driven_path] == ["non_file"]
+        assert driven_add["multi_config"]["value"][0]["condition"] == \
+            driven_add["edit_condition"]
+
         entry = {
             "directory": str(ROOT),
             "file": SPLICED_SOURCE,
@@ -327,8 +392,6 @@ rules:
                           "-DSPLICED_BRANCH", "-c", SPLICED_SOURCE],
         }
         (database / "compile_commands.json").write_text(json.dumps([entry]))
-        environment = os.environ.copy()
-        environment["IWYU_BINARY"] = str(IWYU)
         driven = subprocess.run(
             [sys.executable, str(DRIVER), "-o", "json", "--output-schema",
              "2", "--database", "enabled=" + str(database)],
@@ -409,6 +472,28 @@ rules:
         for key in guard_only_keys:
             assert driven_operations[key]["edit_condition"] == {
                 "status": "not_applicable", "value": None}
+
+        # A remove/include condition anchors the present include occurrence,
+        # unlike add/keep provenance. The producer guarantees that this actual
+        # edit site is active file scope, so a claimed non-file occurrence must
+        # still fail protocol validation.
+        forged_removal_scope = copy.deepcopy(guarded_driven_record)
+        forged_target = next(
+            region for region in forged_removal_scope["conditional_regions"]
+            if region["source_region_id"] == "branch-199-0-199")
+        forged_target["lexical_scope"] = "non_file"
+        driver_spec = importlib.util.spec_from_file_location(
+            "conditional_regions_iwyu_tool", DRIVER)
+        driver_module = importlib.util.module_from_spec(driver_spec)
+        driver_spec.loader.exec_module(driver_module)
+        try:
+            driver_module._validate_declaration_facts(
+                forged_removal_scope, (ROOT / GUARDED_HEADER).read_bytes())
+        except driver_module.ProtocolError as error:
+            assert "not entirely active file scope" in str(error)
+        else:
+            raise AssertionError(
+                "conditional include removal accepted a non-file edit anchor")
 
     print("PASS: MC-002 complete conditional-region census and scope facts")
 

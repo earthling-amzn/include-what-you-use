@@ -704,9 +704,7 @@ def main():
         write_record_mutator(mutator)
         malformed_messages = {
             "child_body_escapes_parent": "differs from exact source census",
-            "anchored_region_non_file": "not entirely active file scope",
             "anchored_region_inactive": "activity is inconsistent",
-            "anchored_ancestor_non_file": "not entirely active file scope",
             "anchored_ancestor_inactive": "activity is inconsistent",
             "omit_else_region": "not a complete exact source census",
             "directive_offset_not_keyword": "differs from exact source census",
@@ -721,6 +719,34 @@ def main():
             assert malformed.returncode != 0, mode
             assert malformed.stdout == "", (mode, malformed.stdout)
             assert message in malformed.stderr, (mode, malformed.stderr)
+
+        # Scope classifications are provenance facts. A valid active path may
+        # contain a non-file target or ancestor without invalidating the native
+        # record; downstream consumers remain responsible for edit placement.
+        for mode in ("anchored_region_non_file",
+                     "anchored_ancestor_non_file"):
+            env = os.environ.copy()
+            env["IWYU_BINARY"] = str(mutator)
+            env["SEM005_BASE_RECORD"] = str(base_record)
+            env["SEM005_RECORD_MUTATION"] = mode
+            accepted = run(malformed_command, env=env)
+            assert accepted.returncode == 0, (mode, accepted.stderr)
+            accepted_records = parse_records(accepted)
+            assert len(accepted_records) == 1
+            accepted_record = accepted_records[0]
+            regions = {
+                region["source_region_id"]: region
+                for region in accepted_record["conditional_regions"]
+            }
+            paths = [
+                operation["edit_condition"]["value"]["source_region_path"]
+                for operation in accepted_record["operations"]
+                if operation["edit_condition"]["status"] == "known"
+            ]
+            assert any(
+                any(regions[region_id]["lexical_scope"] == "non_file"
+                    for region_id in path)
+                for path in paths), mode
 
         race_source = temporary / "source-race.cc"
         race_source.write_text("struct Race {};\nRace* value;\n")

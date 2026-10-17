@@ -153,8 +153,9 @@ Other required operation fields:
 - `symbols`: declarations and per-use completeness/origin/macro/condition data
   motivating the operation.
 - `provider`: separately available selected provider, candidates, and chain.
-- `edit_condition`: condition under which an addition/removal should be applied;
-  this is distinct from each motivating use's condition.
+- `edit_condition`: condition governing the recommendation; for additions and
+  keeps this is provenance, not a guarantee that the condition is a legal
+  insertion point. A consumer must separately validate its edit anchor.
 - `policy`: typed policy file, rule, and decision provenance.
 - `multi_config`: typed per-configuration contributions.
 

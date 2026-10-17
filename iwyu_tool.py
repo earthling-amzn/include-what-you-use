@@ -1361,7 +1361,8 @@ def _validate_conditional_regions(record, source_bytes):
             seen.add(current)
             current = parent_by_identity[current]
 
-    def resolve_condition(condition, context, require_file_scope):
+    def resolve_condition(condition, context, require_active,
+                          require_file_scope):
         if condition['status'] != 'known':
             return
         value = condition['value']
@@ -1421,42 +1422,46 @@ def _validate_conditional_regions(record, source_bytes):
             raise ProtocolError(
                 '%s condition path activity is inconsistent with active_branch' %
                 context)
+        if require_active and not value['active_branch']:
+            raise ProtocolError('%s condition anchor is not an active branch' %
+                                context)
         if require_file_scope:
-            if not value['active_branch']:
-                raise ProtocolError('%s condition anchor is not an active branch' %
-                                    context)
             file_scope = [
                 (identity, path) for identity, path in activity_candidates
-                if all(regions_by_identity[item]['activity'] == 'active' and
-                       regions_by_identity[item]['lexical_scope'] == 'file'
+                if all(regions_by_identity[item]['lexical_scope'] == 'file'
                        for item in path)]
             if not file_scope:
-                if any(any(regions_by_identity[item]['activity'] != 'active'
-                           for item in path)
-                       for _, path in activity_candidates):
-                    raise ProtocolError(
-                        '%s condition anchor resolves inactive or unknown' %
-                        context)
                 raise ProtocolError(
                     '%s condition path is not entirely active file scope' %
                     context)
 
     for operation in record['operations']:
         context = operation['id']
-        resolve_condition(operation['edit_condition'], context, True)
+        # An include removal edits the present include occurrence itself. Its
+        # conditional anchor must therefore remain in active file scope. Add
+        # and keep conditions describe provenance, not an insertion/removal
+        # point, and may honestly originate in a function, class, namespace,
+        # or declaration scope. Consumers decide whether such provenance is an
+        # safe insertion site.
+        require_file_scope = (
+            operation['subject_action'] == 'remove' and
+            operation['item_kind'] == 'include')
+        resolve_condition(operation['edit_condition'], context, True,
+                          require_file_scope)
         multi_config = operation['multi_config']
         if multi_config['status'] == 'known':
             for contribution in multi_config['value']:
                 if contribution['subject_action'] != 'none':
                     resolve_condition(
                         contribution['condition'], context + ' contribution',
-                        True)
+                        True, False)
         for symbol in operation['symbols']:
             for use in symbol['uses']:
                 # Uses inside functions, classes, and other non-file scopes are
-                # valid provenance. They still must name a branch active in at
-                # least one matching physical include instance.
-                resolve_condition(use['condition'], context + ' use', False)
+                # valid provenance. They still must name a branch active in
+                # at least one matching physical include instance.
+                resolve_condition(use['condition'], context + ' use', False,
+                                  False)
 
 
 def _declaration_kinds_incompatible(kinds):
