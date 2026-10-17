@@ -12,11 +12,16 @@ is byte-compatible with the prior contract. Select version 2 with
 Every version-2 record has `file_digest` and `conditional_regions` in addition
 to the declaration fields below. `file_digest.value` equals `source_digest` and
 binds region byte offsets to the exact analyzed SourceManager buffer. The driver
-hashes one byte snapshot, then validates every opening, directive, body-begin,
-and known body-end offset against that same snapshot. Directive offsets must
-name the exact `directive_kind` token after the source line's optional whitespace
-and literal `#`; body beginnings follow the producer's escaped-newline rule, and
-known final body ends name `#endif`. The census contains every physical
+hashes one byte snapshot, independently raw-lexes it after C/C++ phase-2
+backslash-newline splicing, and requires each submitted FileID census to match
+that result exactly. The lexer excludes directive-looking bytes in comments,
+ordinary literals, and raw strings. It compares every opening, alternative,
+closure, directive/body offset, branch index and kind, parent identity, and
+physical source location. Directive offsets name the exact physical
+`directive_kind` token even when `#\\\nif`, `#\\\nelse`, or `#\\\nendif`
+spelling puts the hash on the preceding physical line. Body beginnings account
+for continued directive lines, and every final body end names the independently
+observed `#endif`. The census contains every physical
 `#if`/`#ifdef`/`#ifndef` branch and each alternative, including inactive
 branches. Each child records stable source-derived region and parent identities,
 opening/directive/body offsets, branch index, directive kind, expression,
@@ -27,10 +32,12 @@ every known child body within its known parent body.
 
 Known operation, use, and contribution conditions carry `source_region_id` and
 the complete outer-to-inner `source_region_path`; expression text alone is not
-an identity. Every known anchor must resolve through that parent path to an
-active branch. Known edit anchors and non-`none` contribution anchors must also
-have `active_branch: true` and resolve to `lexical_scope: file`; use-only
-provenance may legitimately resolve to `non_file`. `lexical_scope` is `file`
+an identity. Every known anchor must resolve through that exact parent path.
+For known edit anchors and non-`none` contribution anchors, every region in the
+path must be active and have `lexical_scope: file`, and `active_branch` must be
+true. Use-only provenance may legitimately resolve through `non_file` regions,
+but every ancestor's activity must make the complete path agree with
+`active_branch`. `lexical_scope` is `file`
 only when both the final macro-expanded token stream and completed AST ranges
 prove that the directive can accept a file-scope include. Function, class,
 namespace-block, macro-expanded, declaration-embedded, malformed, and uncertain

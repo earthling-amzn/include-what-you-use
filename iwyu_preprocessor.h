@@ -443,6 +443,8 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
   BranchActivity ActivityUnderParent(BranchActivity condition_activity,
                                      BranchActivity parent_activity) const;
   unsigned DirectiveBodyBeginOffset(clang::SourceLocation loc) const;
+  clang::SourceLocation DirectiveKeywordLocation(
+      clang::SourceLocation loc, const string& directive_kind) const;
   void CloseCurrentRegion(unsigned file_id, unsigned end_offset);
   string ConditionSourceText(clang::SourceRange range) const;
   void RecordConditionEvent(clang::SourceLocation loc);
@@ -526,6 +528,7 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
   map<const clang::FileEntry*, vector<ConditionalState>> conditional_stacks_;
   map<unsigned, vector<ActiveConditionalState>> active_condition_stacks_;
   map<unsigned, vector<ConditionEvent>> condition_events_;
+  map<const clang::FileEntry*, vector<clang::FileID>> entered_file_ids_;
   vector<ConditionalRegion> conditional_regions_;
   map<const clang::FileEntry*, vector<size_t>> conditional_regions_by_file_;
   vector<DirectIncludeCondition> direct_include_conditions_;

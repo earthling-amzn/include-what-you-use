@@ -958,21 +958,217 @@ def _directive_body_begin_offset(source_bytes, offset):
     return len(source_bytes)
 
 
-def _validate_directive_spelling(source_bytes, offset, directive_kind,
-                                 context):
-    token = directive_kind.encode('ascii')
-    if source_bytes[offset:offset + len(token)] != token:
-        raise ProtocolError('%s offset does not name directive keyword' % context)
-    after = offset + len(token)
-    if (after < len(source_bytes) and
-            source_bytes[after] in
-            b'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'):
-        raise ProtocolError('%s directive keyword is not token-delimited' %
-                            context)
-    line_start = source_bytes.rfind(b'\n', 0, offset) + 1
-    prefix = source_bytes[line_start:offset]
-    if re.fullmatch(br'[ \t\v\f\r]*\#[ \t\v\f\r]*', prefix) is None:
-        raise ProtocolError('%s directive lacks source # spelling' % context)
+_CONDITIONAL_OPENERS = set([b'if', b'ifdef', b'ifndef'])
+_CONDITIONAL_ALTERNATIVES = set([b'elif', b'elifdef', b'elifndef', b'else'])
+_CONDITIONAL_DIRECTIVES = (
+    _CONDITIONAL_OPENERS | _CONDITIONAL_ALTERNATIVES | set([b'endif']))
+_HORIZONTAL_SPACE = b' \t\v\f\r'
+_IDENTIFIER_BYTES = (
+    b'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_')
+
+
+def _phase2_splice(source_bytes):
+    """Return phase-2 logical bytes and each byte's physical source offset."""
+    logical = bytearray()
+    physical = []
+    index = 0
+    while index < len(source_bytes):
+        if source_bytes[index:index + 2] == b'\\\n':
+            index += 2
+            continue
+        if source_bytes[index:index + 3] == b'\\\r\n':
+            index += 3
+            continue
+        logical.append(source_bytes[index])
+        physical.append(index)
+        index += 1
+    return bytes(logical), physical
+
+
+def _raw_string_end(logical, index):
+    """Return one-past a C++ raw string token, or None when this is not one."""
+    match = re.match(br'(?:u8|u|U|L)?R"([^ ()\\\t\v\f\r\n]{0,16})\(',
+                     logical[index:])
+    if not match:
+        return None
+    delimiter = match.group(1)
+    body = index + match.end()
+    closing = b')' + delimiter + b'"'
+    end = logical.find(closing, body)
+    return None if end < 0 else end + len(closing)
+
+
+def _directive_keyword_after_hash(logical, hash_index):
+    index = hash_index + 1
+    while index < len(logical):
+        while index < len(logical) and logical[index] in _HORIZONTAL_SPACE:
+            index += 1
+        if logical[index:index + 2] == b'/*':
+            end = logical.find(b'*/', index + 2)
+            if end < 0 or b'\n' in logical[index:end + 2]:
+                return None
+            index = end + 2
+            continue
+        if logical[index:index + 2] == b'//' or (
+                index < len(logical) and logical[index] == ord('\n')):
+            return None
+        break
+    begin = index
+    while index < len(logical) and logical[index] in _IDENTIFIER_BYTES:
+        index += 1
+    if begin == index:
+        return None
+    kind = logical[begin:index]
+    return (kind, begin) if kind in _CONDITIONAL_DIRECTIVES else None
+
+
+def _raw_lex_conditional_directives(source_bytes):
+    """Independently lex conditional directives from exact physical bytes.
+
+    This implements phase-2 backslash-newline splicing before recognizing
+    comments and preprocessing lines. It tracks block comments, ordinary
+    literals, and raw strings so directive-looking bytes inside them cannot
+    enter the census.
+    """
+    logical, physical = _phase2_splice(source_bytes)
+    directives = []
+    index = 0
+    at_line_start = True
+    in_block_comment = False
+    while index < len(logical):
+        if in_block_comment:
+            if logical[index:index + 2] == b'*/':
+                in_block_comment = False
+                index += 2
+            else:
+                if logical[index] == ord('\n'):
+                    at_line_start = True
+                index += 1
+            continue
+
+        if logical[index:index + 2] == b'//':
+            newline = logical.find(b'\n', index + 2)
+            if newline < 0:
+                break
+            index = newline
+            continue
+        if logical[index:index + 2] == b'/*':
+            in_block_comment = True
+            index += 2
+            continue
+
+        byte = logical[index]
+        if byte == ord('\n'):
+            at_line_start = True
+            index += 1
+            continue
+        if at_line_start and byte in _HORIZONTAL_SPACE:
+            index += 1
+            continue
+        if at_line_start and byte == ord('#'):
+            found = _directive_keyword_after_hash(logical, index)
+            if found is not None:
+                kind, keyword_index = found
+                directives.append({
+                    'hash_offset': physical[index],
+                    'offset': physical[keyword_index],
+                    'body_begin': _directive_body_begin_offset(
+                        source_bytes, physical[keyword_index]),
+                    'kind': kind.decode('ascii'),
+                })
+            at_line_start = False
+            index += 1
+            continue
+
+        raw_end = _raw_string_end(logical, index)
+        if raw_end is not None:
+            at_line_start = False
+            index = raw_end
+            continue
+        if byte in (ord('"'), ord("'")):
+            quote = byte
+            at_line_start = False
+            index += 1
+            escaped = False
+            while index < len(logical):
+                current = logical[index]
+                index += 1
+                if escaped:
+                    escaped = False
+                elif current == ord('\\'):
+                    escaped = True
+                elif current == quote:
+                    break
+                elif current == ord('\n'):
+                    # Invalid unspliced ordinary literals will be rejected by
+                    # Clang. Resume line recognition to keep this lexer finite.
+                    at_line_start = True
+                    break
+            continue
+
+        at_line_start = False
+        index += 1
+    return directives
+
+
+def _expected_conditional_regions(source_bytes):
+    directives = _raw_lex_conditional_directives(source_bytes)
+    templates = []
+    stack = []
+    for directive in directives:
+        kind = directive['kind']
+        if kind in ('if', 'ifdef', 'ifndef'):
+            parent = (templates[stack[-1]['current']]['source_region_id']
+                      if stack else None)
+            source_id = 'branch-%d-0-%d' % (
+                directive['offset'], directive['offset'])
+            templates.append({
+                'source_region_id': source_id,
+                'opening_offset': directive['offset'],
+                'directive_offset': directive['offset'],
+                'body_begin_offset': directive['body_begin'],
+                'body_end_offset': None,
+                'branch_index': 0,
+                'parent_source_region_id': parent,
+                'directive_kind': kind,
+            })
+            stack.append({
+                'opening_offset': directive['offset'],
+                'branch_index': 0,
+                'current': len(templates) - 1,
+                'saw_else': False,
+            })
+        elif kind in ('elif', 'elifdef', 'elifndef', 'else'):
+            if not stack or stack[-1]['saw_else']:
+                raise ProtocolError('source bytes contain malformed conditional group')
+            group = stack[-1]
+            templates[group['current']]['body_end_offset'] = directive['offset']
+            group['branch_index'] += 1
+            group['saw_else'] = kind == 'else'
+            parent = (templates[stack[-2]['current']]['source_region_id']
+                      if len(stack) > 1 else None)
+            source_id = 'branch-%d-%d-%d' % (
+                group['opening_offset'], group['branch_index'],
+                directive['offset'])
+            templates.append({
+                'source_region_id': source_id,
+                'opening_offset': group['opening_offset'],
+                'directive_offset': directive['offset'],
+                'body_begin_offset': directive['body_begin'],
+                'body_end_offset': None,
+                'branch_index': group['branch_index'],
+                'parent_source_region_id': parent,
+                'directive_kind': kind,
+            })
+            group['current'] = len(templates) - 1
+        else:
+            if not stack:
+                raise ProtocolError('source bytes contain unmatched #endif')
+            templates[stack[-1]['current']]['body_end_offset'] = directive['offset']
+            stack.pop()
+    if stack:
+        raise ProtocolError('source bytes contain unterminated conditional group')
+    return templates
 
 
 def _validate_conditional_regions(record, source_bytes):
@@ -984,6 +1180,54 @@ def _validate_conditional_regions(record, source_bytes):
     file_path = record['file']['path']
     source_length = len(source_bytes)
     regions = record['conditional_regions']
+    expected_regions = _expected_conditional_regions(source_bytes)
+    if bool(regions) != bool(expected_regions):
+        raise ProtocolError(
+            'conditional_regions is not a complete exact source census')
+    regions_by_file_id = {}
+    for region in regions:
+        regions_by_file_id.setdefault(region['file_id'], []).append(region)
+    for file_regions in regions_by_file_id.values():
+        if len(file_regions) != len(expected_regions):
+            raise ProtocolError(
+                'conditional_regions is not a complete exact source census')
+        for actual, expected in zip(file_regions, expected_regions):
+            expected_parent = expected['parent_source_region_id']
+            parent_availability = actual['parent_source_region_id']
+            if expected_parent is None:
+                parent = (None if parent_availability['status'] ==
+                          'not_applicable' else '<invalid-availability>')
+            else:
+                parent = (parent_availability['value']
+                          if parent_availability['status'] == 'known'
+                          else '<invalid-availability>')
+            actual_template = {
+                'source_region_id': actual['source_region_id'],
+                'opening_offset': actual['opening_offset'],
+                'directive_offset': actual['directive_offset'],
+                'body_begin_offset': actual['body_begin_offset'],
+                'body_end_offset': (
+                    actual['body_end_offset']['value']
+                    if actual['body_end_offset']['status'] == 'known'
+                    else None),
+                'branch_index': actual['branch_index'],
+                'parent_source_region_id': parent,
+                'directive_kind': actual['directive_kind'],
+            }
+            if actual_template != expected:
+                raise ProtocolError(
+                    'conditional_regions differs from exact source census')
+            expected_opening = _source_location_at_offset(
+                source_bytes, file_path, expected['opening_offset'])
+            expected_directive = _source_location_at_offset(
+                source_bytes, file_path, expected['directive_offset'])
+            if actual['opening_location'] != {
+                    'status': 'known', 'value': expected_opening} or \
+                    actual['directive_location'] != {
+                        'status': 'known', 'value': expected_directive}:
+                raise ProtocolError(
+                    'conditional region location differs from exact source census')
+
     sort_keys = [
         (region['opening_offset'], region['branch_index'],
          region['directive_offset'], region['file_id'])
@@ -1023,9 +1267,6 @@ def _validate_conditional_regions(record, source_bytes):
                 raise ProtocolError(
                     'conditional region body end is out of bounds or precedes body')
 
-        _validate_directive_spelling(
-            source_bytes, directive, region['directive_kind'],
-            'conditional region')
         if body_begin != _directive_body_begin_offset(source_bytes, directive):
             raise ProtocolError(
                 'conditional region body begin differs from source directive')
@@ -1114,14 +1355,6 @@ def _validate_conditional_regions(record, source_bytes):
             seen.add(current)
             current = parent_by_identity[current]
 
-    for group_identities in groups.values():
-        final_region = regions_by_identity[group_identities[-1]]
-        final_end = final_region['body_end_offset']
-        if final_end['status'] == 'known':
-            _validate_directive_spelling(
-                source_bytes, final_end['value'], 'endif',
-                'conditional region closing')
-
     def resolve_condition(condition, context, require_file_scope):
         if condition['status'] != 'known':
             return
@@ -1153,6 +1386,15 @@ def _validate_conditional_regions(record, source_bytes):
             raise ProtocolError('%s condition path names an absent region' %
                                 context)
 
+        def resolved_path(identity):
+            path = []
+            current = identity
+            while current is not None:
+                path.append(current)
+                current = parent_by_identity[current]
+            path.reverse()
+            return path
+
         location = value['location']
         if location['status'] == 'known':
             candidates = [
@@ -1161,19 +1403,37 @@ def _validate_conditional_regions(record, source_bytes):
             if not candidates:
                 raise ProtocolError('%s condition location differs from anchor' %
                                     context)
-        if not value['active_branch']:
-            raise ProtocolError('%s condition anchor is not an active branch' %
-                                context)
-        active = [identity for identity in candidates
-                  if regions_by_identity[identity]['activity'] == 'active']
-        if not active:
-            raise ProtocolError('%s condition anchor resolves inactive or unknown' %
-                                context)
-        if require_file_scope and not any(
-                regions_by_identity[identity]['lexical_scope'] == 'file'
-                for identity in active):
-            raise ProtocolError('%s condition anchor is not active file scope' %
-                                context)
+        activity_candidates = []
+        for identity in candidates:
+            path = resolved_path(identity)
+            all_active = all(
+                regions_by_identity[item]['activity'] == 'active'
+                for item in path)
+            if all_active == value['active_branch']:
+                activity_candidates.append((identity, path))
+        if not activity_candidates:
+            raise ProtocolError(
+                '%s condition path activity is inconsistent with active_branch' %
+                context)
+        if require_file_scope:
+            if not value['active_branch']:
+                raise ProtocolError('%s condition anchor is not an active branch' %
+                                    context)
+            file_scope = [
+                (identity, path) for identity, path in activity_candidates
+                if all(regions_by_identity[item]['activity'] == 'active' and
+                       regions_by_identity[item]['lexical_scope'] == 'file'
+                       for item in path)]
+            if not file_scope:
+                if any(any(regions_by_identity[item]['activity'] != 'active'
+                           for item in path)
+                       for _, path in activity_candidates):
+                    raise ProtocolError(
+                        '%s condition anchor resolves inactive or unknown' %
+                        context)
+                raise ProtocolError(
+                    '%s condition path is not entirely active file scope' %
+                    context)
 
     for operation in record['operations']:
         context = operation['id']

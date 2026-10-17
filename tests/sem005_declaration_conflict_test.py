@@ -282,17 +282,34 @@ if mode == "child_body_escapes_parent":
                      region["source_region_id"] == parent_id)
     child["body_end_offset"] = {
         "status": "known", "value": parent["body_end_offset"]["value"] + 1}
-elif mode in ("anchored_region_non_file", "anchored_region_inactive"):
-    target = next(
-        operation["edit_condition"]["value"]["source_region_id"]
+elif mode in ("anchored_region_non_file", "anchored_region_inactive",
+              "anchored_ancestor_non_file", "anchored_ancestor_inactive"):
+    condition = next(
+        operation["edit_condition"]["value"]
         for operation in record["operations"]
-        if operation["edit_condition"]["status"] == "known")
+        if operation["edit_condition"]["status"] == "known" and
+           (not mode.startswith("anchored_ancestor_") or
+            len(operation["edit_condition"]["value"]["source_region_path"]) > 1))
+    target = condition["source_region_id"]
+    if mode.startswith("anchored_ancestor_"):
+        target = condition["source_region_path"][-2]
     region = next(region for region in regions
                   if region["source_region_id"] == target)
-    if mode == "anchored_region_non_file":
+    if mode.endswith("non_file"):
         region["lexical_scope"] = "non_file"
     else:
         region["activity"] = "inactive"
+elif mode == "omit_else_region":
+    omitted = next(region for region in regions
+                   if region["directive_kind"] == "else" and
+                      region["parent_source_region_id"]["status"] ==
+                          "not_applicable")
+    previous = next(region for region in regions
+                    if region["file_id"] == omitted["file_id"] and
+                       region["opening_offset"] == omitted["opening_offset"] and
+                       region["branch_index"] == omitted["branch_index"] - 1)
+    previous["body_end_offset"] = omitted["body_end_offset"]
+    regions.remove(omitted)
 elif mode == "directive_offset_not_keyword":
     region = next(region for region in regions if region["branch_index"] == 1)
     old_id = region["source_region_id"]
@@ -686,10 +703,13 @@ def main():
         mutator = temporary / "record-mutator.py"
         write_record_mutator(mutator)
         malformed_messages = {
-            "child_body_escapes_parent": "body escapes parent body",
-            "anchored_region_non_file": "not active file scope",
-            "anchored_region_inactive": "resolves inactive or unknown",
-            "directive_offset_not_keyword": "does not name directive keyword",
+            "child_body_escapes_parent": "differs from exact source census",
+            "anchored_region_non_file": "not entirely active file scope",
+            "anchored_region_inactive": "activity is inconsistent",
+            "anchored_ancestor_non_file": "not entirely active file scope",
+            "anchored_ancestor_inactive": "activity is inconsistent",
+            "omit_else_region": "not a complete exact source census",
+            "directive_offset_not_keyword": "differs from exact source census",
             "native_kind_family_conflict": "incompatible kind families",
         }
         for mode, message in malformed_messages.items():

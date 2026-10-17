@@ -3,9 +3,11 @@
 
 import json
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 import jsonschema
 
@@ -16,6 +18,8 @@ SCHEMA = json.loads((ROOT / "docs/output-v2.schema.json").read_text())
 VALIDATOR = jsonschema.Draft202012Validator(SCHEMA)
 SOURCE = "tests/conditional_regions/conditional.cc"
 SCOPE_SOURCE = "tests/conditional_regions/scope.cc"
+SPLICED_SOURCE = "tests/conditional_regions/spliced.cc"
+DRIVER = ROOT / "iwyu_tool.py"
 
 CONFIGS = {
     "server": ["-DCOMPILER2", "-DARCH_TEST", "-DX86"],
@@ -124,6 +128,79 @@ def main():
          "-fsyntax-only", str(ROOT / SCOPE_SOURCE)],
         text=True, capture_output=True)
     assert scope_compile.returncode == 0, scope_compile.stderr
+
+    # Legal phase-2 splicing can separate the hash from every directive
+    # keyword. The producer reports keyword offsets and physical locations,
+    # and the driver independently validates the same exact source census.
+    spliced_bytes = (ROOT / SPLICED_SOURCE).read_bytes()
+    spliced_records = {
+        "enabled": analyze("enabled", ["-DSPLICED_BRANCH"], SPLICED_SOURCE),
+        "fallback": analyze("fallback", [], SPLICED_SOURCE),
+    }
+    expected_spliced = {
+        "enabled": (["active", "inactive"], "jit.hpp", "branch-49-0-49"),
+        "fallback": (["inactive", "active"], "generic.hpp",
+                     "branch-49-1-156"),
+    }
+    for name, record in spliced_records.items():
+        regions = record["conditional_regions"]
+        assert [(region["directive_kind"], region["opening_offset"],
+                 region["directive_offset"], region["body_begin_offset"],
+                 region["body_end_offset"]["value"])
+                for region in regions] == [
+                    ("if", 49, 49, 87, 156),
+                    ("else", 49, 156, 161, 234),
+                ]
+        assert [region["activity"] for region in regions] == \
+            expected_spliced[name][0]
+        assert [region["directive_location"]["value"] for region in regions] == [
+            {"path": SPLICED_SOURCE, "line": 4, "column": 1},
+            {"path": SPLICED_SOURCE, "line": 10, "column": 1},
+        ]
+        assert [region["opening_location"]["value"] for region in regions] == [
+            {"path": SPLICED_SOURCE, "line": 4, "column": 1},
+            {"path": SPLICED_SOURCE, "line": 4, "column": 1},
+        ]
+        assert spliced_bytes[49:51] == b"if"
+        assert spliced_bytes[156:160] == b"else"
+        assert spliced_bytes[234:239] == b"endif"
+        add = next(operation for operation in record["operations"]
+                   if operation["subject_action"] == "add")
+        assert add["provider"]["selected"]["value"]["path"].endswith(
+            expected_spliced[name][1])
+        assert add["edit_condition"]["value"]["source_region_id"] == \
+            expected_spliced[name][2]
+        compile_result = subprocess.run(
+            [CXX, "-std=c++17", "-I", str(ROOT),
+             *(["-DSPLICED_BRANCH"] if name == "enabled" else []),
+             "-fsyntax-only", str(ROOT / SPLICED_SOURCE)],
+            text=True, capture_output=True)
+        assert compile_result.returncode == 0, compile_result.stderr
+
+    with tempfile.TemporaryDirectory() as temporary:
+        database = Path(temporary)
+        entry = {
+            "directory": str(ROOT),
+            "file": SPLICED_SOURCE,
+            "arguments": [CXX, "-I", str(ROOT), "-std=c++17",
+                          "-DSPLICED_BRANCH", "-c", SPLICED_SOURCE],
+        }
+        (database / "compile_commands.json").write_text(json.dumps([entry]))
+        environment = os.environ.copy()
+        environment["IWYU_BINARY"] = str(IWYU)
+        driven = subprocess.run(
+            [sys.executable, str(DRIVER), "-o", "json", "--output-schema",
+             "2", "--database", "enabled=" + str(database)],
+            cwd=ROOT, env=environment, text=True, capture_output=True)
+        assert driven.returncode == 0, driven.stderr
+        assert driven.stderr == ""
+        driven_records = [json.loads(line) for line in driven.stdout.splitlines()]
+        assert len(driven_records) == 1
+        driven_record = driven_records[0]
+        VALIDATOR.validate(driven_record)
+        assert driven_record["conditional_regions"] == \
+            spliced_records["enabled"]["conditional_regions"]
+
     print("PASS: MC-002 complete conditional-region census and scope facts")
 
 

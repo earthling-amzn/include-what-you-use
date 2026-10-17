@@ -152,6 +152,173 @@ bool IsExactPlainCounterpart(string inline_path, string plain_path) {
   return inline_path == plain_path;
 }
 
+struct RawConditionalDirective {
+  unsigned hash_offset;
+  unsigned directive_offset;
+  string kind;
+};
+
+bool IsHorizontalSpace(char ch) {
+  return ch == ' ' || ch == '\t' || ch == '\v' || ch == '\f' || ch == '\r';
+}
+
+bool IsIdentifierByte(char ch) {
+  const unsigned char value = static_cast<unsigned char>(ch);
+  return std::isalnum(value) || ch == '_';
+}
+
+size_t RawStringEnd(StringRef source, size_t offset) {
+  static const char* const prefixes[] = {"R\"", "u8R\"", "uR\"",
+                                         "UR\"", "LR\""};
+  for (const char* prefix : prefixes) {
+    const size_t prefix_length = strlen(prefix);
+    if (source.substr(offset).take_front(prefix_length) != prefix)
+      continue;
+    const size_t delimiter_begin = offset + prefix_length;
+    size_t open = delimiter_begin;
+    while (open < source.size() && source[open] != '(') {
+      const char ch = source[open];
+      if (open - delimiter_begin >= 16 || IsHorizontalSpace(ch) ||
+          ch == '\n' || ch == ' ' || ch == '(' || ch == ')' || ch == '\\') {
+        return string::npos;
+      }
+      ++open;
+    }
+    if (open == source.size())
+      return string::npos;
+    const StringRef delimiter = source.slice(delimiter_begin, open);
+    const string closing = ")" + delimiter.str() + "\"";
+    const size_t close = source.find(closing, open + 1);
+    return close == StringRef::npos ? string::npos : close + closing.size();
+  }
+  return string::npos;
+}
+
+vector<RawConditionalDirective> ScanConditionalDirectives(StringRef source) {
+  string logical;
+  vector<unsigned> physical;
+  logical.reserve(source.size());
+  physical.reserve(source.size());
+  for (size_t offset = 0; offset < source.size();) {
+    if (source[offset] == '\\' && offset + 1 < source.size() &&
+        source[offset + 1] == '\n') {
+      offset += 2;
+      continue;
+    }
+    if (source[offset] == '\\' && offset + 2 < source.size() &&
+        source[offset + 1] == '\r' && source[offset + 2] == '\n') {
+      offset += 3;
+      continue;
+    }
+    logical.push_back(source[offset]);
+    physical.push_back(static_cast<unsigned>(offset));
+    ++offset;
+  }
+
+  vector<RawConditionalDirective> directives;
+  bool at_line_start = true;
+  bool in_block_comment = false;
+  for (size_t index = 0; index < logical.size();) {
+    if (in_block_comment) {
+      if (logical.compare(index, 2, "*/") == 0) {
+        in_block_comment = false;
+        index += 2;
+      } else {
+        if (logical[index] == '\n')
+          at_line_start = true;
+        ++index;
+      }
+      continue;
+    }
+    if (logical.compare(index, 2, "//") == 0) {
+      const size_t newline = logical.find('\n', index + 2);
+      if (newline == string::npos)
+        break;
+      index = newline;
+      continue;
+    }
+    if (logical.compare(index, 2, "/*") == 0) {
+      in_block_comment = true;
+      index += 2;
+      continue;
+    }
+    if (logical[index] == '\n') {
+      at_line_start = true;
+      ++index;
+      continue;
+    }
+    if (at_line_start && IsHorizontalSpace(logical[index])) {
+      ++index;
+      continue;
+    }
+    if (at_line_start && logical[index] == '#') {
+      size_t keyword = index + 1;
+      for (;;) {
+        while (keyword < logical.size() &&
+               IsHorizontalSpace(logical[keyword])) {
+          ++keyword;
+        }
+        if (logical.compare(keyword, 2, "/*") != 0)
+          break;
+        const size_t end = logical.find("*/", keyword + 2);
+        const size_t newline = logical.find('\n', keyword);
+        if (end == string::npos ||
+            (newline != string::npos && newline < end)) {
+          keyword = string::npos;
+          break;
+        }
+        keyword = end + 2;
+      }
+      if (keyword != string::npos && keyword < logical.size() &&
+          logical.compare(keyword, 2, "//") != 0 &&
+          logical[keyword] != '\n') {
+        size_t end = keyword;
+        while (end < logical.size() && IsIdentifierByte(logical[end]))
+          ++end;
+        const string kind = logical.substr(keyword, end - keyword);
+        if (kind == "if" || kind == "ifdef" || kind == "ifndef" ||
+            kind == "elif" || kind == "elifdef" || kind == "elifndef" ||
+            kind == "else" || kind == "endif") {
+          directives.push_back(
+              {physical[index], physical[keyword], kind});
+        }
+      }
+      at_line_start = false;
+      ++index;
+      continue;
+    }
+
+    const size_t raw_end = RawStringEnd(logical, index);
+    if (raw_end != string::npos) {
+      at_line_start = false;
+      index = raw_end;
+      continue;
+    }
+    if (logical[index] == '\'' || logical[index] == '"') {
+      const char quote = logical[index++];
+      bool escaped = false;
+      at_line_start = false;
+      while (index < logical.size()) {
+        const char ch = logical[index++];
+        if (escaped) {
+          escaped = false;
+        } else if (ch == '\\') {
+          escaped = true;
+        } else if (ch == quote) {
+          break;
+        } else if (ch == '\n') {
+          at_line_start = true;
+          break;
+        }
+      }
+      continue;
+    }
+    at_line_start = false;
+    ++index;
+  }
+  return directives;
+}
+
 }  // namespace
 
 //------------------------------------------------------------
@@ -1228,6 +1395,30 @@ void IwyuPreprocessorInfo::ClassifyConditionalRegionScopes(
   }
 }
 
+SourceLocation IwyuPreprocessorInfo::DirectiveKeywordLocation(
+    SourceLocation loc, const string& directive_kind) const {
+  const auto& source_manager = preprocessor_->getSourceManager();
+  loc = source_manager.getExpansionLoc(loc);
+  if (loc.isInvalid() || !loc.isFileID())
+    return loc;
+  const FileID file_id = source_manager.getFileID(loc);
+  bool invalid = false;
+  const StringRef buffer = source_manager.getBufferData(file_id, &invalid);
+  if (invalid)
+    return loc;
+  const unsigned callback_offset = source_manager.getFileOffset(loc);
+  for (const RawConditionalDirective& directive :
+       ScanConditionalDirectives(buffer)) {
+    if (directive.kind == directive_kind &&
+        directive.hash_offset <= callback_offset &&
+        callback_offset <= directive.directive_offset) {
+      return source_manager.getLocForStartOfFile(file_id).getLocWithOffset(
+          directive.directive_offset);
+    }
+  }
+  return loc;
+}
+
 unsigned IwyuPreprocessorInfo::DirectiveBodyBeginOffset(
     SourceLocation loc) const {
   const auto& source_manager = preprocessor_->getSourceManager();
@@ -1275,6 +1466,7 @@ void IwyuPreprocessorInfo::EnterConditional(
     SourceLocation loc, const clang::IdentifierInfo* macro, bool is_ifndef,
     const string& expression, BranchActivity condition_activity,
     const string& directive_kind) {
+  loc = DirectiveKeywordLocation(loc, directive_kind);
   const FileEntry* file = GetFileEntry(loc);
   if (!file)
     return;
@@ -1324,6 +1516,7 @@ void IwyuPreprocessorInfo::EnterConditional(
 void IwyuPreprocessorInfo::EnterAlternative(
     SourceLocation loc, const string& expression, bool is_else,
     BranchActivity condition_activity, const string& directive_kind) {
+  loc = DirectiveKeywordLocation(loc, directive_kind);
   const FileEntry* file = GetFileEntry(loc);
   if (!file)
     return;
@@ -1404,6 +1597,7 @@ void IwyuPreprocessorInfo::EnterAlternative(
 }
 
 void IwyuPreprocessorInfo::ExitConditional(SourceLocation loc) {
+  loc = DirectiveKeywordLocation(loc, "endif");
   const FileEntry* file = GetFileEntry(loc);
   if (!file)
     return;
@@ -1611,6 +1805,8 @@ void IwyuPreprocessorInfo::FileChanged_EnterFile(
 
   const FileEntry* const new_file = GetFileEntry(file_beginning);
   if (new_file) {
+    entered_file_ids_[new_file].push_back(
+        GlobalSourceManager()->getFileID(file_beginning));
     AddDirectInclude(include_loc, new_file, include_name_as_written,
                      GlobalSourceManager()->getFileID(file_beginning));
   }
@@ -2353,20 +2549,18 @@ IwyuPreprocessorInfo::ConditionalRegionsFor(const FileEntry* file) const {
     if (index < conditional_regions_.size())
       observed.push_back(conditional_regions_[index]);
   }
-  if (observed.empty())
+  const auto entered = entered_file_ids_.find(file);
+  if (entered == entered_file_ids_.end() || entered->second.empty())
     return observed;
 
   const auto& source_manager = preprocessor_->getSourceManager();
-  const FileID scan_file_id = source_manager.getFileID(
-      source_manager.getExpansionLoc(observed.front().opening_location));
+  const FileID scan_file_id = entered->second.front();
   bool invalid = false;
   const StringRef buffer = source_manager.getBufferData(scan_file_id, &invalid);
   if (invalid)
     return observed;
   const SourceLocation file_start =
       source_manager.getLocForStartOfFile(scan_file_id);
-  clang::Lexer lexer(file_start, preprocessor_->getLangOpts(), buffer.begin(),
-                     buffer.begin(), buffer.end());
 
   struct Directive {
     unsigned offset;
@@ -2374,32 +2568,14 @@ IwyuPreprocessorInfo::ConditionalRegionsFor(const FileEntry* file) const {
     string kind;
   };
   vector<Directive> directives;
-  bool pending_hash = false;
-  clang::Token token;
-  do {
-    lexer.LexFromRawLexer(token);
-    if (token.is(clang::tok::hash) && token.isAtStartOfLine()) {
-      pending_hash = true;
-      continue;
-    }
-    if (!pending_hash)
-      continue;
-    pending_hash = false;
-    if (!token.is(clang::tok::raw_identifier))
-      continue;
-    const string kind = token.getRawIdentifier().str();
-    if (kind != "if" && kind != "ifdef" && kind != "ifndef" &&
-        kind != "elif" && kind != "elifdef" && kind != "elifndef" &&
-        kind != "else" && kind != "endif") {
-      continue;
-    }
-    const unsigned directive_offset =
-        source_manager.getFileOffset(token.getLocation());
+  for (const RawConditionalDirective& raw :
+       ScanConditionalDirectives(buffer)) {
     const SourceLocation directive_location =
-        file_start.getLocWithOffset(directive_offset);
+        file_start.getLocWithOffset(raw.directive_offset);
     directives.push_back(
-        {directive_offset, DirectiveBodyBeginOffset(directive_location), kind});
-  } while (!token.is(clang::tok::eof));
+        {raw.directive_offset, DirectiveBodyBeginOffset(directive_location),
+         raw.kind});
+  }
 
   struct RegionTemplate {
     string source_region_id;
@@ -2467,14 +2643,18 @@ IwyuPreprocessorInfo::ConditionalRegionsFor(const FileEntry* file) const {
   }
 
   map<pair<string, unsigned>, const ConditionalRegion*> exact;
-  set<unsigned> file_ids;
+  map<unsigned, FileID> file_ids;
+  for (const FileID entered_id : entered->second)
+    file_ids[entered_id.getHashValue()] = entered_id;
   for (const ConditionalRegion& region : observed) {
     exact[{region.source_region_id, region.file_id}] = &region;
-    file_ids.insert(region.file_id);
   }
 
   vector<ConditionalRegion> result;
-  for (unsigned file_id : file_ids) {
+  for (const auto& file_id_entry : file_ids) {
+    const unsigned file_id = file_id_entry.first;
+    const SourceLocation instance_start =
+        source_manager.getLocForStartOfFile(file_id_entry.second);
     map<string, BranchActivity> activity_by_region;
     map<unsigned, pair<bool, bool>> prior_group_activity;
     for (const RegionTemplate& region : templates) {
@@ -2508,9 +2688,9 @@ IwyuPreprocessorInfo::ConditionalRegionsFor(const FileEntry* file) const {
       prior.first = prior.first || activity == BranchActivity::kActive;
       prior.second = prior.second || activity == BranchActivity::kUnknown;
       const SourceLocation opening =
-          file_start.getLocWithOffset(region.opening_offset);
+          instance_start.getLocWithOffset(region.opening_offset);
       const SourceLocation directive =
-          file_start.getLocWithOffset(region.directive_offset);
+          instance_start.getLocWithOffset(region.directive_offset);
       result.push_back(
           {region.source_region_id, file_id, region.opening_offset,
            region.directive_offset, region.body_begin_offset,
