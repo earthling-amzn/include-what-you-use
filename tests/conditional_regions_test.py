@@ -19,6 +19,7 @@ VALIDATOR = jsonschema.Draft202012Validator(SCHEMA)
 SOURCE = "tests/conditional_regions/conditional.cc"
 SCOPE_SOURCE = "tests/conditional_regions/scope.cc"
 SPLICED_SOURCE = "tests/conditional_regions/spliced.cc"
+NESTED_SOURCE = "tests/conditional_regions/nested.cc"
 DRIVER = ROOT / "iwyu_tool.py"
 
 CONFIGS = {
@@ -177,6 +178,37 @@ def main():
             text=True, capture_output=True)
         assert compile_result.returncode == 0, compile_result.stderr
 
+    # A nested group appearing inside the first outer branch is encountered in
+    # source order before the outer alternatives. Schema order instead groups
+    # all branches by their opening offset. Preserve the exact parent links
+    # while requiring that canonical producer order.
+    nested_flags = ["-DOUTER_BRANCH", "-DINNER_ALTERNATIVE"]
+    nested = analyze("nested", nested_flags, NESTED_SOURCE)
+    nested_regions = nested["conditional_regions"]
+    assert [(region["source_region_id"], region["directive_kind"],
+             region["activity"])
+            for region in nested_regions] == [
+                ("branch-1-0-1", "if", "active"),
+                ("branch-1-1-183", "elif", "inactive"),
+                ("branch-1-2-244", "else", "inactive"),
+                ("branch-27-0-27", "if", "inactive"),
+                ("branch-27-1-81", "elif", "active"),
+                ("branch-27-2-142", "else", "inactive"),
+            ]
+    assert [region["parent_source_region_id"]
+            for region in nested_regions] == [
+                {"status": "not_applicable", "value": None},
+                {"status": "not_applicable", "value": None},
+                {"status": "not_applicable", "value": None},
+                {"status": "known", "value": "branch-1-0-1"},
+                {"status": "known", "value": "branch-1-0-1"},
+                {"status": "known", "value": "branch-1-0-1"},
+            ]
+    nested_compile = subprocess.run(
+        [CXX, "-std=c++17", *nested_flags, "-fsyntax-only",
+         str(ROOT / NESTED_SOURCE)], text=True, capture_output=True)
+    assert nested_compile.returncode == 0, nested_compile.stderr
+
     with tempfile.TemporaryDirectory() as temporary:
         database = Path(temporary)
         entry = {
@@ -200,6 +232,27 @@ def main():
         VALIDATOR.validate(driven_record)
         assert driven_record["conditional_regions"] == \
             spliced_records["enabled"]["conditional_regions"]
+
+        nested_entry = {
+            "directory": str(ROOT),
+            "file": NESTED_SOURCE,
+            "arguments": [CXX, "-std=c++17", *nested_flags,
+                          "-c", NESTED_SOURCE],
+        }
+        (database / "compile_commands.json").write_text(
+            json.dumps([nested_entry]))
+        nested_driven = subprocess.run(
+            [sys.executable, str(DRIVER), "-o", "json", "--output-schema",
+             "2", "--database", "nested=" + str(database)],
+            cwd=ROOT, env=environment, text=True, capture_output=True)
+        assert nested_driven.returncode == 0, nested_driven.stderr
+        assert nested_driven.stderr == ""
+        nested_driven_records = [
+            json.loads(line) for line in nested_driven.stdout.splitlines()]
+        assert len(nested_driven_records) == 1
+        nested_driven_record = nested_driven_records[0]
+        VALIDATOR.validate(nested_driven_record)
+        assert nested_driven_record["conditional_regions"] == nested_regions
 
     print("PASS: MC-002 complete conditional-region census and scope facts")
 

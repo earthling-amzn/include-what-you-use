@@ -1171,6 +1171,12 @@ def _expected_conditional_regions(source_bytes):
     return templates
 
 
+def _conditional_region_schema_sort_key(region):
+    """Mirror the producer's conditional_regions schema ordering."""
+    return (region['opening_offset'], region['branch_index'],
+            region['directive_offset'], region.get('file_id', 0))
+
+
 def _validate_conditional_regions(record, source_bytes):
     """Validate schema-v2 regions against the exact digest-checked bytes."""
     source_digest = record['source_digest']
@@ -1180,7 +1186,9 @@ def _validate_conditional_regions(record, source_bytes):
     file_path = record['file']['path']
     source_length = len(source_bytes)
     regions = record['conditional_regions']
-    expected_regions = _expected_conditional_regions(source_bytes)
+    expected_regions = sorted(
+        _expected_conditional_regions(source_bytes),
+        key=_conditional_region_schema_sort_key)
     if bool(regions) != bool(expected_regions):
         raise ProtocolError(
             'conditional_regions is not a complete exact source census')
@@ -1229,9 +1237,7 @@ def _validate_conditional_regions(record, source_bytes):
                     'conditional region location differs from exact source census')
 
     sort_keys = [
-        (region['opening_offset'], region['branch_index'],
-         region['directive_offset'], region['file_id'])
-        for region in regions]
+        _conditional_region_schema_sort_key(region) for region in regions]
     if sort_keys != sorted(sort_keys):
         raise ProtocolError('conditional regions are not sorted')
 
