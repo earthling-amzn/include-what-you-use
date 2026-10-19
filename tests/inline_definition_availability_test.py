@@ -147,6 +147,107 @@ def assert_analyzer_contracts():
             for op in control["operations"]] == [
         ("remove", "apply", '#include "unused.inline.hpp"')]
 
+    default_provider, _ = analyze("default_provider.cc")
+    assert definition_diagnostics(default_provider) == []
+    default_body = next(op for op in semantic_keeps(default_provider)
+                        if op["spelling"] ==
+                        '#include "default_provider.inline.hpp"')
+    assert_provider_keep(default_body,
+                         '#include "default_provider.inline.hpp"', [
+                             "default_provider.cc",
+                             "default_provider.inline.hpp"])
+    assert [symbol["qualified_name"]["value"]
+            for symbol in default_body["symbols"]] == ["MissingDefault"]
+    assert {use["location"]["line"]
+            for symbol in default_body["symbols"]
+            for use in symbol["uses"]} == {3}
+
+    default_missing, _ = analyze("default_provider_missing.cc")
+    assert [(fact["code"], fact["location"]["value"]["line"])
+            for fact in definition_diagnostics(default_missing)] == [
+        ("missing_inline_definition", 2)]
+    assert "MissingDefault" in definition_diagnostics(default_missing)[0][
+        "message"]
+
+    default_controls, _ = analyze("default_provider_controls.cc")
+    assert definition_diagnostics(default_controls) == []
+    assert not [op for op in semantic_keeps(default_controls)
+                if op["spelling"] ==
+                '#include "default_provider.inline.hpp"']
+
+    instantiated_default, _ = analyze("default_provider_instantiated.cc")
+    assert definition_diagnostics(instantiated_default) == []
+    instantiated_body = next(
+        op for op in semantic_keeps(instantiated_default)
+        if op["spelling"] == '#include "default_provider.inline.hpp"')
+    assert_provider_keep(instantiated_body,
+                         '#include "default_provider.inline.hpp"', [
+                             "default_provider_instantiated.cc",
+                             "default_provider.inline.hpp"])
+    assert [(symbol["qualified_name"]["value"],
+             [(use["location"]["line"], use["location"]["column"])
+              for use in symbol["uses"]])
+            for symbol in instantiated_body["symbols"]] == [
+        ("MissingDefault", [(4, 21)])]
+
+    defaulted_provider, _ = analyze("defaulted_provider.cc")
+    assert definition_diagnostics(defaulted_provider) == []
+    lifecycle = next(op for op in semantic_keeps(defaulted_provider)
+                     if op["spelling"] ==
+                     '#include "defaulted_provider.inline.hpp"')
+    assert_provider_keep(lifecycle,
+                         '#include "defaulted_provider.inline.hpp"', [
+                             "defaulted_provider.cc",
+                             "defaulted_provider.inline.hpp"])
+    lifecycle_names = {symbol["qualified_name"]["value"]
+                       for symbol in lifecycle["symbols"]}
+    assert lifecycle_names == {
+        "LifecycleDependency::LifecycleDependency",
+        "LifecycleDependency::operator=",
+        "LifecycleDependency::~LifecycleDependency"}
+    assert {use["location"]["line"]
+            for symbol in lifecycle["symbols"]
+            for use in symbol["uses"]} == {4, 5, 6, 7, 8}
+
+    defaulted_trivial, _ = analyze("defaulted_trivial.cc")
+    assert definition_diagnostics(defaulted_trivial) == []
+    assert semantic_keeps(defaulted_trivial) == []
+
+    pure_destructor, _ = analyze("pure_virtual_destructor.cc")
+    assert [(fact["code"], fact["location"]["value"]["line"])
+            for fact in definition_diagnostics(pure_destructor)] == [
+        ("missing_inline_definition", 5)]
+    assert "PureDestructorBase::~PureDestructorBase" in \
+        definition_diagnostics(pure_destructor)[0]["message"]
+
+    deep_parent, _ = analyze("deep_parent.cc")
+    assert [(fact["code"], fact["location"]["value"]["line"])
+            for fact in definition_diagnostics(deep_parent)] == [
+        ("missing_inline_definition", 2)]
+
+    late_same, _ = analyze("late_same.cc")
+    assert definition_diagnostics(late_same) == []
+    assert semantic_keeps(late_same) == []
+
+    late_provider, _ = analyze("late_template_provider.cc")
+    assert definition_diagnostics(late_provider) == []
+    late_keep = semantic_keeps(late_provider)
+    assert len(late_keep) == 1
+    assert_provider_keep(late_keep[0],
+                         '#include "late_template_provider.inline.hpp"', [
+                             "late_template_provider.cc",
+                             "late_template_provider.inline.hpp"])
+    assert late_keep[0]["source_range"]["value"]["start"]["line"] == 3
+    assert [symbol["qualified_name"]["value"]
+            for symbol in late_keep[0]["symbols"]] == ["LateProvider"]
+
+    uninstantiated, _ = analyze("uninstantiated_nondependent.cc")
+    assert definition_diagnostics(uninstantiated) == []
+    instantiated, _ = analyze("instantiated_nondependent.cc")
+    assert [(fact["code"], fact["location"]["value"]["line"])
+            for fact in definition_diagnostics(instantiated)] == [
+        ("missing_inline_definition", 3)]
+
     template_available, _ = analyze("template_available.cc")
     assert definition_diagnostics(template_available) == []
     keep = semantic_keeps(template_available)
@@ -304,6 +405,10 @@ def assert_driver_contracts():
         ("mapped_consumer.cc",
          ["-Xiwyu", "--mapping_file=providers.imp"]),
         ("associated_consumer.cc", []),
+        ("default_provider.cc", []),
+        ("defaulted_provider.cc", []),
+        ("late_template_provider.cc", []),
+        ("default_provider_instantiated.cc", []),
     ]
     records = analyze_with_driver(entries)
 
@@ -324,13 +429,23 @@ def assert_driver_contracts():
         4: ("mapped_consumer.cc", '#include "mapped_carrier.hpp"'),
         5: ("associated_consumer.cc",
             '#include "associated_owner.hpp"  // IWYU pragma: associated'),
+        6: ("default_provider.cc",
+            '#include "default_provider.inline.hpp"'),
+        7: ("defaulted_provider.cc",
+            '#include "defaulted_provider.inline.hpp"'),
+        8: ("late_template_provider.cc",
+            '#include "late_template_provider.inline.hpp"'),
+        9: ("default_provider_instantiated.cc",
+            '#include "default_provider.inline.hpp"'),
     }
     for index, (filename, spelling) in expected.items():
-        keep = semantic_keeps(source_records[index])
-        assert len(keep) == 1, (filename, keep)
-        selected_path = keep[0]["provider"]["selected"]["value"]["path"]
+        keeps = [operation for operation in semantic_keeps(source_records[index])
+                 if operation["spelling"] == spelling]
+        assert len(keeps) == 1, (filename, semantic_keeps(source_records[index]))
+        keep = keeps[0]
+        selected_path = keep["provider"]["selected"]["value"]["path"]
         assert_provider_keep(
-            keep[0], spelling,
+            keep, spelling,
             [source_records[index]["file"]["path"], selected_path])
 
     # Two source calls become two sorted use facts on one symbol object, and
@@ -365,7 +480,12 @@ def assert_gcc_backstop(corpus=CORPUS):
                        "template_available.cc", "duplicate_calls.cc",
                        "template_contexts.cc",
                        "direct_after.cc", "export_consumer.cc",
-                       "mapped_consumer.cc", "associated_consumer.cc"):
+                       "mapped_consumer.cc", "associated_consumer.cc",
+                       "default_provider.cc", "default_provider_controls.cc",
+                       "default_provider_instantiated.cc",
+                       "defaulted_provider.cc", "defaulted_trivial.cc",
+                       "late_same.cc", "late_template_provider.cc",
+                       "uninstantiated_nondependent.cc"):
             executable = out / source.removesuffix(".cc")
             run([CXX, "-std=c++17", "-fno-inline", "-I", ".", source,
                  "-o", executable], cwd=corpus)
@@ -432,6 +552,20 @@ def assert_gcc_backstop(corpus=CORPUS):
         assert_link_fails(pure_qualified_object, out / "pure_virtual_qualified",
                           ["PureBase::MissingBody()"], cwd=corpus)
 
+        for source, symbols in {
+            "default_provider_missing.cc": ["MissingDefault()"],
+            "pure_virtual_destructor.cc": [
+                "PureDestructorBase::~PureDestructorBase()"],
+            "deep_parent.cc": ["MissingDeepParent()"],
+            "instantiated_nondependent.cc": ["MissingInstantiated()"],
+        }.items():
+            object_file = out / f"{source}.o"
+            run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "-c",
+                 source, "-o", object_file], cwd=corpus)
+            assert_link_fails(object_file,
+                              out / source.removesuffix(".cc"),
+                              symbols, cwd=corpus)
+
 
 def assert_fixer_idempotence():
     with tempfile.TemporaryDirectory(prefix="sem004-fix-", dir=ROOT / "build") as tmp:
@@ -446,6 +580,10 @@ def assert_fixer_idempotence():
             "conditional_dominating.cc": ["-DFEATURE=1"],
             "repeated_provider.cc": ["-DFEATURE=0"],
             "extern_consumer.cc": [], "extern_instantiations.cc": [],
+            "default_provider.cc": [], "default_provider_controls.cc": [],
+            "defaulted_provider.cc": [], "defaulted_trivial.cc": [],
+            "late_same.cc": [], "late_template_provider.cc": [],
+            "uninstantiated_nondependent.cc": [],
         }
         for filename, options in cases.items():
             command = [IWYU, "-I", ".", "-std=c++17", *options, filename]

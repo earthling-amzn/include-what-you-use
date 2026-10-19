@@ -42,12 +42,30 @@ The obligation follows Clang's canonical specialization and recursively peels
 function-template and instantiated-member patterns to the source-written body.
 Concrete template traversal reports at the caller/instantiation site and
 reconsiders pattern-identical nodes as well as dependent calls resolved by the
-instantiation. Uninstantiated primaries and unresolved dependent calls create no
-obligation. Clang's semantic parent map and `EvaluatedExprVisitor` exclude
-`decltype`, `sizeof`-like and `noexcept` operands, unused default arguments, and
-discarded `if constexpr` branches. Deleted/defaulted functions, virtual dispatch
-to a pure function, and pure member-pointer formation are excluded. An
-explicitly qualified pure call still requires the pure declaration's body.
+instantiation. Non-dependent calls in an uninstantiated templated entity remain
+inert; the dedicated concrete-instantiation traversal emits them once at the
+instantiation site. Uninstantiated primaries and unresolved dependent calls
+create no obligation. Clang's evaluated-expression visitor excludes `decltype`,
+`sizeof`-like and `noexcept` operands, unused default arguments, and discarded
+`if constexpr` branches. Its result is cached per complete expression. The
+parent walk uses IWYU's explicit AST stack iteratively with cycle detection;
+missing or cyclic ancestry is unknown and therefore fails closed by preserving
+or diagnosing the body rather than suppressing the obligation.
+
+An omitted `CXXDefaultArgExpr` is traversed in its concrete call context, so an
+evaluated default expression owns body obligations at that call site. Explicit
+arguments, unevaluated calls, and defaults in never-instantiated templates stay
+excluded. A concretely used first-declaration defaulted constructor, destructor,
+copy/move constructor, or copy/move assignment does not require a body for the
+defaulted function itself. Instead, its generated initializer/body graph and
+direct base/member destruction graph create obligations for selected lifecycle
+functions. This covers arrays, bases, in-class member initializers, and nested
+defaulted members with a per-use cycle guard. Trivial subobjects add nothing.
+An out-of-class defaulted inline definition remains an ordinary required
+provider. Pure virtual destructors require a definition when concrete object
+lifecycle destroys the base; forming a member pointer or making a virtual call
+to other pure methods remains excluded, while an explicitly qualified pure call
+still requires its body.
 
 A definition is available only through one concrete entered `FileID` ancestry.
 IncludePicker supplies candidate public, mapping-file, pragma-export, and
@@ -74,7 +92,13 @@ angled token. Intermediate records never inherit consumer use locations. They
 retain their own includes only through source-local semantic obligations or
 existing export/keep analysis. This pin is re-applied after ordinary duplicate
 pruning, so an equal spelling cannot substitute for the entered occurrence. No
-include is synthesized from an absent or unproved body.
+include is synthesized from an absent or unproved body. An implicit template
+instantiation may use a later definition at its legal point of instantiation.
+A later same-TU definition is accepted only from the actual entered definition
+declaration; a later header provider is retained only through its exact entered
+root occurrence and physical chain. Inactive, sibling, and unentered providers
+still fail closed. Explicit instantiation declarations/definitions and `extern
+template` keep their separate ownership rules.
 
 Repeated observations are stored by include operation and canonical function.
 Structured output emits one symbol object per qualified identity with sorted,
@@ -84,8 +108,12 @@ headers and 5,000 calls), baseline `411eec0` used 1.89 s, 421,540 KiB RSS, and
 3,007,009 output bytes; its schema-v2 driver rejected 5,000 duplicate symbol
 objects. After grouping, three analyzer runs used 1.93/1.76/1.57 s and
 257,880/257,980/258,064 KiB RSS, emitted 1,732,264 bytes as one symbol with 5,000
-uses, and the real driver accepted the record in 2.75 s at 258,024 KiB RSS. The
-non-inline control remained 620,944 bytes (baseline 1.01 s/120,056 KiB; after
+uses, and the real driver accepted the record in 2.75 s at 258,024 KiB RSS.
+After replacing capped recursive parent-map queries with cached evaluated
+subtrees and an iterative cycle-safe AST-stack walk, three absolute-path reruns
+used 1.65/1.55/1.63 s and 258,452/258,700/258,440 KiB RSS with the same
+1,732,264-byte output, one symbol, and 5,000 uses. The non-inline control remained
+620,944 bytes (baseline 1.01 s/120,056 KiB; after
 1.08/1.09/1.11 s and 119,580/119,632/119,728 KiB).
 
 An absent ordinary-inline body emits `missing_inline_definition`; an absent
@@ -94,6 +122,8 @@ without a proved entered/dominating provider emits
 `definition_provider_unproven`. Schema versions 1 and 2 use their existing
 operation, provider, symbol-use, condition, range, and diagnostic structures.
 The opaque corpus validates deterministic output, two fixer passes, both schemas,
-conditional configurations, direct/associated/exported/mapped/repeated provider
-instances, GCC `-fno-inline` compile-link-run success, and expected unresolved
-symbols for missing bodies.
+conditional configurations, direct/associated/exported/mapped/repeated and
+later-entered provider instances, omitted defaults, generated defaulted
+lifecycle, pure destructors, deep/cyclic-safe ancestry, instantiated and
+uninstantiated template bodies, GCC `-fno-inline` compile-link-run success, and
+expected unresolved symbols for missing bodies.

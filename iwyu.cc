@@ -129,7 +129,6 @@
 #include "clang/AST/ExprConcepts.h"
 #include "clang/AST/NestedNameSpecifier.h"
 #include "clang/AST/OperationKinds.h"
-#include "clang/AST/ParentMapContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/TemplateBase.h"
 #include "clang/AST/Type.h"
@@ -1083,6 +1082,17 @@ struct VisitorState {
   // specialization, concrete report site, and obligation kind.
   set<std::tuple<const FunctionDecl*, unsigned, int>>
       definition_obligations;
+
+  // Evaluation queries used to rescan an entire owning expression for every
+  // nested call. Cache both the potentially-evaluated node set for each root
+  // and the final answer for each traversal mode. The latter differs between
+  // the source-written template pattern and a concrete instantiation.
+  map<const Stmt*, set<const Stmt*>> potentially_evaluated_nodes;
+  map<std::pair<const Expr*, bool>, bool> potentially_evaluated_exprs;
+
+  // A defaulted special member can invoke another defaulted special member.
+  // Keep that generated call graph cycle-safe at each concrete use site.
+  set<std::pair<const FunctionDecl*, unsigned>> lifecycle_obligations;
 };
 
 // ----------------------------------------------------------------------
@@ -2307,98 +2317,134 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     return true;
   }
 
-  class PotentiallyEvaluatedExprFinder
+  class PotentiallyEvaluatedExprCollector
       : public clang::ConstEvaluatedExprVisitor<
-            PotentiallyEvaluatedExprFinder> {
+            PotentiallyEvaluatedExprCollector> {
     using EvalBase =
-        clang::ConstEvaluatedExprVisitor<PotentiallyEvaluatedExprFinder>;
+        clang::ConstEvaluatedExprVisitor<PotentiallyEvaluatedExprCollector>;
 
    public:
-    PotentiallyEvaluatedExprFinder(const ASTContext& context,
-                                   const Stmt* target)
-        : EvalBase(context), target_(target) {}
+    PotentiallyEvaluatedExprCollector(const ASTContext& context,
+                                      set<const Stmt*>* nodes)
+        : EvalBase(context), nodes_(nodes) {}
 
     bool shouldVisitDiscardedStmt() const { return false; }
 
     void VisitStmt(const Stmt* stmt) {
-      if (stmt == target_)
-        found_ = true;
+      nodes_->insert(stmt);
       EvalBase::VisitStmt(stmt);
     }
 
     void VisitDeclRefExpr(const DeclRefExpr* expr) {
-      if (expr == target_)
-        found_ = true;
+      nodes_->insert(expr);
+      EvalBase::VisitDeclRefExpr(expr);
     }
 
     void VisitMemberExpr(const MemberExpr* expr) {
-      if (expr == target_)
-        found_ = true;
+      nodes_->insert(expr);
       EvalBase::VisitMemberExpr(expr);
     }
 
-    bool found() const { return found_; }
-
    private:
-    const Stmt* target_;
-    bool found_ = false;
+    set<const Stmt*>* nodes_;
   };
 
+  bool IsPotentiallyEvaluatedWithin(const Stmt* root, const Expr* expr) {
+    if (!root || !expr)
+      return true;  // Unknown must preserve/diagnose, never suppress.
+    auto insertion = visitor_state_->potentially_evaluated_nodes.emplace(
+        root, set<const Stmt*>());
+    if (insertion.second) {
+      PotentiallyEvaluatedExprCollector collector(
+          compiler()->getASTContext(), &insertion.first->second);
+      collector.Visit(root);
+    }
+    return insertion.first->second.count(expr) != 0;
+  }
+
   // Clang's EvaluatedExprVisitor encodes sizeof/noexcept and discarded
-  // if-constexpr semantics. Climb Clang's semantic parent map to the complete
-  // expression owned by a declaration; the traversal stack alone omits
-  // wrappers reached through TypeLocs, such as decltype.
+  // if-constexpr semantics. Walk the analyzer's explicit AST parent stack
+  // iteratively to the complete expression owned by a declaration. This stack
+  // also contains TypeLoc wrappers omitted by Clang's semantic parent map. A
+  // malformed, cyclic, or parentless stack is unknown and therefore fails
+  // closed as evaluated.
   bool IsPotentiallyEvaluated(const Expr* expr) {
     if (!expr)
       return false;
-    if (current_ast_node()->
-            template HasAncestorOfType<clang::DecltypeType>() ||
-        current_ast_node()->
-            template HasAncestorOfType<clang::TypeOfExprType>()) {
-      return false;
-    }
-    ASTContext& context = compiler()->getASTContext();
-    using clang::DynTypedNode;
-    std::function<bool(DynTypedNode, const Stmt*, unsigned)> evaluate_from =
-        [&](DynTypedNode node, const Stmt* root, unsigned depth) {
-          if (depth > 128)
-            return false;
-          const auto parents = context.getParents(node);
-          if (parents.empty())
-            return false;
-          for (const DynTypedNode& parent : parents) {
-            if (parent.get<clang::DecltypeType>() ||
-                parent.get<clang::TypeOfExprType>()) {
-              continue;
-            }
-            if (const Decl* owner = parent.get<Decl>()) {
-              if (!root || isa<ParmVarDecl>(owner))
-                continue;
-              if (const auto* function = dyn_cast<FunctionDecl>(owner)) {
-                if (function->isDeleted() || function->isDefaulted())
-                  continue;
-              }
-              PotentiallyEvaluatedExprFinder finder(context, expr);
-              finder.Visit(root);
-              if (finder.found())
-                return true;
-              continue;
-            }
-            const Stmt* next_root = root;
-            if (const Stmt* parent_stmt = parent.get<Stmt>())
-              next_root = parent_stmt;
-            if (evaluate_from(parent, next_root, depth + 1))
-              return true;
-          }
+    const bool concrete_template =
+        static_cast<Derived*>(this)->IsConcreteTemplateTraversal();
+    const auto cache_key = std::make_pair(expr, concrete_template);
+    const auto cached =
+        visitor_state_->potentially_evaluated_exprs.find(cache_key);
+    if (cached != visitor_state_->potentially_evaluated_exprs.end())
+      return cached->second;
+
+    const Stmt* root = nullptr;
+    set<const ASTNode*> seen;
+    for (const ASTNode* node = current_ast_node(); node;
+         node = node->parent()) {
+      if (!seen.insert(node).second) {
+        visitor_state_->potentially_evaluated_exprs.emplace(cache_key, true);
+        return true;
+      }
+      if (node->template GetAs<clang::DecltypeType>() ||
+          node->template GetAs<clang::TypeOfExprType>()) {
+        visitor_state_->potentially_evaluated_exprs.emplace(cache_key, false);
+        return false;
+      }
+      if (const Stmt* statement = node->template GetAs<Stmt>())
+        root = statement;
+
+      const Decl* owner = node->template GetAs<Decl>();
+      if (!owner)
+        continue;
+      if (!root || isa<ParmVarDecl>(owner) || isa<clang::FieldDecl>(owner)) {
+        visitor_state_->potentially_evaluated_exprs.emplace(cache_key, false);
+        return false;
+      }
+      if (!concrete_template) {
+        bool uninstantiated_template =
+            owner->isTemplated() ||
+            (owner->getDeclContext() &&
+             owner->getDeclContext()->isDependentContext());
+        if (const auto* function = dyn_cast<FunctionDecl>(owner)) {
+          uninstantiated_template = uninstantiated_template ||
+              function->getTemplateInstantiationPattern() != nullptr ||
+              function->getTemplatedKind() ==
+                  FunctionDecl::TK_FunctionTemplate ||
+              function->getTemplatedKind() ==
+                  FunctionDecl::TK_DependentFunctionTemplateSpecialization ||
+              function->getTemplatedKind() ==
+                  FunctionDecl::TK_DependentNonTemplate;
+        }
+        if (uninstantiated_template) {
+          visitor_state_->potentially_evaluated_exprs.emplace(cache_key,
+                                                               false);
           return false;
-        };
-    return evaluate_from(DynTypedNode::create(*expr), expr, 0);
+        }
+      }
+      if (const auto* function = dyn_cast<FunctionDecl>(owner)) {
+        if (function->isDeleted() || function->isDefaulted()) {
+          visitor_state_->potentially_evaluated_exprs.emplace(cache_key,
+                                                               false);
+          return false;
+        }
+      }
+      const bool result = IsPotentiallyEvaluatedWithin(root, expr);
+      visitor_state_->potentially_evaluated_exprs.emplace(cache_key, result);
+      return result;
+    }
+
+    visitor_state_->potentially_evaluated_exprs.emplace(cache_key, true);
+    return true;
   }
 
   bool PureVirtualUseRequiresDefinition(const FunctionDecl* callee,
                                         const Expr* use_expr) {
     const auto* method = dyn_cast<CXXMethodDecl>(callee);
     if (!method || !method->isPure())
+      return true;
+    if (isa<CXXDestructorDecl>(method))
       return true;
 
     // Forming a pointer to a pure virtual member and dispatching through one do
@@ -2431,7 +2477,7 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
 
   DefinitionObligationKind ClassifyDefinitionObligation(
       const FunctionDecl* callee) const {
-    if (!callee || callee->isDeleted() || callee->isDefaulted())
+    if (!callee || callee->isDeleted())
       return DefinitionObligationKind::kNone;
 
     const auto specialization_kind = callee->getTemplateSpecializationKind();
@@ -2499,8 +2545,7 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
 
   bool IsPotentiallyEvaluatedOdrUse(const FunctionDecl* callee,
                                     const Expr* expr) {
-    if (!callee || callee->isDeleted() || callee->isDefaulted() ||
-        !IsPotentiallyEvaluated(expr)) {
+    if (!callee || callee->isDeleted() || !IsPotentiallyEvaluated(expr)) {
       return false;
     }
     if (const auto* decl_ref = dyn_cast<DeclRefExpr>(expr)) {
@@ -2651,6 +2696,13 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     return false;
   }
 
+  bool CanUseLaterTemplateDefinition(
+      const FunctionDecl* callee, DefinitionObligationKind kind) const {
+    return callee && kind == DefinitionObligationKind::kTemplateInstantiation &&
+           callee->getTemplateSpecializationKind() ==
+               clang::TSK_ImplicitInstantiation;
+  }
+
   bool SatisfyDefinitionObligation(FunctionDecl* callee,
                                    SourceLocation report_loc,
                                    DefinitionObligationKind kind) {
@@ -2686,6 +2738,17 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     if (!use_file || !definition_file)
       return true;
 
+    const bool allow_later =
+        kind == DefinitionObligationKind::kOrdinaryInline ||
+        CanUseLaterTemplateDefinition(callee, kind);
+    // An implicit instantiation can legally select a definition entered later
+    // in the same translation unit. The concrete definition declaration is
+    // itself exact entered proof; there is no include occurrence to retain.
+    if (CanUseLaterTemplateDefinition(callee, kind) &&
+        use_file == definition_file) {
+      return true;
+    }
+
     vector<CandidateHeader> candidates =
         GlobalIncludePicker().GetCandidateHeaderRefsForFilepathIncludedFrom(
             GetFilePath(definition), GetFilePath(report_loc));
@@ -2700,8 +2763,6 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
       candidates.push_back(physical);
     }
 
-    const bool allow_later =
-        kind == DefinitionObligationKind::kOrdinaryInline;
     bool unknown = false;
     for (const CandidateHeader& candidate : candidates) {
       auto coverage = preprocessor_info().DefinitionProviderCoverageAt(
@@ -2759,37 +2820,210 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     return true;
   }
 
-  bool HandleInlineDefinitionOdrUse(FunctionDecl* callee,
-                                    const Expr* expr) {
-    if (!IsPotentiallyEvaluatedOdrUse(callee, expr))
+  bool IsGeneratedDefaultedSpecialMember(const FunctionDecl* callee) const {
+    const auto* method = dyn_cast_or_null<CXXMethodDecl>(callee);
+    if (!method || !method->getCanonicalDecl()->isDefaulted())
       return false;
-    if (!PureVirtualUseRequiresDefinition(callee, expr))
+    return isa<CXXConstructorDecl>(method) ||
+           isa<CXXDestructorDecl>(method) ||
+           method->isCopyAssignmentOperator() ||
+           method->isMoveAssignmentOperator();
+  }
+
+  bool HandleConcreteDefinitionUse(FunctionDecl* callee,
+                                   const Expr* use_expr,
+                                   SourceLocation report_loc) {
+    if (!callee || callee->isDeleted())
+      return false;
+    if (IsGeneratedDefaultedSpecialMember(callee))
+      return HandleDefaultedSpecialMemberLifecycle(callee, report_loc);
+    if (!PureVirtualUseRequiresDefinition(callee, use_expr))
       return true;
+
     const DefinitionObligationKind kind =
         ClassifyDefinitionObligation(callee);
     if (kind == DefinitionObligationKind::kNone)
       return false;
-    const SourceLocation report_loc =
-        static_cast<Derived*>(this)->DefinitionObligationReportLocation(expr);
     if (ExternTemplateControls(callee, report_loc))
       return true;
     if (kind ==
         DefinitionObligationKind::kExplicitInstantiationDefinition) {
-      // The explicit-instantiation declaration owns this specialization's
-      // single local body obligation. Calls after it need only the ordinary
-      // declaration requirement.
       return true;
     }
     if (GlobalFlags().output_format == CommandlineFlags::kTextOutput) {
-      // Legacy text has no occurrence/provider structure. Preserve its prior
-      // SEM-004 surface: only an ordinary inline body that is truly absent is
-      // diagnostic; generic template and unproven-provider facts are native.
       if (kind != DefinitionObligationKind::kOrdinaryInline ||
           DefinitionForObligation(callee, kind)) {
         return false;
       }
     }
     return SatisfyDefinitionObligation(callee, report_loc, kind);
+  }
+
+  class GeneratedLifecycleCallCollector
+      : public RecursiveASTVisitor<GeneratedLifecycleCallCollector> {
+   public:
+    explicit GeneratedLifecycleCallCollector(
+        std::function<void(const FunctionDecl*, const Expr*)> callback)
+        : callback_(std::move(callback)) {}
+
+    bool VisitCallExpr(CallExpr* expr) {
+      callback_(expr->getDirectCallee(), expr);
+      return true;
+    }
+
+    bool VisitCXXConstructExpr(CXXConstructExpr* expr) {
+      callback_(expr->getConstructor(), expr);
+      return true;
+    }
+
+   private:
+    std::function<void(const FunctionDecl*, const Expr*)> callback_;
+  };
+
+  const CXXRecordDecl* LifecycleSubobjectRecord(QualType type) {
+    type = compiler()->getASTContext().getBaseElementType(type);
+    return dyn_cast_or_null<CXXRecordDecl>(
+        TypeToDeclAsWritten(type.getTypePtrOrNull()));
+  }
+
+  bool HandleDefaultedSpecialMemberLifecycle(FunctionDecl* callee,
+                                              SourceLocation report_loc) {
+    auto* method = dyn_cast_or_null<CXXMethodDecl>(callee);
+    if (!method || !IsGeneratedDefaultedSpecialMember(method) ||
+        report_loc.isInvalid()) {
+      return false;
+    }
+    const auto key = std::make_pair(
+        static_cast<const FunctionDecl*>(method->getCanonicalDecl()),
+        report_loc.getRawEncoding());
+    if (!visitor_state_->lifecycle_obligations.insert(key).second)
+      return true;
+
+    auto require = [&](const FunctionDecl* dependency, const Expr* expr) {
+      if (!dependency || dependency->getCanonicalDecl() ==
+                             method->getCanonicalDecl()) {
+        return;
+      }
+      HandleConcreteDefinitionUse(const_cast<FunctionDecl*>(dependency), expr,
+                                  report_loc);
+    };
+    GeneratedLifecycleCallCollector collector(require);
+
+    // Clang materializes exact constructor initializers and copy/move
+    // assignment bodies when those defaulted members are concretely used.
+    // Walking those generated nodes covers bases, arrays, in-class member
+    // initializers, and selected copy-vs-move operations without guessing.
+    if (auto* constructor = dyn_cast<CXXConstructorDecl>(method)) {
+      for (clang::CXXCtorInitializer* initializer : constructor->inits()) {
+        if (initializer && initializer->getInit())
+          collector.TraverseStmt(initializer->getInit());
+      }
+    }
+    if (Stmt* body = method->getBody())
+      collector.TraverseStmt(body);
+
+    // A generated destructor has no explicit call expressions in Clang's AST.
+    // Resolve each direct base/member (peeling arrays) and recurse through its
+    // actual destructor. Trivial and ordinary out-of-line destructors create
+    // no SEM-004 body obligation.
+    if (isa<CXXDestructorDecl>(method)) {
+      CXXRecordDecl* record = method->getParent()->getDefinition();
+      if (record) {
+        for (const CXXBaseSpecifier& base : record->bases()) {
+          if (const CXXRecordDecl* subobject =
+                  LifecycleSubobjectRecord(base.getType())) {
+            require(const_cast<CXXDestructorDecl*>(subobject->getDestructor()),
+                    nullptr);
+          }
+        }
+        for (const clang::FieldDecl* field : record->fields()) {
+          if (const CXXRecordDecl* subobject =
+                  LifecycleSubobjectRecord(field->getType())) {
+            require(const_cast<CXXDestructorDecl*>(subobject->getDestructor()),
+                    nullptr);
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  class DefaultArgumentUseCollector
+      : public clang::ConstEvaluatedExprVisitor<DefaultArgumentUseCollector> {
+    using EvalBase =
+        clang::ConstEvaluatedExprVisitor<DefaultArgumentUseCollector>;
+
+   public:
+    DefaultArgumentUseCollector(
+        const ASTContext& context,
+        std::function<void(const FunctionDecl*, const Expr*)> callback)
+        : EvalBase(context), callback_(std::move(callback)) {}
+
+    bool shouldVisitDiscardedStmt() const { return false; }
+
+    void VisitCallExpr(const CallExpr* expr) {
+      callback_(expr->getDirectCallee(), expr);
+      EvalBase::VisitCallExpr(expr);
+    }
+
+    void VisitDeclRefExpr(const DeclRefExpr* expr) {
+      callback_(dyn_cast<FunctionDecl>(expr->getDecl()), expr);
+      EvalBase::VisitDeclRefExpr(expr);
+    }
+
+    void VisitMemberExpr(const MemberExpr* expr) {
+      callback_(dyn_cast<FunctionDecl>(expr->getMemberDecl()), expr);
+      EvalBase::VisitMemberExpr(expr);
+    }
+
+    void VisitCXXConstructExpr(const CXXConstructExpr* expr) {
+      callback_(expr->getConstructor(), expr);
+      EvalBase::VisitCXXConstructExpr(expr);
+    }
+
+   private:
+    std::function<void(const FunctionDecl*, const Expr*)> callback_;
+  };
+
+  void HandleDefaultArgumentDefinitionUses(const Expr* calling_expr,
+                                           SourceLocation report_loc) {
+    if (!calling_expr || report_loc.isInvalid() ||
+        !IsPotentiallyEvaluated(calling_expr)) {
+      return;
+    }
+    auto require = [&](const FunctionDecl* dependency, const Expr* expr) {
+      HandleConcreteDefinitionUse(const_cast<FunctionDecl*>(dependency), expr,
+                                  report_loc);
+    };
+    DefaultArgumentUseCollector collector(compiler()->getASTContext(),
+                                          require);
+    auto inspect = [&](const Expr* argument) {
+      const Expr* expression = nullptr;
+      if (const auto* default_arg = dyn_cast<clang::CXXDefaultArgExpr>(argument))
+        expression = default_arg->getExpr();
+      else if (const auto* default_init =
+                   dyn_cast<clang::CXXDefaultInitExpr>(argument))
+        expression = default_init->getExpr();
+      if (expression)
+        collector.Visit(expression);
+    };
+    if (const auto* call = dyn_cast<CallExpr>(calling_expr)) {
+      for (const Expr* argument : call->arguments())
+        inspect(argument);
+    } else if (const auto* construct =
+                   dyn_cast<CXXConstructExpr>(calling_expr)) {
+      for (const Expr* argument : construct->arguments())
+        inspect(argument);
+    }
+  }
+
+  bool HandleInlineDefinitionOdrUse(FunctionDecl* callee,
+                                    const Expr* expr) {
+    if (!IsPotentiallyEvaluatedOdrUse(callee, expr))
+      return false;
+    const SourceLocation report_loc =
+        static_cast<Derived*>(this)->DefinitionObligationReportLocation(expr);
+    return HandleConcreteDefinitionUse(callee, expr, report_loc);
   }
 
   void HandleExplicitInstantiationDefinition(FunctionDecl* declaration) {
@@ -2845,6 +3079,10 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     const Expr* odr_expr = calling_expr;
     if (!odr_expr)
       odr_expr = current_ast_node()->template GetAs<Expr>();
+    const SourceLocation report_loc =
+        static_cast<Derived*>(this)->DefinitionObligationReportLocation(
+            odr_expr);
+    HandleDefaultArgumentDefinitionUses(odr_expr, report_loc);
     HandleInlineDefinitionOdrUse(callee, odr_expr);
 
     // We may have already been checked in a previous
@@ -3462,6 +3700,8 @@ class InstantiatedTemplateVisitor
     return caller_loc();
   }
 
+  bool IsConcreteTemplateTraversal() const { return true; }
+
   bool CanIgnoreType(const Type* type, IgnoreKind ignore_kind =
                                            IgnoreKind::ForUse) const override {
     if (!type)
@@ -3578,8 +3818,10 @@ class InstantiatedTemplateVisitor
   // The 'convenience' HandleFunctionCall is perfect for us!
   bool HandleFunctionCall(FunctionDecl* callee, const Type* parent_type,
                           const clang::Expr* calling_expr) {
-    if (callee && calling_expr && CanIgnoreCurrentASTNode())
+    if (callee && calling_expr && CanIgnoreCurrentASTNode()) {
+      HandleDefaultArgumentDefinitionUses(calling_expr, caller_loc());
       HandleInlineDefinitionOdrUse(callee, calling_expr);
+    }
     if (const Type* resugared_type = ResugarType(parent_type))
       parent_type = resugared_type;
     if (!Base::HandleFunctionCall(callee, parent_type, calling_expr))
@@ -3591,8 +3833,14 @@ class InstantiatedTemplateVisitor
 
   bool VisitDeclRefExpr(clang::DeclRefExpr* expr) {
     if (CanIgnoreCurrentASTNode()) {
-      if (auto* function = dyn_cast<FunctionDecl>(expr->getDecl()))
+      if (auto* function = dyn_cast<FunctionDecl>(expr->getDecl())) {
+        if (const auto* call = current_ast_node()->
+                template GetAncestorAs<clang::CallExpr>()) {
+          if (call->getDirectCallee() == function)
+            HandleDefaultArgumentDefinitionUses(call, caller_loc());
+        }
         HandleInlineDefinitionOdrUse(function, expr);
+      }
       return true;
     }
     return Base::VisitDeclRefExpr(expr);
@@ -3600,8 +3848,14 @@ class InstantiatedTemplateVisitor
 
   bool VisitMemberExpr(clang::MemberExpr* expr) {
     if (CanIgnoreCurrentASTNode()) {
-      if (auto* function = dyn_cast<FunctionDecl>(expr->getMemberDecl()))
+      if (auto* function = dyn_cast<FunctionDecl>(expr->getMemberDecl())) {
+        if (const auto* call = current_ast_node()->
+                template GetAncestorAs<clang::CallExpr>()) {
+          if (call->getDirectCallee() == function)
+            HandleDefaultArgumentDefinitionUses(call, caller_loc());
+        }
         HandleInlineDefinitionOdrUse(function, expr);
+      }
       return true;
     }
     return Base::VisitMemberExpr(expr);
@@ -4349,6 +4603,8 @@ class IwyuAstConsumer
   SourceLocation DefinitionObligationReportLocation(const Expr* expr) const {
     return expr ? expr->getExprLoc() : SourceLocation();
   }
+
+  bool IsConcreteTemplateTraversal() const { return false; }
 
   // We are interested in all types for iwyu checking.
   bool CanIgnoreType(const Type* type, IgnoreKind) const override {
