@@ -571,6 +571,7 @@ class JsonCommandIdentityTests(unittest.TestCase):
             with self.subTest(abbreviation=abbreviation):
                 with self.assertRaises(ValueError):
                     iwyu_tool.Invocation.from_compile_command(
+
                         entry, ['-Xiwyu', abbreviation + '=forged'],
                         database_index=0, output_format='json')
 
@@ -800,6 +801,179 @@ class JsonCommandIdentityTests(unittest.TestCase):
                         iwyu_tool.reject_reserved_json_args(
                             ['-Xiwyu', abbreviation + '=forged'],
                             iwyu_tool.NAMED_DATABASE_RESERVED_JSON_OPTIONS)
+
+
+class HeaderAnalysisTests(unittest.TestCase):
+    def test_glob_manifest_and_symlink_contracts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, 'headers')
+            os.mkdir(root)
+            first = os.path.join(root, 'a.hpp')
+            nested = os.path.join(root, 'nested')
+            os.mkdir(nested)
+            second = os.path.join(nested, 'same.hpp')
+            with open(first, 'wb') as stream:
+                stream.write(b'// a\n')
+            with open(second, 'wb') as stream:
+                stream.write(b'// b\n')
+
+            selected_root, selected = iwyu_tool.select_headers(
+                root, ['*.hpp', '**/*.hpp'])
+            self.assertEqual(root, selected_root)
+            self.assertEqual(['a.hpp', 'nested/same.hpp'],
+                             [item[0] for item in selected])
+
+            manifest = os.path.join(directory, 'headers.json')
+            canonical = iwyu_tool._canonical_manifest_bytes(
+                root, [(relative, path, digest)
+                       for relative, path, digest, _ in selected])
+            with open(manifest, 'wb') as stream:
+                stream.write(canonical)
+            _, manifested = iwyu_tool.select_headers(root, manifest=manifest)
+            self.assertEqual([item[:3] for item in selected],
+                             [item[:3] for item in manifested])
+
+            with open(manifest, 'ab') as stream:
+                stream.write(b'\n')
+            with self.assertRaisesRegex(ValueError, 'canonical JSON'):
+                iwyu_tool.select_headers(root, manifest=manifest)
+
+            hardlink = os.path.join(root, 'hardlink.hpp')
+            os.link(first, hardlink)
+            with self.assertRaisesRegex(ValueError, 'alias one physical file'):
+                iwyu_tool.select_headers(root, ['a.hpp', 'hardlink.hpp'])
+            os.unlink(hardlink)
+
+            alias = os.path.join(root, 'alias.hpp')
+            os.symlink(first, alias)
+            with self.assertRaisesRegex(ValueError, 'symlink'):
+                iwyu_tool.select_headers(root, ['alias.hpp'])
+            with self.assertRaisesRegex(ValueError, 'normalized'):
+                iwyu_tool.select_headers(root + os.path.sep, ['*.hpp'])
+            with self.assertRaisesRegex(ValueError, 'relative to root'):
+                iwyu_tool.select_headers(root, ['../*.hpp'])
+
+    def test_compile_profiles_preserve_semantics_and_strip_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, 'source.cc')
+            header = os.path.join(directory, 'orphan.hpp')
+            for path in (source, header):
+                open(path, 'w').close()
+            response = os.path.join(directory, 'flags.rsp')
+            with open(response, 'w') as stream:
+                stream.write('-DFROM_RESPONSE=1 -Iinc')
+            entry = {
+                'directory': directory,
+                'file': source,
+                'arguments': [
+                    'clang++', '@flags.rsp', '-DLOCAL=1', '-iquote', 'quoted',
+                    '-MD', '-MF', 'source.d', '-MTtarget', '-o', 'source.o',
+                    '-c', source, '-Werror'],
+            }
+            profile = iwyu_tool.synthetic_compile_profile(entry)
+            arguments = profile['arguments']
+            self.assertEqual('clang++', arguments[0])
+            self.assertLess(arguments.index('-DFROM_RESPONSE=1'),
+                            arguments.index('-DLOCAL=1'))
+            self.assertLess(arguments.index('-DLOCAL=1'),
+                            arguments.index('-iquote'))
+            self.assertIn('-Werror', arguments)
+            self.assertNotIn('-MD', arguments)
+            self.assertNotIn('-MF', arguments)
+            self.assertNotIn('-MTtarget', arguments)
+            self.assertNotIn('-o', arguments)
+            self.assertNotIn('-c', arguments)
+            self.assertEqual(1, arguments.count('{header}'))
+            self.assertEqual(['-x', 'c++', '{header}'],
+                             arguments[arguments.index('-x'):
+                                       arguments.index('-x') + 3])
+            synthetic = iwyu_tool.instantiate_synthetic_entry(profile, header)
+            self.assertIn(header, synthetic['arguments'])
+            self.assertNotIn(source, synthetic['arguments'])
+
+            changed = dict(entry)
+            changed['arguments'] = list(entry['arguments'])
+            changed['arguments'].insert(2, '-DLOCAL=2')
+            self.assertNotEqual(
+                profile['key'],
+                iwyu_tool.synthetic_compile_profile(changed)['key'])
+
+    def test_source_input_must_be_unique_and_replaceable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, 'source.cc')
+            open(source, 'w').close()
+            duplicate = {'directory': directory, 'file': source,
+                         'arguments': ['clang++', source, source]}
+            absent = {'directory': directory, 'file': source,
+                      'arguments': ['clang++', '-c', 'other.cc']}
+            for entry in (duplicate, absent):
+                with self.assertRaisesRegex(ValueError, 'exactly one'):
+                    iwyu_tool.synthetic_compile_profile(entry)
+
+    def test_main_reserves_database_blocks_and_deduplicates_only_profiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, 'headers')
+            os.mkdir(root)
+            header = os.path.join(root, 'orphan.hpp')
+            open(header, 'w').close()
+            source_a = os.path.join(directory, 'a.cc')
+            source_b = os.path.join(directory, 'b.cc')
+            open(source_a, 'w').close()
+            open(source_b, 'w').close()
+            database = [
+                {'directory': directory, 'file': source_a,
+                 'arguments': ['clang++', '-DPROFILE=A', '-c', source_a]},
+                {'directory': directory, 'file': source_b,
+                 'arguments': ['clang++', '-DPROFILE=A', '-c', source_b]},
+                {'directory': directory, 'file': source_b,
+                 'arguments': ['clang++', '-DPROFILE=B', '-c', source_b]},
+            ]
+            database_path = os.path.join(directory, 'compile_commands.json')
+            with open(database_path, 'w') as stream:
+                json.dump(database, stream)
+
+            captured = {}
+            old_execute = iwyu_tool.execute_header_analysis
+            old_executable = iwyu_tool.IWYU_EXECUTABLE
+            try:
+                iwyu_tool.IWYU_EXECUTABLE = 'include-what-you-use'
+
+                def capture(plans, invocations, headers, *args):
+                    captured['plans'] = plans
+                    captured['invocations'] = invocations
+                    return 0
+
+                iwyu_tool.execute_header_analysis = capture
+                result = iwyu_tool.main(
+                    database_path, [], False, None, 1, 0, [], 'json',
+                    output_schema_version=2, configuration='server',
+                    analyze_header_root=root,
+                    analyze_header_globs=['*.hpp'],
+                    max_synthetic_header_invocations=10)
+            finally:
+                iwyu_tool.execute_header_analysis = old_execute
+                iwyu_tool.IWYU_EXECUTABLE = old_executable
+            self.assertEqual(0, result)
+            self.assertEqual([0, 1, 2], [inv.database_index
+                                        for inv in captured['invocations']])
+            self.assertEqual(2, len(captured['plans'][0]['profiles']))
+            self.assertEqual(0, captured['plans'][0]['base'])
+            self.assertEqual(5, len(database) + 2)
+
+    def test_header_mode_cli_gates(self):
+        old_executable = iwyu_tool.IWYU_EXECUTABLE
+        saved_stderr = iwyu_tool.sys.stderr
+        iwyu_tool.IWYU_EXECUTABLE = 'include-what-you-use'
+        iwyu_tool.sys.stderr = StringIO()
+        try:
+            self.assertEqual(1, iwyu_tool.main(
+                '/missing', [], False, None, 1, 0, [], 'json',
+                output_schema_version=1, analyze_header_root='/tmp',
+                analyze_header_globs=['*.hpp']))
+            self.assertIn('schema 2', iwyu_tool.sys.stderr.getvalue())
+        finally:
+            iwyu_tool.IWYU_EXECUTABLE = old_executable
+            iwyu_tool.sys.stderr = saved_stderr
 
 
 class WinSplitTests(unittest.TestCase):

@@ -211,6 +211,13 @@ See `iwyu_tool.py --help` for more options.
 We also include a tool that automatically fixes up your source files based on the IWYU recommendations.  This is also alpha-quality software!  Here's how to use it (requires python3):
 
       make -k CXX=include-what-you-use CXXFLAGS="-Xiwyu --error_always" 2> /tmp/iwyu.out
+
+Schema-2 JSON runs can also guarantee coverage of a strict rooted header set,
+synthesizing direct header invocations only where real translation units do not
+already provide coverage. See
+[Complete header analysis from compilation databases](docs/DriverHeaderAnalysis.md)
+for its CLI, canonical manifest, compile-profile, indexing, and atomicity
+contracts.
       python3 fix_includes.py < /tmp/iwyu.out
 
 If you don't like the way `fix_includes.py` munges your `#include` lines, you can control its behavior via flags. `fix_includes.py --help` will give a full list, but these are some common ones:

@@ -232,6 +232,12 @@ if (Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     OUTPUT_VARIABLE test_names_and_files
   )
+
+  add_test(NAME driver001_header_analysis_test
+    COMMAND ${Python3_EXECUTABLE} tests/driver001_header_analysis_test.py
+      $<TARGET_FILE:include-what-you-use> ${CMAKE_CURRENT_SOURCE_DIR}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
   string(REPLACE "\n" ";" test_names_list ${test_names_and_files})
   foreach (test_name_and_file IN ITEMS ${test_names_list})
     string(REPLACE ":" ";" test_name_and_file ${test_name_and_file})
