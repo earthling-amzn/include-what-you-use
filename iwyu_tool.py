@@ -364,6 +364,369 @@ def reject_reserved_json_args(
                              iwyu_argument)
 
 
+HEADER_SUFFIX_RE = re.compile(
+    r'(?i)(?:\.h|\.hh|\.hpp|\.hxx|\.inc|\.inl)$')
+SYNTHETIC_OUTPUT_OPTIONS = frozenset([
+    '-o', '--output', '-MF', '-MT', '-MQ', '-MJ',
+    '-dependency-file', '--dependency-file',
+    '-serialize-diagnostics', '--serialize-diagnostics',
+])
+SYNTHETIC_OUTPUT_FLAGS = frozenset([
+    '-c', '-S', '-E', '-MD', '-MMD', '-MP', '-MG', '-save-temps',
+    '--save-temps', '/c', '/showIncludes',
+])
+SYNTHETIC_OPTION_OPERANDS = frozenset([
+    '-o', '--output', '-MF', '-MT', '-MQ', '-MJ', '-x',
+    '-include', '-imacros', '-include-pch', '-isysroot', '--sysroot',
+    '-I', '-isystem', '-iquote', '-idirafter', '-iprefix', '-iwithprefix',
+    '-iwithprefixbefore', '-F', '-iframework', '-resource-dir',
+    '-gcc-toolchain', '-target', '--target', '-B', '-Xclang', '-Xpreprocessor',
+    '-Xassembler', '-Xlinker', '-dependency-file', '--dependency-file',
+    '-serialize-diagnostics', '--serialize-diagnostics',
+])
+
+
+def _strict_absolute_path(path, description, kind=None):
+    """Return a canonical path while rejecting lexical and symlink aliases."""
+    if not isinstance(path, str) or not path or not os.path.isabs(path):
+        raise ValueError('%s must be an absolute path' % description)
+    if os.path.abspath(os.path.normpath(path)) != path:
+        raise ValueError('%s must be lexically normalized' % description)
+    probe = path
+    while probe and probe != os.path.dirname(probe):
+        if os.path.islink(probe):
+            raise ValueError('%s must not contain a symlink: %s' %
+                             (description, probe))
+        probe = os.path.dirname(probe)
+    if not os.path.exists(path):
+        raise ValueError('%s does not exist: %s' % (description, path))
+    if kind == 'directory' and not os.path.isdir(path):
+        raise ValueError('%s is not a directory: %s' % (description, path))
+    if kind == 'file' and not os.path.isfile(path):
+        raise ValueError('%s is not a regular file: %s' % (description, path))
+    real = os.path.realpath(path)
+    if normcase(real) != normcase(path):
+        raise ValueError('%s aliases a different physical path: %s' %
+                         (description, path))
+    return real
+
+
+def _validate_rooted_header(root, relative_path):
+    if (not isinstance(relative_path, str) or not relative_path or
+            '\x00' in relative_path or '\\' in relative_path or
+            relative_path.startswith('/') or
+            any(component in ('', '.', '..')
+                for component in relative_path.split('/'))):
+        raise ValueError('header path is not a normalized rooted path: %r' %
+                         relative_path)
+    if not HEADER_SUFFIX_RE.search(relative_path):
+        raise ValueError('selected path is not a recognized header: %s' %
+                         relative_path)
+    lexical = os.path.join(root, *relative_path.split('/'))
+    header = _strict_absolute_path(lexical, 'selected header', kind='file')
+    if not is_subpath_of(header, root) or header == root:
+        raise ValueError('selected header escapes analysis root: %s' %
+                         relative_path)
+    return header
+
+
+def _source_snapshot(path):
+    with open(path, 'rb') as source:
+        contents = source.read()
+    return contents, 'sha256:' + hashlib.sha256(contents).hexdigest()
+
+
+def _canonical_manifest_bytes(root, headers):
+    value = OrderedDict([
+        ('schema_version', 1),
+        ('root', root.replace(os.path.sep, '/')),
+        ('headers', [OrderedDict([
+            ('path', relative), ('sha256', digest[len('sha256:'):])])
+            for relative, _, digest in headers]),
+    ])
+    return (_json_dumps_canonical(value) + '\n').encode('utf-8')
+
+
+def select_headers(root, globs=None, manifest=None):
+    """Strictly select and snapshot rooted physical headers."""
+    root = _strict_absolute_path(root, 'header analysis root', kind='directory')
+    globs = list(globs or [])
+    if bool(globs) == bool(manifest):
+        raise ValueError('specify header globs or one header manifest, not both')
+
+    selected = []
+    if manifest:
+        manifest = _strict_absolute_path(
+            manifest, 'header manifest', kind='file')
+        try:
+            with open(manifest, 'rb') as stream:
+                manifest_bytes = stream.read()
+            text = manifest_bytes.decode('utf-8')
+            value = json.loads(
+                text, object_pairs_hook=_reject_duplicate_object_keys,
+                parse_constant=_reject_nonfinite)
+        except (IOError, UnicodeError, ValueError) as why:
+            raise ValueError('invalid header manifest: %s' % why)
+        if (not isinstance(value, dict) or
+                list(value.keys()) != ['schema_version', 'root', 'headers'] or
+                value.get('schema_version') != 1 or
+                value.get('root') != root.replace(os.path.sep, '/') or
+                not isinstance(value.get('headers'), list)):
+            raise ValueError('header manifest has an invalid canonical shape')
+        previous = None
+        for item in value['headers']:
+            if (not isinstance(item, dict) or
+                    list(item.keys()) != ['path', 'sha256'] or
+                    not isinstance(item.get('sha256'), str) or
+                    re.fullmatch(r'[0-9a-f]{64}', item['sha256']) is None):
+                raise ValueError('header manifest entry has an invalid shape')
+            relative = item.get('path')
+            if previous is not None and relative <= previous:
+                raise ValueError('header manifest paths are duplicate or unsorted')
+            previous = relative
+            path = _validate_rooted_header(root, relative)
+            contents, digest = _source_snapshot(path)
+            if item['sha256'] != digest[len('sha256:'):]:
+                raise ValueError('header manifest digest mismatch: %s' % relative)
+            selected.append((relative, path, digest, contents))
+        canonical = _canonical_manifest_bytes(
+            root, [(r, p, d) for r, p, d, _ in selected])
+        if manifest_bytes != canonical:
+            raise ValueError('header manifest is not canonical JSON')
+    else:
+        import glob as glob_module
+        by_physical = {}
+        for pattern in globs:
+            if (not isinstance(pattern, str) or not pattern or
+                    '\x00' in pattern or '\\' in pattern or
+                    pattern.startswith('/') or
+                    any(component in ('', '.', '..')
+                        for component in pattern.split('/'))):
+                raise ValueError(
+                    'header glob must be a normalized path relative to root: %r' %
+                    pattern)
+            matches = sorted(glob_module.glob(
+                os.path.join(root, *pattern.split('/')), recursive=True))
+            file_matches = []
+            for match in matches:
+                if os.path.isdir(match):
+                    continue
+                relative = os.path.relpath(match, root).replace(os.path.sep, '/')
+                path = _validate_rooted_header(root, relative)
+                file_matches.append((relative, path))
+            if not file_matches:
+                raise ValueError('header glob matched no headers: %s' % pattern)
+            for relative, path in file_matches:
+                key = normcase(path)
+                prior = by_physical.get(key)
+                if prior is not None and prior != relative:
+                    raise ValueError(
+                        'header paths alias one physical file: %s and %s' %
+                        (prior, relative))
+                by_physical[key] = relative
+        for path_key, relative in sorted(
+                by_physical.items(), key=lambda item: item[1]):
+            path = os.path.join(root, *relative.split('/'))
+            contents, digest = _source_snapshot(path)
+            selected.append((relative, path, digest, contents))
+    if not selected:
+        raise ValueError('header selection is empty')
+    physical_files = {}
+    for relative, path, _, _ in selected:
+        metadata = os.stat(path)
+        physical_id = (metadata.st_dev, metadata.st_ino)
+        prior = physical_files.get(physical_id)
+        if prior is not None and prior != relative:
+            raise ValueError(
+                'header paths alias one physical file: %s and %s' %
+                (prior, relative))
+        physical_files[physical_id] = relative
+    return root, selected
+
+
+def _verify_source_contents(source_contents):
+    for identity, expected in sorted(source_contents.items()):
+        try:
+            with open(identity, 'rb') as source:
+                current = source.read()
+        except OSError as why:
+            raise ValueError('cannot rehash analyzed source %s: %s' %
+                             (identity, why))
+        if current != expected:
+            raise ValueError('analyzed source changed during analysis: %s' %
+                             identity)
+
+
+def _verify_header_snapshots(headers):
+    for relative, path, expected_digest, expected_contents in headers:
+        contents, digest = _source_snapshot(path)
+        if digest != expected_digest or contents != expected_contents:
+            raise ValueError('selected header changed during analysis: %s' %
+                             relative)
+
+
+def _canonical_compile_arguments(entry):
+    if 'arguments' in entry:
+        command = list(entry['arguments'])
+    elif 'command' in entry:
+        command = split_command(entry['command'])
+    else:
+        raise ValueError('Invalid compilation database entry: %s' % entry)
+    if not command:
+        raise ValueError('Empty compilation command: %s' % entry)
+    command = _unwrap_compiler_wrapper(command)
+    if not command:
+        raise ValueError('Compilation command contains only a wrapper')
+    windows_args = is_msvc_driver(command[0])
+    directory = os.path.realpath(entry['directory'])
+    canonical = expand_response_files(command, directory, windows=windows_args)
+    canonical = _unwrap_compiler_wrapper(canonical)
+    if not canonical:
+        raise ValueError('expanded compilation command contains only a wrapper')
+    if not windows_args and is_msvc_driver(canonical[0]):
+        windows_args = True
+        canonical = expand_response_files(command, directory, windows=True)
+        canonical = _unwrap_compiler_wrapper(canonical)
+        if not canonical:
+            raise ValueError('expanded compilation command contains only a wrapper')
+    return canonical, windows_args
+
+
+def _argument_physical_path(argument, directory):
+    if not argument or argument.startswith('-'):
+        return None
+    path = argument if os.path.isabs(argument) else os.path.join(directory,
+                                                                  argument)
+    return os.path.realpath(path)
+
+
+def _source_argument_index(arguments, directory, source):
+    operands = set()
+    index = 1
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in SYNTHETIC_OPTION_OPERANDS and index + 1 < len(arguments):
+            operands.add(index + 1)
+            index += 2
+            continue
+        index += 1
+    positional = [
+        (index, argument) for index, argument in enumerate(arguments[1:], 1)
+        if index not in operands and not argument.startswith('-')]
+    source_like = [
+        (index, argument) for index, argument in positional
+        if re.search(r'(?i)\.(?:c|cc|cpp|cxx|m|mm|h|hh|hpp|hxx)$', argument)]
+    candidates = [
+        index for index, argument in positional
+        if normcase(_argument_physical_path(argument, directory) or '') ==
+        normcase(source)]
+    if len(candidates) != 1 or any(
+            index != candidates[0] for index, _ in source_like):
+        raise ValueError(
+            'compile command must contain exactly one replaceable source input')
+    return candidates[0]
+
+
+def _compile_language(arguments, source, windows_args):
+    if windows_args:
+        lowered = [normcase(argument) for argument in arguments]
+        if '/tc' in lowered:
+            return 'c'
+        if '/tp' in lowered:
+            return 'c++'
+    language = None
+    for index, argument in enumerate(arguments[:-1]):
+        if argument == '-x':
+            language = arguments[index + 1]
+    if language:
+        normalized = language.lower()
+        if normalized in ('c', 'c-header'):
+            return 'c'
+        if normalized in ('c++', 'c++-header', 'objective-c++'):
+            return 'c++'
+        raise ValueError('unsupported source language for header synthesis: %s' %
+                         language)
+    return 'c' if source.lower().endswith('.c') else 'c++'
+
+
+def synthetic_compile_profile(entry):
+    """Return a deterministic source-independent semantic compile profile."""
+    arguments, windows_args = _canonical_compile_arguments(entry)
+    directory = os.path.realpath(entry['directory'])
+    source = os.path.realpath(entry['file'])
+    source_index = _source_argument_index(arguments, directory, source)
+    language = _compile_language(arguments, source, windows_args)
+    result = [arguments[0]]
+    insert_at = None
+    index = 1
+    while index < len(arguments):
+        argument = arguments[index]
+        if index == source_index:
+            insert_at = len(result)
+            index += 1
+            continue
+        if argument == '-x':
+            if index + 1 >= len(arguments):
+                raise ValueError('compile command has an incomplete -x option')
+            index += 2
+            continue
+        if argument in SYNTHETIC_OUTPUT_OPTIONS:
+            if index + 1 >= len(arguments):
+                raise ValueError('compile command has an incomplete output option')
+            index += 2
+            continue
+        joined_output = (
+            any(argument.startswith(prefix) and argument != prefix
+                for prefix in ('-MF', '-MT', '-MQ', '-MJ')) or
+            argument.startswith('--output=') or
+            (argument.startswith('-o') and len(argument) > 2 and
+             not argument.startswith(('-objc', '-object', '-openmp'))))
+        if (argument in SYNTHETIC_OUTPUT_FLAGS or joined_output or
+                re.match(r'(?i)^/(?:Fo|Fd|Fe|Fa|Fi).+', argument)):
+            index += 1
+            continue
+        if windows_args and normcase(argument) in ('/tc', '/tp'):
+            index += 1
+            continue
+        result.append(argument)
+        index += 1
+    if insert_at is None:
+        raise ValueError('compile source input was not replaced')
+    replacement = ['/TC' if language == 'c' else '/TP', '{header}'] \
+        if windows_args else ['-x', language, '{header}']
+    result[insert_at:insert_at] = replacement
+    return {
+        'directory': directory,
+        'arguments': result,
+        'language': language,
+        'key': hashlib.sha256(_json_dumps_canonical(result).encode('utf-8')).hexdigest(),
+    }
+
+
+def instantiate_synthetic_entry(profile, header):
+    arguments = [header if argument == '{header}' else argument
+                 for argument in profile['arguments']]
+    return {'directory': profile['directory'], 'file': header,
+            'arguments': arguments}
+
+
+def _exact_check_also(path):
+    # POSIX fnmatch treats a backslash as an escape. Windows selection rejects
+    # wildcard-bearing paths because PathMatchSpecA has no exact escaping form.
+    if sys.platform.startswith('win') and any(char in path for char in '*?['):
+        raise ValueError('selected header path cannot be expressed exactly')
+    escaped = ''.join(('\\' + char) if char in '*?[' else char for char in path)
+    return ['-Xiwyu', '--check_also=' + escaped.replace(os.path.sep, '/')]
+
+
+
+def _entry_with_driver_arguments(entry, driver_arguments):
+    arguments, _ = _canonical_compile_arguments(entry)
+    return {
+        'directory': os.path.realpath(entry['directory']),
+        'file': entry['file'],
+        'arguments': ([arguments[0]] + list(driver_arguments) + arguments[1:]),
+    }
 def validate_configuration_name(name):
     """Return a safe non-empty configuration name or raise ValueError."""
     if not isinstance(name, str) or CONFIGURATION_NAME_RE.fullmatch(name) is None:
@@ -541,16 +904,13 @@ class Invocation(object):
                              output_schema_version=1):
         """ Parse a JSON compilation database entry into new Invocation. """
         if 'arguments' in entry:
-            # arguments is a command-line in list form.
             command = list(entry['arguments'])
         elif 'command' in entry:
-            # command is a command-line in string form, split to list.
             command = split_command(entry['command'])
         else:
             raise ValueError('Invalid compilation database entry: %s' % entry)
         if not command:
             raise ValueError('Empty compilation command: %s' % entry)
-
         command = _unwrap_compiler_wrapper(command)
         if not command:
             raise ValueError('Compilation command contains only a wrapper')
@@ -588,26 +948,7 @@ class Invocation(object):
         directory = real_directory.replace(os.path.sep, '/')
         translation_unit = os.path.realpath(source_file).replace(os.path.sep,
                                                                   '/')
-        canonical_args = expand_response_files(
-            command, real_directory, windows=windows_args)
-        canonical_args = _unwrap_compiler_wrapper(canonical_args)
-        if not canonical_args:
-            raise ValueError('expanded compilation command contains only a wrapper')
-
-        # The compiler itself can be hidden in a response file. GNU response
-        # tokenization may be good enough to reveal clang-cl, but it consumes
-        # literal backslashes in that file and every nested response file.
-        # Start over from the unexpanded command so identity and launch use
-        # clang-cl's Windows tokenization at every level.
-        if not windows_args and is_msvc_driver(canonical_args[0]):
-            windows_args = True
-            canonical_args = expand_response_files(
-                command, real_directory, windows=True)
-            canonical_args = _unwrap_compiler_wrapper(canonical_args)
-            if not canonical_args:
-                raise ValueError(
-                    'expanded compilation command contains only a wrapper')
-
+        canonical_args, windows_args = _canonical_compile_arguments(entry)
         reject_reserved_json_args(canonical_args[1:], reserved_options)
         if windows_args:
             extra_args = ['--driver-mode=cl'] + extra_args
@@ -2162,8 +2503,8 @@ def _protocol_error_context(invocation):
         invocation.database_index)
 
 
-def execute_json(invocations, verbose, jobs, max_load_average=0):
-    """Run structured invocations and atomically emit validated JSON groups."""
+def _collect_json_processes(invocations, verbose, jobs, max_load_average=0):
+    """Run invocations and return database-ordered buffered child results."""
     _validate_jobs(jobs)
     ordered = sorted(invocations, key=lambda invocation:
                      invocation.database_index)
@@ -2203,11 +2544,14 @@ def execute_json(invocations, verbose, jobs, max_load_average=0):
             pending.append((position, ordered[position].start(verbose)))
         next_invocation = end
         time.sleep(0.0001)
+    return ordered, results
 
-    # Validate all groups before writing any structured stdout.
-    identities = set()
-    source_digests = {}
-    source_contents = {}
+
+def _validate_json_processes(ordered, results, identities=None,
+                             source_digests=None, source_contents=None):
+    identities = set() if identities is None else identities
+    source_digests = {} if source_digests is None else source_digests
+    source_contents = {} if source_contents is None else source_contents
     groups = []
     errors = []
     exit_code = 0
@@ -2230,6 +2574,21 @@ def execute_json(invocations, verbose, jobs, max_load_average=0):
         except ProtocolError as why:
             errors.append((invocation, str(why)))
             groups.append([])
+    return groups, errors, exit_code
+
+
+def execute_json(invocations, verbose, jobs, max_load_average=0):
+    """Run structured invocations and atomically emit validated JSON groups."""
+    ordered, results = _collect_json_processes(
+        invocations, verbose, jobs, max_load_average)
+
+
+    # Validate all groups before writing any structured stdout.
+    identities = set()
+    source_digests = {}
+    source_contents = {}
+    groups, errors, exit_code = _validate_json_processes(
+        ordered, results, identities, source_digests, source_contents)
 
     # Native diagnostics use stderr exclusively and remain grouped by DB index.
     for _, result in zip(ordered, results):
@@ -2255,6 +2614,155 @@ def execute_json(invocations, verbose, jobs, max_load_average=0):
             sys.stdout.write(line + '\n')
     return exit_code
 
+def _emit_buffered_json_stderr(buffered, errors):
+    for _, text in sorted(buffered, key=lambda item: item[0]):
+        if text:
+            sys.stderr.write(text)
+    for invocation, message in sorted(
+            errors, key=lambda item: item[0].database_index):
+        print('error: IWYU JSON protocol at %s: %s' %
+              (_protocol_error_context(invocation), message), file=sys.stderr)
+
+
+def execute_header_analysis(database_plans, real_invocations, headers,
+                            extra_args, verbose, jobs, max_load_average,
+                            max_synthetic_invocations):
+    """Run DRIVER-001's atomic real-then-uncovered-header analysis."""
+    identities = set()
+    source_digests = {}
+    source_contents = {}
+    all_pairs = []
+    buffered_stderr = []
+    all_errors = []
+
+    ordered, results = _collect_json_processes(
+        real_invocations, verbose, jobs, max_load_average)
+    groups, errors, exit_code = _validate_json_processes(
+        ordered, results, identities, source_digests, source_contents)
+    buffered_stderr.extend(
+        (invocation.database_index, result[1])
+        for invocation, result in zip(ordered, results))
+    all_errors.extend(errors)
+    all_pairs.extend(zip(ordered, groups))
+    if errors or exit_code:
+        _emit_buffered_json_stderr(buffered_stderr, all_errors)
+        return max(exit_code, 1)
+
+    try:
+        _verify_header_snapshots(headers)
+        _verify_source_contents(source_contents)
+    except (IOError, ValueError) as why:
+        _emit_buffered_json_stderr(buffered_stderr, all_errors)
+        print('error: %s' % why, file=sys.stderr)
+        return 1
+
+    covered = set()
+    for invocation, lines in all_pairs:
+        for line in lines:
+            record = _parse_json_object(line)
+            identity = record.get('source_identity')
+            if identity:
+                covered.add((invocation.configuration, normcase(identity)))
+
+    synthetic = []
+    expected = {}
+    for plan in database_plans:
+        configuration = plan['configuration']
+        for header_index, (relative, path, digest, _) in enumerate(headers):
+            if (configuration, normcase(path.replace(os.path.sep, '/'))) in covered:
+                continue
+            for profile_index, profile in enumerate(plan['profiles']):
+                local_index = (len(plan['compilation_db']) +
+                               header_index * len(plan['profiles']) +
+                               profile_index)
+                database_index = plan['base'] + local_index
+                entry = instantiate_synthetic_entry(profile, path)
+                entry = _entry_with_driver_arguments(entry, extra_args)
+                invocation = Invocation.from_compile_command(
+                    entry, [], database_index, JSON_FORMAT,
+                    configuration=configuration,
+                    database_name=plan['database_name'],
+                    database_local_index=local_index,
+                    output_schema_version=2)
+                synthetic.append(invocation)
+                expected[database_index] = (path.replace(os.path.sep, '/'),
+                                            digest, relative, profile_index)
+    if len(synthetic) > max_synthetic_invocations:
+        _emit_buffered_json_stderr(buffered_stderr, all_errors)
+        print('error: synthetic header invocation count %d exceeds cap %d' %
+              (len(synthetic), max_synthetic_invocations), file=sys.stderr)
+        return 1
+
+    if synthetic:
+        ordered2, results2 = _collect_json_processes(
+            synthetic, verbose, jobs, max_load_average)
+        groups2, errors2, exit_code2 = _validate_json_processes(
+            ordered2, results2, identities, source_digests, source_contents)
+        buffered_stderr.extend(
+            (invocation.database_index, result[1])
+            for invocation, result in zip(ordered2, results2))
+        all_errors.extend(errors2)
+        exit_code = max(exit_code, exit_code2)
+        filtered_groups = []
+        for invocation, lines in zip(ordered2, groups2):
+            target, digest, relative, _ = expected[invocation.database_index]
+            targets = []
+            for line in lines:
+                record = _parse_json_object(line)
+                if record.get('source_identity') == target:
+                    targets.append((line, record))
+            if len(targets) != 1:
+                all_errors.append((
+                    invocation,
+                    'synthetic invocation for %s produced %d target records' %
+                    (relative, len(targets))))
+                filtered_groups.append([])
+                continue
+            line, record = targets[0]
+            if record.get('source_digest') != digest:
+                all_errors.append((
+                    invocation,
+                    'synthetic target source digest differs from snapshot'))
+                filtered_groups.append([])
+                continue
+            if record.get('status') not in ('correct', 'changes'):
+                all_errors.append((
+                    invocation,
+                    'synthetic target has non-terminal status %r' %
+                    record.get('status')))
+                filtered_groups.append([])
+                continue
+            filtered_groups.append([line])
+        all_pairs.extend(zip(ordered2, filtered_groups))
+
+    try:
+        _verify_header_snapshots(headers)
+        _verify_source_contents(source_contents)
+    except (IOError, ValueError) as why:
+        _emit_buffered_json_stderr(buffered_stderr, all_errors)
+        print('error: %s' % why, file=sys.stderr)
+        return 1
+
+    _emit_buffered_json_stderr(buffered_stderr, all_errors)
+    if all_errors or exit_code:
+        return max(exit_code, 1)
+
+    all_pairs.sort(key=lambda item: item[0].database_index)
+    final_invocations = [item[0] for item in all_pairs]
+    final_groups = [item[1] for item in all_pairs]
+    try:
+        final_groups = _aggregate_declaration_conflicts(
+            final_groups, final_invocations, source_contents)
+    except ProtocolError as why:
+        print('error: IWYU JSON aggregation: %s' % why, file=sys.stderr)
+        return 1
+    for lines in final_groups:
+        for line in lines:
+            sys.stdout.write(line + '\n')
+    return 0
+
+
+
 
 def _deduplicate_selected_entries(compilation_db):
     selected_ids = set()
@@ -2269,7 +2777,10 @@ def _deduplicate_selected_entries(compilation_db):
 
 def main(compilation_db_path, source_files, verbose, formatter, jobs,
          max_load_average, extra_args, output_format=DEFAULT_FORMAT,
-         named_databases=None, output_schema_version=1):
+         named_databases=None, output_schema_version=1,
+         configuration=None, analyze_header_root=None,
+         analyze_header_globs=None, analyze_header_manifest=None,
+         max_synthetic_header_invocations=None):
     """Run IWYU for one legacy database or ordered named databases."""
 
     try:
@@ -2288,6 +2799,44 @@ def main(compilation_db_path, source_files, verbose, formatter, jobs,
         return 1
 
     named_databases = list(named_databases or [])
+    header_feature = bool(analyze_header_root or analyze_header_globs or
+                          analyze_header_manifest or
+                          max_synthetic_header_invocations is not None)
+    headers = None
+    if header_feature:
+        if output_format != JSON_FORMAT or output_schema_version != 2:
+            print('error: header analysis requires JSON output schema 2',
+                  file=sys.stderr)
+            return 1
+        if not analyze_header_root:
+            print('error: header analysis requires --analyze-header-root',
+                  file=sys.stderr)
+            return 1
+        if named_databases and configuration is not None:
+            print('error: --configuration is only valid with single -p mode',
+                  file=sys.stderr)
+            return 1
+        if not named_databases:
+            try:
+                validate_configuration_name(configuration)
+            except ValueError:
+                print('error: single -p header analysis requires an exact '
+                      '--configuration', file=sys.stderr)
+                return 1
+        if max_synthetic_header_invocations is None:
+            max_synthetic_header_invocations = 1000
+        try:
+            _validate_jobs(max_synthetic_header_invocations)
+            _, headers = select_headers(
+                analyze_header_root, analyze_header_globs,
+                analyze_header_manifest)
+        except (IOError, TypeError, ValueError) as why:
+            print('error: %s' % why, file=sys.stderr)
+            return 1
+    elif configuration is not None:
+        print('error: --configuration requires header analysis', file=sys.stderr)
+        return 1
+
     try:
         if named_databases:
             names = set()
@@ -2308,44 +2857,86 @@ def main(compilation_db_path, source_files, verbose, formatter, jobs,
                 requested.append((name, canonical_path))
 
             databases = []
-            invocation_base = 0
             for name, path in requested:
                 canonical_path, compilation_db = load_compilation_db(
                     path, require_nonempty=True)
-                databases.append(
-                    (name, canonical_path, compilation_db, invocation_base))
-                invocation_base += len(compilation_db)
+                databases.append((name, canonical_path, compilation_db))
         else:
             canonical_path, compilation_db = load_compilation_db(
                 compilation_db_path)
-            databases = [(None, canonical_path, compilation_db, 0)]
+            databases = [(configuration if header_feature else None,
+                          canonical_path, compilation_db)]
     except (TypeError, ValueError) as why:
         print('error: %s' % why, file=sys.stderr)
         return 1
 
     invocations = []
+    plans = []
+    invocation_base = 0
     try:
-        for name, _, compilation_db, invocation_base in databases:
+        for name, canonical_path, compilation_db in databases:
             original_indices = {
                 id(entry): index for index, entry in enumerate(compilation_db)}
             selected = slice_compilation_db(compilation_db, source_files)
             if output_format == JSON_FORMAT:
                 selected = _deduplicate_selected_entries(selected)
+            if header_feature and not selected:
+                raise ValueError(
+                    "configuration '%s' has no selected compilation entries" %
+                    name)
 
-            # Index named invocations in database order, retaining each entry's
-            # original local position and gaps left by source selection.
+            profiles = []
+            if header_feature:
+                profile_keys = set()
+                for entry in selected:
+                    profile = synthetic_compile_profile(entry)
+                    if profile['key'] not in profile_keys:
+                        profile_keys.add(profile['key'])
+                        profiles.append(profile)
+                if not profiles:
+                    raise ValueError(
+                        "configuration '%s' has no synthetic compile profiles" %
+                        name)
+
+            bound_driver_args = list(extra_args)
+            if header_feature:
+                for _, path, _, _ in headers:
+                    bound_driver_args.extend(_exact_check_also(path))
+
             for entry in selected:
                 local_index = original_indices[id(entry)]
+                analysis_entry = (_entry_with_driver_arguments(
+                    entry, bound_driver_args) if header_feature else entry)
                 invocations.append(Invocation.from_compile_command(
-                    entry, extra_args, invocation_base + local_index,
-                    output_format, configuration=name, database_name=name,
+                    analysis_entry, [] if header_feature else extra_args,
+                    invocation_base + local_index,
+                    output_format, configuration=name, database_name=(
+                        name if named_databases else None),
                     database_local_index=local_index,
                     output_schema_version=output_schema_version))
+
+            if header_feature:
+                plans.append({
+                    'configuration': name,
+                    'database_name': name if named_databases else None,
+                    'path': canonical_path,
+                    'compilation_db': compilation_db,
+                    'profiles': profiles,
+                    'base': invocation_base,
+                })
+                invocation_base += (len(compilation_db) +
+                                    len(headers) * len(profiles))
+            else:
+                invocation_base += len(compilation_db)
     except (KeyError, TypeError, ValueError) as why:
         print('error: failed to prepare IWYU invocation: %s' % why,
               file=sys.stderr)
         return 1
 
+    if header_feature:
+        return execute_header_analysis(
+            plans, invocations, headers, extra_args, verbose, jobs,
+            max_load_average, max_synthetic_header_invocations)
     if output_format == JSON_FORMAT:
         return execute_json(invocations, verbose, jobs, max_load_average)
     return execute(invocations, verbose, formatter, jobs, max_load_average)
@@ -2396,6 +2987,25 @@ def _bootstrap(sys_argv):
                         help='Number of concurrent subprocesses')
     parser.add_argument('-l', '--load', type=float, default=0,
                         help='Do not start new jobs if the 1min load average is greater than the provided value')
+    parser.add_argument(
+        '--configuration', type=validate_configuration_name,
+        help=('Configuration name for single -p header analysis; named '
+              'database names are their configurations'))
+    parser.add_argument(
+        '--analyze-header-root', metavar='<absolute-directory>',
+        help='Canonical physical root containing headers selected for analysis')
+    parser.add_argument(
+        '--analyze-header-glob', action='append', dest='analyze_header_globs',
+        metavar='<root-relative-glob>',
+        help=('Select rooted headers (repeatable; mutually exclusive with '
+              '--analyze-header-manifest)'))
+    parser.add_argument(
+        '--analyze-header-manifest', metavar='<absolute-manifest>',
+        help='Canonical JSON manifest of rooted header paths and SHA-256 digests')
+    parser.add_argument(
+        '--max-synthetic-header-invocations', type=_positive_jobs,
+        metavar='<count>',
+        help='Fail atomically if uncovered-header invocations exceed this cap')
     database_group = parser.add_mutually_exclusive_group(required=True)
     database_group.add_argument(
         '-p', metavar='<build-path>',
@@ -2424,7 +3034,13 @@ def _bootstrap(sys_argv):
                 FORMATTERS.get(args.output_format), args.jobs, args.load,
                 extra_args, args.output_format,
                 named_databases=args.databases,
-                output_schema_version=args.output_schema)
+                output_schema_version=args.output_schema,
+                configuration=args.configuration,
+                analyze_header_root=args.analyze_header_root,
+                analyze_header_globs=args.analyze_header_globs,
+                analyze_header_manifest=args.analyze_header_manifest,
+                max_synthetic_header_invocations=(
+                    args.max_synthetic_header_invocations))
 
 
 if __name__ == '__main__':
