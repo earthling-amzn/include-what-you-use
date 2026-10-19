@@ -16,6 +16,7 @@ import random
 import inspect
 import tempfile
 import unittest
+import stat
 import iwyu_tool
 
 try:
@@ -826,7 +827,7 @@ class HeaderAnalysisTests(unittest.TestCase):
             manifest = os.path.join(directory, 'headers.json')
             canonical = iwyu_tool._canonical_manifest_bytes(
                 root, [(relative, path, digest)
-                       for relative, path, digest, _ in selected])
+                       for relative, path, digest, _, _ in selected])
             with open(manifest, 'wb') as stream:
                 stream.write(canonical)
             _, manifested = iwyu_tool.select_headers(root, manifest=manifest)
@@ -909,6 +910,156 @@ class HeaderAnalysisTests(unittest.TestCase):
             for entry in (duplicate, absent):
                 with self.assertRaisesRegex(ValueError, 'exactly one'):
                     iwyu_tool.synthetic_compile_profile(entry)
+
+    def test_profile_key_includes_canonical_working_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profiles = []
+            for name in ('one', 'two'):
+                working = os.path.join(directory, name)
+                os.mkdir(working)
+                source = os.path.join(working, 'source.cc')
+                open(source, 'w').close()
+                profiles.append(iwyu_tool.synthetic_compile_profile({
+                    'directory': working,
+                    'file': source,
+                    'arguments': ['clang++', '-Iinclude', '-iquote', 'quote',
+                                  '--sysroot=sysroot', '-include', 'forced.hpp',
+                                  '-c', 'source.cc'],
+                }))
+            self.assertEqual(profiles[0]['arguments'], profiles[1]['arguments'])
+            self.assertNotEqual(profiles[0]['key'], profiles[1]['key'])
+
+    def test_joined_language_selectors_use_last_effective_language(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cases = [
+                ('source.c', ['-xobjective-c++', '-xc++', '-xc'], 'c'),
+                ('source.c', ['-xc++', '-xnone'], 'c'),
+                ('source.mm', ['-xc', '-x', 'objective-c++'],
+                 'objective-c++'),
+                ('source.m', [], 'objective-c'),
+            ]
+            for filename, selectors, expected in cases:
+                source = os.path.join(directory, filename)
+                open(source, 'w').close()
+                entry = {
+                    'directory': directory,
+                    'file': source,
+                    'arguments': ['clang'] + selectors + ['-c', filename],
+                }
+                with self.subTest(filename=filename, selectors=selectors):
+                    profile = iwyu_tool.synthetic_compile_profile(entry)
+                    self.assertEqual(expected, profile['language'])
+                    arguments = profile['arguments']
+                    self.assertEqual(1, arguments.count('-x'))
+                    self.assertEqual(expected,
+                                     arguments[arguments.index('-x') + 1])
+                    self.assertFalse(any(
+                        argument.startswith('-x') and argument != '-x'
+                        for argument in arguments))
+
+    def test_synthetic_rewrite_strips_outputs_and_preserves_module_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, 'source.cc')
+            open(source, 'w').close()
+            arguments = [
+                'clang++', '-M', '-MM', '-MD', '-MMD', '-MFdep.d',
+                '-MT', 'target', '-MQquoted', '-MJcommands.json',
+                '-save-temps=obj', '--serialize-diagnostics=diag.dia',
+                '-fdiagnostics-serialization-file=other.dia',
+                '-fprofile-instr-generate=profile.raw', '-fprofile-arcs',
+                '-ftest-coverage', '-ftime-trace=trace.json',
+                '-fsave-optimization-record=yaml',
+                '-foptimization-record-file=opt.yaml', '-gen-reproducer',
+                '-fcrash-diagnostics-dir=crashes', '-ooutput.o',
+                '-fmodule-file', 'input.pcm',
+                '-fmodule-map-file=module.modulemap',
+                '-fprebuilt-module-path=prebuilt',
+                '-fbuild-session-file=session.timestamp', '-c', source,
+            ]
+            profile = iwyu_tool.synthetic_compile_profile({
+                'directory': directory, 'file': source,
+                'arguments': arguments})
+            rewritten = profile['arguments']
+            for output in [
+                    'dep.d', 'target', 'quoted', 'commands.json', 'diag.dia',
+                    'other.dia', 'profile.raw', 'trace.json', 'opt.yaml',
+                    'crashes', 'output.o']:
+                self.assertFalse(any(output in argument
+                                     for argument in rewritten))
+            self.assertIn('-fmodule-file', rewritten)
+            self.assertIn('input.pcm', rewritten)
+            self.assertIn('-fmodule-map-file=module.modulemap', rewritten)
+            self.assertIn('-fprebuilt-module-path=prebuilt', rewritten)
+            self.assertIn('-fbuild-session-file=session.timestamp', rewritten)
+            self.assertEqual(1, rewritten.count('-fsyntax-only'))
+            self.assertEqual(1, rewritten.count('-fno-crash-diagnostics'))
+
+            for unsafe in ['-fmodules', '-fmodule-output=out.pcm',
+                           '-fmodules-cache-path=cache']:
+                rejected = dict(directory=directory, file=source,
+                                arguments=['clang++', unsafe, source])
+                with self.subTest(unsafe=unsafe):
+                    with self.assertRaisesRegex(ValueError, 'unsafe synthetic'):
+                        iwyu_tool.synthetic_compile_profile(rejected)
+
+    def test_header_snapshot_rejects_replacement_symlink_and_mode_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, 'headers')
+            os.mkdir(root)
+            header = os.path.join(root, 'target.hpp')
+            with open(header, 'wb') as stream:
+                stream.write(b'// same bytes\n')
+            _, selected = iwyu_tool.select_headers(root, ['target.hpp'])
+
+            replacement = os.path.join(root, 'replacement.hpp')
+            with open(replacement, 'wb') as stream:
+                stream.write(b'// same bytes\n')
+            os.replace(replacement, header)
+            with self.assertRaisesRegex(ValueError, 'changed during analysis'):
+                iwyu_tool._verify_header_snapshots(selected)
+
+            _, selected = iwyu_tool.select_headers(root, ['target.hpp'])
+            mode = os.stat(header).st_mode
+            os.chmod(header, mode ^ stat.S_IXUSR)
+            with self.assertRaisesRegex(ValueError, 'changed during analysis'):
+                iwyu_tool._verify_header_snapshots(selected)
+            os.chmod(header, mode)
+
+            _, selected = iwyu_tool.select_headers(root, ['target.hpp'])
+            saved = os.path.join(root, 'saved.hpp')
+            os.replace(header, saved)
+            os.symlink(saved, header)
+            with self.assertRaisesRegex(ValueError, 'changed during analysis'):
+                iwyu_tool._verify_header_snapshots(selected)
+
+    def test_synthetic_cap_is_checked_before_product_allocation(self):
+        class HugeProfiles(object):
+            def __len__(self):
+                return 10 ** 12
+
+            def __iter__(self):
+                raise AssertionError('profiles were iterated before cap check')
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, 'headers')
+            os.mkdir(root)
+            header = os.path.join(root, 'target.hpp')
+            open(header, 'w').close()
+            _, headers = iwyu_tool.select_headers(root, ['target.hpp'])
+            plan = {
+                'configuration': 'one', 'database_name': None,
+                'compilation_db': [], 'profiles': HugeProfiles(), 'base': 0,
+            }
+            saved_stderr = iwyu_tool.sys.stderr
+            iwyu_tool.sys.stderr = StringIO()
+            try:
+                result = iwyu_tool.execute_header_analysis(
+                    [plan], [], headers, [], False, 1, 0, 1)
+                error = iwyu_tool.sys.stderr.getvalue()
+            finally:
+                iwyu_tool.sys.stderr = saved_stderr
+            self.assertEqual(1, result)
+            self.assertIn('exceeds cap', error)
 
     def test_main_reserves_database_blocks_and_deduplicates_only_profiles(self):
         with tempfile.TemporaryDirectory() as directory:

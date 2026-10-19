@@ -45,6 +45,7 @@ import argparse
 import hashlib
 import tempfile
 import subprocess
+import stat
 from collections import OrderedDict
 
 
@@ -366,15 +367,71 @@ def reject_reserved_json_args(
 
 HEADER_SUFFIX_RE = re.compile(
     r'(?i)(?:\.h|\.hh|\.hpp|\.hxx|\.inc|\.inl)$')
+# Options whose operand names an output. Both tokens are removed.
 SYNTHETIC_OUTPUT_OPTIONS = frozenset([
     '-o', '--output', '-MF', '-MT', '-MQ', '-MJ',
     '-dependency-file', '--dependency-file',
     '-serialize-diagnostics', '--serialize-diagnostics',
+    '-fdiagnostics-serialization-file', '-foptimization-record-file',
+    '-fprofile-dir', '-fprofile-note', '-fprofile-instrument-path',
+    '-dependency-dot', '-arcmt-migrate-report-output',
+    '-gen-cdb-fragment-path', '-dsym-dir', '-coverage-data-file',
+    '-coverage-notes-file', '-split-dwarf-output', '-object-file-name',
+    '-dumpdir', '-dumpbase', '/Fo', '/Fd', '/Fe', '/Fa', '/Fi',
 ])
+# Output/action switches that are safe to discard for syntax-only analysis.
 SYNTHETIC_OUTPUT_FLAGS = frozenset([
-    '-c', '-S', '-E', '-MD', '-MMD', '-MP', '-MG', '-save-temps',
-    '--save-temps', '/c', '/showIncludes',
+    '-c', '-S', '-E', '-M', '-MM', '-MD', '-MMD', '-MP', '-MG',
+    '-save-temps', '--save-temps', '/c', '/showIncludes',
+    '--coverage', '-coverage', '-fprofile-arcs', '-ftest-coverage',
+    '-fcoverage-mapping', '-fprofile-instr-generate',
+    '-fprofile-generate', '-fcs-profile-generate', '-fmemory-profile',
+    '-forder-file-instrumentation', '-ftime-trace',
+    '-ftime-trace-verbose', '-fsave-optimization-record', '-save-stats',
+    '-gen-reproducer', '-fcrash-diagnostics', '-fsyntax-only',
+    '-fno-crash-diagnostics', '-via-file-asm',
 ])
+# Joined output destinations and output-enabling switches.
+SYNTHETIC_OUTPUT_PREFIXES = (
+    '-MF', '-MT', '-MQ', '-MJ', '--output=',
+    '-dependency-file=', '--dependency-file=',
+    '-serialize-diagnostics=', '--serialize-diagnostics=',
+    '-fdiagnostics-serialization-file=', '-foptimization-record-file=',
+    '-fprofile-dir=', '-fprofile-note=', '-fprofile-instrument-path=',
+    '-dumpdir=', '-dumpbase=', '-save-temps=', '--save-temps=',
+    '-fprofile-instr-generate=', '-fprofile-generate=',
+    '-fcs-profile-generate=', '-fmemory-profile=', '-ftime-trace=',
+    '-ftime-trace-granularity=', '-foptimization-record-passes=',
+    '-foptimization-record-format=', '-fsave-optimization-record=',
+    '-gen-reproducer=', '-fcrash-diagnostics=',
+    '-fcrash-diagnostics-dir=', '-save-stats=', '-stats-file=',
+    '-coverage-data-file=', '-coverage-notes-file=',
+    '-split-dwarf-output=', '-object-file-name=',
+    '-dependency-dot=', '-arcmt-migrate-report-output=',
+    '-gen-cdb-fragment-path=', '-dsym-dir=',
+    '-fsanitize-coverage=', '-fno-sanitize-coverage=',
+)
+# These options can make Clang write module/cache artifacts. Silently removing
+# them could change lookup semantics, so header synthesis fails closed instead.
+SYNTHETIC_REJECT_OPTIONS = frozenset([
+    '-fmodules', '-fcxx-modules', '-fimplicit-modules',
+    '-fimplicit-module-maps', '-fmodule-output', '-fmodule-header',
+    '-fmodules-cache-path',
+    '-fmodules-user-build-path', '-module-dependency-dir',
+    '-emit-module', '-emit-module-interface', '-emit-header-unit', '-emit-pch',
+    '-emit-interface-stubs', '-emit-llvm', '-emit-ast', '-emit-merged-ifs',
+    '--emit-static-lib', '--emit-symbol-graph', '-extract-api', '--analyze',
+    '-rewrite-objc', '-rewrite-legacy-objc', '--gpu-bundle-output',
+])
+SYNTHETIC_REJECT_PREFIXES = (
+    '-fmodule-output=', '-fmodule-header=', '-fmodules-cache-path=',
+    '-fmodules-user-build-path=',
+    '-fcas-path=', '-fcas-plugin-path=', '-fthinlto-index=',
+    '-module-dependency-dir=', '--emit-symbol-graph=',
+)
+# Options with a separate operand. Semantic module inputs intentionally remain
+# here and are copied unchanged: -fmodule-file, -fmodule-map-file and
+# -fprebuilt-module-path (including their joined spellings).
 SYNTHETIC_OPTION_OPERANDS = frozenset([
     '-o', '--output', '-MF', '-MT', '-MQ', '-MJ', '-x',
     '-include', '-imacros', '-include-pch', '-isysroot', '--sysroot',
@@ -383,6 +440,18 @@ SYNTHETIC_OPTION_OPERANDS = frozenset([
     '-gcc-toolchain', '-target', '--target', '-B', '-Xclang', '-Xpreprocessor',
     '-Xassembler', '-Xlinker', '-dependency-file', '--dependency-file',
     '-serialize-diagnostics', '--serialize-diagnostics',
+    '-fdiagnostics-serialization-file', '-foptimization-record-file',
+    '-fprofile-dir', '-fprofile-note', '-fprofile-instrument-path',
+    '-dependency-dot', '-arcmt-migrate-report-output',
+    '-gen-cdb-fragment-path', '-dsym-dir', '-coverage-data-file',
+    '-coverage-notes-file', '-split-dwarf-output', '-object-file-name',
+    '-dumpdir', '-dumpbase', '-fmodule-file', '-fmodule-map-file',
+    '-fprebuilt-module-path', '/Fo', '/Fd', '/Fe', '/Fa', '/Fi',
+])
+SYNTHETIC_UNSAFE_XCLANG = frozenset([
+    '-emit-module', '-emit-module-interface', '-emit-header-unit', '-emit-pch',
+    '-emit-interface-stubs', '-emit-llvm', '-dependency-file',
+    '-serialize-diagnostic-file', '-fmodule-output', '-fmodules-cache-path',
 ])
 
 
@@ -430,10 +499,50 @@ def _validate_rooted_header(root, relative_path):
     return header
 
 
+def _metadata_identity(metadata):
+    """Return the replacement-sensitive identity required for a source file."""
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode,
+            stat.S_IFMT(metadata.st_mode))
+
+
 def _source_snapshot(path):
-    with open(path, 'rb') as source:
-        contents = source.read()
-    return contents, 'sha256:' + hashlib.sha256(contents).hexdigest()
+    """Read one stable regular file without following a final symlink."""
+    before_lstat = os.lstat(path)
+    before_stat = os.stat(path)
+    if (stat.S_ISLNK(before_lstat.st_mode) or
+            not stat.S_ISREG(before_lstat.st_mode) or
+            not stat.S_ISREG(before_stat.st_mode)):
+        raise ValueError('snapshot source is not a regular non-symlink file: %s' %
+                         path)
+    flags = os.O_RDONLY
+    if hasattr(os, 'O_CLOEXEC'):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, 'O_NOFOLLOW'):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        contents = b''.join(chunks)
+    finally:
+        os.close(descriptor)
+    after_lstat = os.lstat(path)
+    after_stat = os.stat(path)
+    lstat_identity = _metadata_identity(before_lstat)
+    stat_identity = _metadata_identity(before_stat)
+    if (lstat_identity != _metadata_identity(after_lstat) or
+            stat_identity != _metadata_identity(after_stat) or
+            stat_identity != _metadata_identity(opened) or
+            stat.S_ISLNK(after_lstat.st_mode)):
+        raise ValueError('snapshot source changed while it was read: %s' % path)
+    metadata = (lstat_identity, stat_identity)
+    return (contents, 'sha256:' + hashlib.sha256(contents).hexdigest(),
+            metadata)
 
 
 def _canonical_manifest_bytes(root, headers):
@@ -485,12 +594,12 @@ def select_headers(root, globs=None, manifest=None):
                 raise ValueError('header manifest paths are duplicate or unsorted')
             previous = relative
             path = _validate_rooted_header(root, relative)
-            contents, digest = _source_snapshot(path)
+            contents, digest, metadata = _source_snapshot(path)
             if item['sha256'] != digest[len('sha256:'):]:
                 raise ValueError('header manifest digest mismatch: %s' % relative)
-            selected.append((relative, path, digest, contents))
+            selected.append((relative, path, digest, contents, metadata))
         canonical = _canonical_manifest_bytes(
-            root, [(r, p, d) for r, p, d, _ in selected])
+            root, [(r, p, d) for r, p, d, _, _ in selected])
         if manifest_bytes != canonical:
             raise ValueError('header manifest is not canonical JSON')
     else:
@@ -527,14 +636,13 @@ def select_headers(root, globs=None, manifest=None):
         for path_key, relative in sorted(
                 by_physical.items(), key=lambda item: item[1]):
             path = os.path.join(root, *relative.split('/'))
-            contents, digest = _source_snapshot(path)
-            selected.append((relative, path, digest, contents))
+            contents, digest, metadata = _source_snapshot(path)
+            selected.append((relative, path, digest, contents, metadata))
     if not selected:
         raise ValueError('header selection is empty')
     physical_files = {}
-    for relative, path, _, _ in selected:
-        metadata = os.stat(path)
-        physical_id = (metadata.st_dev, metadata.st_ino)
+    for relative, path, _, _, metadata in selected:
+        physical_id = metadata[1][:2]
         prior = physical_files.get(physical_id)
         if prior is not None and prior != relative:
             raise ValueError(
@@ -558,9 +666,14 @@ def _verify_source_contents(source_contents):
 
 
 def _verify_header_snapshots(headers):
-    for relative, path, expected_digest, expected_contents in headers:
-        contents, digest = _source_snapshot(path)
-        if digest != expected_digest or contents != expected_contents:
+    for relative, path, expected_digest, expected_contents, expected_metadata in headers:
+        try:
+            contents, digest, metadata = _source_snapshot(path)
+        except (OSError, ValueError) as why:
+            raise ValueError('selected header changed during analysis: %s (%s)' %
+                             (relative, why))
+        if (metadata != expected_metadata or digest != expected_digest or
+                contents != expected_contents):
             raise ValueError('selected header changed during analysis: %s' %
                              relative)
 
@@ -627,30 +740,86 @@ def _source_argument_index(arguments, directory, source):
     return candidates[0]
 
 
-def _compile_language(arguments, source, windows_args):
-    if windows_args:
-        lowered = [normcase(argument) for argument in arguments]
-        if '/tc' in lowered:
-            return 'c'
-        if '/tp' in lowered:
-            return 'c++'
-    language = None
-    for index, argument in enumerate(arguments[:-1]):
-        if argument == '-x':
-            language = arguments[index + 1]
-    if language:
-        normalized = language.lower()
-        if normalized in ('c', 'c-header'):
-            return 'c'
-        if normalized in ('c++', 'c++-header', 'objective-c++'):
-            return 'c++'
+def _source_kind_language(source):
+    if source.endswith('.C'):
+        return 'c++'
+    lowered = source.lower()
+    if lowered.endswith(('.c', '.i')):
+        return 'c'
+    if lowered.endswith(('.m', '.mi')):
+        return 'objective-c'
+    if lowered.endswith(('.mm', '.mii')):
+        return 'objective-c++'
+    return 'c++'
+
+
+def _normalized_compile_language(language, source):
+    normalized = language.lower()
+    if normalized == 'none':
+        return _source_kind_language(source)
+    aliases = {
+        'c': 'c', 'c-header': 'c', 'cpp-output': 'c',
+        'c++': 'c++', 'c++-header': 'c++', 'c++-cpp-output': 'c++',
+        'objective-c': 'objective-c',
+        'objective-c-header': 'objective-c',
+        'objective-c-cpp-output': 'objective-c',
+        'objective-c++': 'objective-c++',
+        'objective-c++-header': 'objective-c++',
+        'objective-c++-cpp-output': 'objective-c++',
+    }
+    if normalized not in aliases:
         raise ValueError('unsupported source language for header synthesis: %s' %
                          language)
-    return 'c' if source.lower().endswith('.c') else 'c++'
+    return aliases[normalized]
+
+
+def _compile_language(arguments, source, windows_args):
+    if windows_args:
+        language = None
+        for argument in arguments:
+            lowered = normcase(argument)
+            if lowered == '/tc':
+                language = 'c'
+            elif lowered == '/tp':
+                language = 'c++'
+        return language or _source_kind_language(source)
+
+    language = None
+    index = 1
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == '-x':
+            if index + 1 >= len(arguments):
+                raise ValueError('compile command has an incomplete -x option')
+            language = arguments[index + 1]
+            index += 2
+            continue
+        if argument.startswith('-x') and len(argument) > 2:
+            language = argument[2:]
+        index += 1
+    return (_normalized_compile_language(language, source) if language
+            else _source_kind_language(source))
+
+
+def _is_joined_output_option(argument):
+    if (argument.startswith('-o') and len(argument) > 2 and
+            not argument.startswith(('-objc', '-object', '-openmp'))):
+        return True
+    if re.match(r'(?i)^/(?:Fo|Fd|Fe|Fa|Fi).+', argument):
+        return True
+    return any(argument.startswith(prefix) and
+               (prefix.endswith('=') or argument != prefix)
+               for prefix in SYNTHETIC_OUTPUT_PREFIXES)
+
+
+def _is_rejected_synthetic_option(argument):
+    return (argument in SYNTHETIC_REJECT_OPTIONS or
+            any(argument.startswith(prefix)
+                for prefix in SYNTHETIC_REJECT_PREFIXES))
 
 
 def synthetic_compile_profile(entry):
-    """Return a deterministic source-independent semantic compile profile."""
+    """Return a deterministic, side-effect-free semantic compile profile."""
     arguments, windows_args = _canonical_compile_arguments(entry)
     directory = os.path.realpath(entry['directory'])
     source = os.path.realpath(entry['file'])
@@ -670,19 +839,26 @@ def synthetic_compile_profile(entry):
                 raise ValueError('compile command has an incomplete -x option')
             index += 2
             continue
+        if argument.startswith('-x') and len(argument) > 2:
+            index += 1
+            continue
+        if _is_rejected_synthetic_option(argument):
+            raise ValueError(
+                'compile option may write an unsafe synthetic artifact: %s' %
+                argument)
+        if argument == '-Xclang' and index + 1 < len(arguments):
+            xclang_option = arguments[index + 1].split('=', 1)[0]
+            if xclang_option in SYNTHETIC_UNSAFE_XCLANG:
+                raise ValueError(
+                    'unsafe synthetic -Xclang option: %s' %
+                    arguments[index + 1])
         if argument in SYNTHETIC_OUTPUT_OPTIONS:
             if index + 1 >= len(arguments):
                 raise ValueError('compile command has an incomplete output option')
             index += 2
             continue
-        joined_output = (
-            any(argument.startswith(prefix) and argument != prefix
-                for prefix in ('-MF', '-MT', '-MQ', '-MJ')) or
-            argument.startswith('--output=') or
-            (argument.startswith('-o') and len(argument) > 2 and
-             not argument.startswith(('-objc', '-object', '-openmp'))))
-        if (argument in SYNTHETIC_OUTPUT_FLAGS or joined_output or
-                re.match(r'(?i)^/(?:Fo|Fd|Fe|Fa|Fi).+', argument)):
+        if (argument in SYNTHETIC_OUTPUT_FLAGS or
+                _is_joined_output_option(argument)):
             index += 1
             continue
         if windows_args and normcase(argument) in ('/tc', '/tp'):
@@ -695,11 +871,20 @@ def synthetic_compile_profile(entry):
     replacement = ['/TC' if language == 'c' else '/TP', '{header}'] \
         if windows_args else ['-x', language, '{header}']
     result[insert_at:insert_at] = replacement
+    # Force a non-emitting frontend action and disable automatic crash bundles.
+    # Both options are semantic no-ops for IWYU's source analysis.
+    if not windows_args:
+        result.extend(['-fsyntax-only', '-fno-crash-diagnostics'])
+    profile_identity = OrderedDict([
+        ('directory', directory.replace(os.path.sep, '/')),
+        ('arguments', result),
+    ])
     return {
         'directory': directory,
         'arguments': result,
         'language': language,
-        'key': hashlib.sha256(_json_dumps_canonical(result).encode('utf-8')).hexdigest(),
+        'key': hashlib.sha256(
+            _json_dumps_canonical(profile_identity).encode('utf-8')).hexdigest(),
     }
 
 
@@ -2635,6 +2820,14 @@ def execute_header_analysis(database_plans, real_invocations, headers,
     buffered_stderr = []
     all_errors = []
 
+    # Selection and every phase boundary revalidate both bytes and filesystem
+    # identity before any buffered native output can become public.
+    try:
+        _verify_header_snapshots(headers)
+    except (IOError, ValueError) as why:
+        print('error: %s' % why, file=sys.stderr)
+        return 1
+
     ordered, results = _collect_json_processes(
         real_invocations, verbose, jobs, max_load_average)
     groups, errors, exit_code = _validate_json_processes(
@@ -2644,9 +2837,6 @@ def execute_header_analysis(database_plans, real_invocations, headers,
         for invocation, result in zip(ordered, results))
     all_errors.extend(errors)
     all_pairs.extend(zip(ordered, groups))
-    if errors or exit_code:
-        _emit_buffered_json_stderr(buffered_stderr, all_errors)
-        return max(exit_code, 1)
 
     try:
         _verify_header_snapshots(headers)
@@ -2655,20 +2845,56 @@ def execute_header_analysis(database_plans, real_invocations, headers,
         _emit_buffered_json_stderr(buffered_stderr, all_errors)
         print('error: %s' % why, file=sys.stderr)
         return 1
+    if errors or exit_code:
+        _emit_buffered_json_stderr(buffered_stderr, all_errors)
+        return max(exit_code, 1)
 
+    selected_identities = {
+        normcase(path.replace(os.path.sep, '/')): relative
+        for relative, path, _, _, _ in headers
+    }
     covered = set()
     for invocation, lines in all_pairs:
         for line in lines:
             record = _parse_json_object(line)
             identity = record.get('source_identity')
-            if identity:
-                covered.add((invocation.configuration, normcase(identity)))
+            selected_relative = selected_identities.get(normcase(identity or ''))
+            if selected_relative is None:
+                continue
+            status = record.get('status')
+            if status not in ('correct', 'changes'):
+                all_errors.append((
+                    invocation,
+                    'selected header %s has non-terminal real status %r' %
+                    (selected_relative, status)))
+                continue
+            covered.add((invocation.configuration, normcase(identity)))
+    if all_errors:
+        _emit_buffered_json_stderr(buffered_stderr, all_errors)
+        return 1
+
+    # Count the complete product before constructing entries, Invocations, or
+    # expected-record maps. This keeps a low cap memory-safe for huge products.
+    prospective_count = 0
+    for plan in database_plans:
+        configuration = plan['configuration']
+        uncovered_count = sum(
+            1 for _, path, _, _, _ in headers
+            if (configuration, normcase(path.replace(os.path.sep, '/')))
+            not in covered)
+        prospective_count += uncovered_count * len(plan['profiles'])
+        if prospective_count > max_synthetic_invocations:
+            _emit_buffered_json_stderr(buffered_stderr, all_errors)
+            print('error: synthetic header invocation count %d exceeds cap %d' %
+                  (prospective_count, max_synthetic_invocations),
+                  file=sys.stderr)
+            return 1
 
     synthetic = []
     expected = {}
     for plan in database_plans:
         configuration = plan['configuration']
-        for header_index, (relative, path, digest, _) in enumerate(headers):
+        for header_index, (relative, path, digest, _, _) in enumerate(headers):
             if (configuration, normcase(path.replace(os.path.sep, '/'))) in covered:
                 continue
             for profile_index, profile in enumerate(plan['profiles']):
@@ -2677,7 +2903,6 @@ def execute_header_analysis(database_plans, real_invocations, headers,
                                profile_index)
                 database_index = plan['base'] + local_index
                 entry = instantiate_synthetic_entry(profile, path)
-                entry = _entry_with_driver_arguments(entry, extra_args)
                 invocation = Invocation.from_compile_command(
                     entry, [], database_index, JSON_FORMAT,
                     configuration=configuration,
@@ -2687,11 +2912,6 @@ def execute_header_analysis(database_plans, real_invocations, headers,
                 synthetic.append(invocation)
                 expected[database_index] = (path.replace(os.path.sep, '/'),
                                             digest, relative, profile_index)
-    if len(synthetic) > max_synthetic_invocations:
-        _emit_buffered_json_stderr(buffered_stderr, all_errors)
-        print('error: synthetic header invocation count %d exceeds cap %d' %
-              (len(synthetic), max_synthetic_invocations), file=sys.stderr)
-        return 1
 
     if synthetic:
         ordered2, results2 = _collect_json_processes(
@@ -2753,8 +2973,11 @@ def execute_header_analysis(database_plans, real_invocations, headers,
     try:
         final_groups = _aggregate_declaration_conflicts(
             final_groups, final_invocations, source_contents)
-    except ProtocolError as why:
-        print('error: IWYU JSON aggregation: %s' % why, file=sys.stderr)
+        _verify_header_snapshots(headers)
+        _verify_source_contents(source_contents)
+    except (IOError, ValueError, ProtocolError) as why:
+        print('error: IWYU JSON aggregation/final verification: %s' % why,
+              file=sys.stderr)
         return 1
     for lines in final_groups:
         for line in lines:
@@ -2889,7 +3112,9 @@ def main(compilation_db_path, source_files, verbose, formatter, jobs,
             if header_feature:
                 profile_keys = set()
                 for entry in selected:
-                    profile = synthetic_compile_profile(entry)
+                    profile_entry = _entry_with_driver_arguments(
+                        entry, extra_args)
+                    profile = synthetic_compile_profile(profile_entry)
                     if profile['key'] not in profile_keys:
                         profile_keys.add(profile['key'])
                         profiles.append(profile)
@@ -2900,13 +3125,19 @@ def main(compilation_db_path, source_files, verbose, formatter, jobs,
 
             bound_driver_args = list(extra_args)
             if header_feature:
-                for _, path, _, _ in headers:
+                for _, path, _, _, _ in headers:
                     bound_driver_args.extend(_exact_check_also(path))
 
             for entry in selected:
                 local_index = original_indices[id(entry)]
-                analysis_entry = (_entry_with_driver_arguments(
-                    entry, bound_driver_args) if header_feature else entry)
+                if header_feature:
+                    bound_entry = _entry_with_driver_arguments(
+                        entry, bound_driver_args)
+                    safe_profile = synthetic_compile_profile(bound_entry)
+                    analysis_entry = instantiate_synthetic_entry(
+                        safe_profile, os.path.realpath(entry['file']))
+                else:
+                    analysis_entry = entry
                 invocations.append(Invocation.from_compile_command(
                     analysis_entry, [] if header_feature else extra_args,
                     invocation_base + local_index,

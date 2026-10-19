@@ -38,23 +38,39 @@ The manifest must be UTF-8 canonical compact JSON with exactly one final LF,
 keys in the shown order, entries sorted by `path`, no duplicate keys or paths,
 and lowercase SHA-256 values matching current file bytes. The manifest itself
 must be an absolute, normalized, non-symlink regular file. The driver snapshots
-every selected header and verifies bytes before and after synthetic analysis.
+every selected header's bytes plus lstat/stat device, inode, mode, and file type.
+It verifies that snapshot at selection, at each analysis phase boundary, and
+immediately before publishing stdout. Same-byte replacement, chmod, type change,
+and symlink substitution fail the transaction.
 
 ## Execution contract
 
 Phase 1 runs every selected real compilation-database entry. It adds an exact
 `--check_also` selector for every selected header, validates and buffers the
 complete schema-2 stream, and retains every real context. Real contexts are
-never deduplicated.
+never deduplicated. A selected-header record provides coverage only with status
+`correct` or `changes`; a real selected-header `skipped` or `error` record fails
+the transaction instead of suppressing synthesis.
 
-For each header not observed by physical `source_identity` in a configuration,
-phase 2 runs the header directly under every distinct semantic compile profile
-from that configuration's selected real entries. Profiles retain compiler
-macros, include paths and their order, target/language options, and other
-semantic flags. They expand response files, replace exactly one physical source
-input, strip write/dependency output options, and explicitly select C or C++.
-The header itself is the main file; no wrapper or temporary source is created.
-Only identical synthetic profiles are deduplicated.
+For each header without terminal coverage by physical `source_identity` in a
+configuration, phase 2 runs the header directly under every distinct semantic
+compile profile from that configuration's selected real entries. Profiles retain
+compiler macros, include paths and their order, target options, forced inputs,
+and semantic module inputs. The profile key binds both the canonical working
+directory and the exact rewritten argv, so relative paths from different working
+directories cannot be merged. Response files are expanded and exactly one
+physical source input is replaced. Separate and joined `-x` selectors are
+removed; the last effective selector, or the source suffix after `-xnone`, yields
+exactly one C, C++, Objective-C, or Objective-C++ selector.
+
+Both real and synthetic header-analysis commands remove dependency, object,
+save-temps, serialized-diagnostic, coverage/profile, time-trace, optimization,
+statistics, and crash-reproducer outputs. They use a syntax-only action with
+crash diagnostics disabled. Module/cache output modes and other uncertain output
+actions fail closed, while semantic module inputs remain unchanged. The header
+itself is the synthetic main file; no wrapper or temporary source is created.
+Only profiles with the same working directory and rewritten argv are
+deduplicated.
 
 `--max-synthetic-header-invocations` is a positive safety cap and defaults to
 1000. The driver reserves deterministic per-database index blocks before phase
