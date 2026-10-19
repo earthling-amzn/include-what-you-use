@@ -836,21 +836,21 @@ void IwyuFileInfo::ReportSemanticDefinitionProvider(
     return;
   semantic_definition_provider_lines_.insert(line);
   auto& facts = semantic_definition_provider_facts_[line];
-  const auto duplicate = std::find_if(
-      facts.begin(), facts.end(), [&](const auto& fact) {
-        return fact.function->getCanonicalDecl() ==
-                   function->getCanonicalDecl() &&
-               fact.include_location == include_location &&
-               fact.use_location == use_location &&
-               fact.definition_location == definition_location &&
-               fact.selected_spelling == selected_spelling &&
-               fact.selected_path == selected_path && fact.chain == chain;
-      });
-  if (duplicate == facts.end()) {
-    facts.push_back({function, include_location, use_location,
-                     definition_location, selected_spelling, selected_path,
-                     chain});
+  const FunctionDecl* canonical = function->getCanonicalDecl();
+  auto [position, inserted] = facts.emplace(
+      canonical, SemanticDefinitionProviderFact{});
+  SemanticDefinitionProviderFact& fact = position->second;
+  if (inserted) {
+    fact.function = canonical;
+    fact.include_location = include_location;
+    fact.selected_spelling = selected_spelling;
+    fact.selected_path = selected_path;
+    fact.chain = chain;
   }
+  fact.uses.emplace(
+      std::make_pair(use_location.getRawEncoding(),
+                     definition_location.getRawEncoding()),
+      SemanticDefinitionProviderUseFact{use_location, definition_location});
 }
 
 void IwyuFileInfo::ReportForwardDeclareUse(SourceLocation use_loc,
@@ -2795,7 +2795,8 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       if (found != semantic_definition_provider_facts_.end() &&
           !found->second.empty()) {
         StructuredLocationValue range_location;
-        if (StructuredLocation(found->second.front().include_location, false,
+        if (StructuredLocation(found->second.begin()->second.include_location,
+                               false,
                                &range_location)) {
           range_column = range_location.column;
         }
@@ -2823,52 +2824,94 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
 
   const auto operation_symbols = [&](const OperationRef& operation) {
     if (operation.reason_code == "semantic_definition_provider") {
-      llvm::json::Array symbols;
+      struct SemanticFact {
+        const SemanticDefinitionProviderFact* fact;
+        string name;
+        string qualified_name;
+        StructuredLocationValue use_location;
+        StructuredLocationValue declaration;
+        IwyuPreprocessorInfo::ActiveCondition condition;
+      };
+      vector<SemanticFact> facts;
       const auto found = semantic_definition_provider_facts_.find(
           operation.line->start_linenum());
       if (found == semantic_definition_provider_facts_.end())
-        return symbols;
-      vector<const SemanticDefinitionProviderFact*> facts;
-      for (const auto& fact : found->second)
-        facts.push_back(&fact);
-      std::sort(facts.begin(), facts.end(), [](const auto* lhs,
-                                               const auto* rhs) {
+        return llvm::json::Array{};
+      for (const auto& entry : found->second) {
+        const SemanticDefinitionProviderFact& fact = entry.second;
+        for (const auto& use_entry : fact.uses) {
+          const SemanticDefinitionProviderUseFact& use = use_entry.second;
+          StructuredLocationValue use_location;
+          StructuredLocationValue declaration;
+          if (!StructuredLocation(use.use_location, true, &use_location) ||
+              !StructuredLocation(use.definition_location, false,
+                                  &declaration) ||
+              use_location.path != file_path()) {
+            continue;
+          }
+          facts.push_back({
+              &fact, fact.function->getNameAsString(),
+              fact.function->getQualifiedNameAsString(), use_location,
+              declaration,
+              preprocessor_info_->ActiveConditionAt(use.use_location)});
+        }
+      }
+      const auto use_key = [](const SemanticFact& fact) {
         return std::make_tuple(
-                   lhs->function->getQualifiedNameAsString(),
-                   lhs->use_location.getRawEncoding(),
-                   lhs->definition_location.getRawEncoding()) <
-               std::make_tuple(
-                   rhs->function->getQualifiedNameAsString(),
-                   rhs->use_location.getRawEncoding(),
-                   rhs->definition_location.getRawEncoding());
-      });
-      for (const auto* fact : facts) {
-        StructuredLocationValue use_location;
-        StructuredLocationValue declaration;
-        if (!StructuredLocation(fact->use_location, true, &use_location) ||
-            !StructuredLocation(fact->definition_location, false,
-                                &declaration)) {
-          continue;
+            fact.use_location.path, fact.use_location.line,
+            fact.use_location.column, static_cast<int>(fact.condition.status),
+            fact.condition.expression,
+            fact.condition.directive_location.getRawEncoding(),
+            fact.condition.active_branch, fact.condition.source_region_id,
+            fact.condition.source_region_path);
+      };
+      const auto fact_key = [&](const SemanticFact& fact) {
+        return std::make_tuple(
+            fact.qualified_name, fact.name, fact.declaration.path,
+            fact.declaration.line, fact.declaration.column, use_key(fact));
+      };
+      std::sort(facts.begin(), facts.end(),
+                [&](const SemanticFact& lhs, const SemanticFact& rhs) {
+                  return fact_key(lhs) < fact_key(rhs);
+                });
+
+      llvm::json::Array symbols;
+      size_t begin = 0;
+      while (begin < facts.size()) {
+        size_t end = begin + 1;
+        while (end < facts.size() &&
+               facts[end].qualified_name == facts[begin].qualified_name &&
+               facts[end].name == facts[begin].name) {
+          ++end;
         }
         llvm::json::Array uses;
-        uses.push_back(llvm::json::Object{
-            {"location", LocationObject(use_location)},
-            {"requirement", "full"},
-            {"origin", "ast"},
-            {"condition", ConditionObject(
-                preprocessor_info_->ActiveConditionAt(fact->use_location))},
-            {"macro", UnavailableValue()}});
+        bool have_previous = false;
+        decltype(use_key(facts[begin])) previous;
+        for (size_t index = begin; index < end; ++index) {
+          const auto key = use_key(facts[index]);
+          if (have_previous && key == previous)
+            continue;
+          have_previous = true;
+          previous = key;
+          uses.push_back(llvm::json::Object{
+              {"location", LocationObject(facts[index].use_location)},
+              {"requirement", "full"},
+              {"origin", "ast"},
+              {"condition", ConditionObject(facts[index].condition)},
+              {"macro", UnavailableValue()}});
+        }
+        const SemanticFact& first = facts[begin];
         llvm::json::Object symbol{
-            {"name", fact->function->getNameAsString()},
-            {"qualified_name", KnownString(
-                fact->function->getQualifiedNameAsString())},
+            {"name", first.name},
+            {"qualified_name", KnownString(first.qualified_name)},
             {"declaration", llvm::json::Object{
                 {"status", "known"},
-                {"value", LocationObject(declaration)}}},
+                {"value", LocationObject(first.declaration)}}},
             {"uses", std::move(uses)}};
         if (GlobalFlags().output_schema_version >= 2)
           symbol["declaration_kind"] = UnavailableValue();
         symbols.push_back(std::move(symbol));
+        begin = end;
       }
       return symbols;
     }
@@ -3116,26 +3159,19 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
         provider["chain"] = UnavailableValue();
         return provider;
       }
-      const SemanticDefinitionProviderFact* selected_fact =
-          &found->second.front();
-      for (const SemanticDefinitionProviderFact& candidate : found->second) {
-        if (candidate.chain.size() > selected_fact->chain.size() ||
-            (candidate.chain.size() == selected_fact->chain.size() &&
-             candidate.chain < selected_fact->chain)) {
-          selected_fact = &candidate;
-        }
-      }
-      const SemanticDefinitionProviderFact& fact = *selected_fact;
+      const string selected_spelling = operation.line->quoted_include();
+      const string selected_path = NormalizeFilePath(
+          GetFilePath(operation.line->included_file()));
       llvm::json::Object selected{
-          {"spelling", fact.selected_spelling},
-          {"path", fact.selected_path}};
+          {"spelling", selected_spelling},
+          {"path", selected_path}};
       llvm::json::Array candidates;
       candidates.push_back(llvm::json::Object{
-          {"spelling", fact.selected_spelling},
-          {"path", fact.selected_path}});
+          {"spelling", selected_spelling},
+          {"path", selected_path}});
       llvm::json::Array chain;
-      for (const string& path : fact.chain)
-        chain.push_back(path);
+      chain.push_back(file_path());
+      chain.push_back(selected_path);
       provider["selected"] = llvm::json::Object{
           {"status", "known"}, {"value", std::move(selected)}};
       provider["candidates"] = llvm::json::Object{
@@ -3386,8 +3422,8 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       StructuredLocationValue start;
       if (found != semantic_definition_provider_facts_.end() &&
           !found->second.empty() &&
-          StructuredLocation(found->second.front().include_location, false,
-                             &start)) {
+          StructuredLocation(found->second.begin()->second.include_location,
+                             false, &start)) {
         StructuredLocationValue end = start;
         end.column += operation.line->quoted_include().size();
         value["source_range"] = llvm::json::Object{
@@ -3744,8 +3780,9 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
       const auto facts = semantic_definition_provider_facts_.find(
           line.start_linenum());
       if (facts != semantic_definition_provider_facts_.end()) {
-        for (const SemanticDefinitionProviderFact& fact : facts->second)
-          line.AddSymbolUse(fact.function->getQualifiedNameAsString());
+        for (const auto& fact : facts->second)
+          line.AddSymbolUse(
+              fact.second.function->getQualifiedNameAsString());
       }
       line.SetStructuredDecision(
           "keep", "keep", "semantic_definition_provider",

@@ -3005,6 +3005,25 @@ IwyuPreprocessorInfo::DefinitionProviderCoverageAt(
     const FileEntry* includer, const string& selected_spelling,
     const string& selected_path, SourceLocation definition_loc,
     SourceLocation use_loc, bool allow_later_root) const {
+  const auto key = std::make_tuple(
+      includer, selected_spelling, selected_path,
+      definition_loc.getRawEncoding(), use_loc.getRawEncoding(),
+      allow_later_root);
+  const auto found = definition_provider_coverage_cache_.find(key);
+  if (found != definition_provider_coverage_cache_.end())
+    return found->second;
+  DefinitionProviderCoverage result = ComputeDefinitionProviderCoverageAt(
+      includer, selected_spelling, selected_path, definition_loc, use_loc,
+      allow_later_root);
+  definition_provider_coverage_cache_.emplace(key, result);
+  return result;
+}
+
+IwyuPreprocessorInfo::DefinitionProviderCoverage
+IwyuPreprocessorInfo::ComputeDefinitionProviderCoverageAt(
+    const FileEntry* includer, const string& selected_spelling,
+    const string& selected_path, SourceLocation definition_loc,
+    SourceLocation use_loc, bool allow_later_root) const {
   DefinitionProviderCoverage result;
   if (!includer || selected_spelling.empty() || definition_loc.isInvalid() ||
       use_loc.isInvalid()) {
@@ -3158,6 +3177,27 @@ IwyuPreprocessorInfo::DefinitionProviderCoverageAt(
 
 IwyuPreprocessorInfo::DefinitionProviderCoverage
 IwyuPreprocessorInfo::AssociatedDefinitionProviderCoverageAt(
+    const FileEntry* includer, const FileEntry* associated_header,
+    const string& selected_spelling, const string& selected_path,
+    SourceLocation definition_loc, SourceLocation use_loc,
+    bool allow_later_root) const {
+  const auto key = std::make_tuple(
+      includer, associated_header, selected_spelling, selected_path,
+      definition_loc.getRawEncoding(), use_loc.getRawEncoding(),
+      allow_later_root);
+  const auto found = associated_definition_provider_coverage_cache_.find(key);
+  if (found != associated_definition_provider_coverage_cache_.end())
+    return found->second;
+  DefinitionProviderCoverage result =
+      ComputeAssociatedDefinitionProviderCoverageAt(
+          includer, associated_header, selected_spelling, selected_path,
+          definition_loc, use_loc, allow_later_root);
+  associated_definition_provider_coverage_cache_.emplace(key, result);
+  return result;
+}
+
+IwyuPreprocessorInfo::DefinitionProviderCoverage
+IwyuPreprocessorInfo::ComputeAssociatedDefinitionProviderCoverageAt(
     const FileEntry* includer, const FileEntry* associated_header,
     const string& selected_spelling, const string& selected_path,
     SourceLocation definition_loc, SourceLocation use_loc,

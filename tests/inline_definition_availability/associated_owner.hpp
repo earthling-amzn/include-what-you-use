@@ -1,4 +1,4 @@
 #ifndef TESTS_INLINE_DEFINITION_AVAILABILITY_ASSOCIATED_OWNER_HPP_
 #define TESTS_INLINE_DEFINITION_AVAILABILITY_ASSOCIATED_OWNER_HPP_
-#include "template_bodies.hpp"
+#include "template_bodies.hpp"  // IWYU pragma: export
 #endif

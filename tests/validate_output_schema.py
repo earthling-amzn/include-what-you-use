@@ -22,7 +22,9 @@ KIND_RANK = {"include": 0, "forward_declaration": 1}
 ORIGIN_RANK = {"ast": 0, "macro": 1, "heuristic": 2, "unknown": 3}
 REQUIREMENT_RANK = {"full": 0, "forward_declaration": 1, "none": 2, "unknown": 3}
 RANGE_STATUS_RANK = {"known": 0, "unknown": 1, "unavailable": 2, "not_applicable": 3}
-INCLUDE_RE = re.compile(r'^#include\s+(?P<token><[^>]+>|"[^"]+")$')
+INCLUDE_RE = re.compile(
+    r'^\s*#\s*include\s+(?P<token><[^>]+>|"[^"]+")'
+    r'(?:\s*(?://.*|/\*.*\*/\s*))?$')
 PROVIDER_SPELLING_RE = re.compile(r'^(?:<[^>]+>|"[^"]+")$')
 
 

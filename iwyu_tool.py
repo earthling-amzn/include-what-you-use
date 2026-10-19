@@ -1702,8 +1702,10 @@ def _validate_declaration_facts(record, source_bytes, native_conflicts=True,
                 raise ProtocolError('%s selected provider is absent from candidates' %
                                     operation['id'])
         if selected['status'] == 'known' and operation['item_kind'] == 'include':
-            include = re.match(r'^#include\s+(<[^>]+>|"[^"]+")$',
-                               operation['spelling'])
+            include = re.match(
+                r'^\s*#\s*include\s+(<[^>]+>|"[^"]+")'
+                r'(?:\s*(?://.*|/\*.*\*/\s*))?$',
+                operation['spelling'])
             if (not include or
                     include.group(1) != selected['value']['spelling']):
                 raise ProtocolError('%s selected provider contradicts include' %

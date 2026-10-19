@@ -2,6 +2,7 @@
 """Opaque generic SEM-004 definition-availability contracts."""
 
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CORPUS = ROOT / "tests" / "inline_definition_availability"
 IWYU = Path(sys.argv[1]).resolve()
 CXX = Path(sys.argv[2]).resolve()
+DRIVER = ROOT / "iwyu_tool.py"
 
 
 def run(command, cwd=CORPUS, stdin=None, expect=0):
@@ -44,6 +46,35 @@ def definition_diagnostics(record):
                                 "definition_provider_unproven"}]
 
 
+def analyze_with_driver(entries, corpus=CORPUS):
+    """Run real schema-v2 driver records for (filename, IWYU options)."""
+    with tempfile.TemporaryDirectory(prefix="sem004-driver-",
+                                     dir=ROOT / "build") as temporary:
+        database = Path(temporary)
+        commands = []
+        for filename, options in entries:
+            source = (corpus / filename).resolve()
+            commands.append({
+                "directory": str(corpus.resolve()),
+                "file": str(source),
+                "arguments": [str(CXX), "-I", ".", "-std=c++17",
+                              *options, "-c", str(source)],
+            })
+        (database / "compile_commands.json").write_text(json.dumps(commands))
+        environment = os.environ.copy()
+        environment["IWYU_BINARY"] = str(IWYU)
+        result = subprocess.run(
+            [sys.executable, str(DRIVER), "-o", "json",
+             "--output-schema", "2", "-j", "2", "-p", str(database)],
+            cwd=ROOT, env=environment, text=True, capture_output=True)
+        assert result.returncode == 0, result.stderr
+        assert result.stderr == "", result.stderr
+        records = [json.loads(line) for line in result.stdout.splitlines()]
+        assert records
+        assert all(record["schema_version"] == 2 for record in records)
+        return records
+
+
 def semantic_keeps(record):
     return [op for op in record["operations"]
             if op["reason_code"] == "semantic_definition_provider"]
@@ -53,15 +84,26 @@ def assert_provider_keep(operation, spelling, chain):
     assert (operation["subject_action"], operation["disposition"],
             operation["spelling"]) == ("keep", "keep", spelling)
     assert operation["source_range"]["status"] == "known"
-    assert operation["provider"]["selected"]["status"] == "known"
+    selected = operation["provider"]["selected"]
+    assert selected["status"] == "known"
+    include_token = spelling.split()[1]
+    assert selected["value"]["spelling"] == include_token
     assert operation["provider"]["chain"] == {
         "status": "known", "value": chain}
+    assert chain[0] == operation["source_range"]["value"]["start"]["path"]
+    assert chain[-1] == selected["value"]["path"]
     assert operation["symbols"]
+    identities = [(symbol["name"], symbol["qualified_name"]["value"])
+                  for symbol in operation["symbols"]]
+    assert len(identities) == len(set(identities)), identities
     for symbol in operation["symbols"]:
         assert symbol["qualified_name"]["status"] == "known"
         assert symbol["declaration"]["status"] == "known"
-        assert symbol["uses"][0]["origin"] == "ast"
-        assert symbol["uses"][0]["requirement"] == "full"
+        assert symbol["uses"]
+        assert all(use["origin"] == "ast" and
+                   use["requirement"] == "full" and
+                   use["location"]["path"] == chain[0]
+                   for use in symbol["uses"]), symbol
 
 
 def assert_analyzer_contracts():
@@ -110,9 +152,17 @@ def assert_analyzer_contracts():
     keep = semantic_keeps(template_available)
     assert len(keep) == 1
     assert_provider_keep(keep[0], '#include "template_bodies.hpp"', [
-        "template_available.cc", "template_bodies.hpp", "templates.hpp"])
+        "template_available.cc", "template_bodies.hpp"])
     qualified = {symbol["qualified_name"]["value"]
                  for symbol in keep[0]["symbols"]}
+
+    duplicate_calls, _ = analyze("duplicate_calls.cc")
+    duplicate_keep = semantic_keeps(duplicate_calls)
+    assert len(duplicate_keep) == 1
+    assert_provider_keep(duplicate_keep[0], '#include "template_bodies.hpp"',
+                         ["duplicate_calls.cc", "template_bodies.hpp"])
+    assert len(duplicate_keep[0]["symbols"]) == 1
+    assert len(duplicate_keep[0]["symbols"][0]["uses"]) == 2
     assert {"TemplateFunction", "TemplateBox<int>::Member",
             "TemplateBox<int>::AddressMember",
             "TemplateBox<int>::MemberTemplate"} <= qualified
@@ -191,23 +241,20 @@ def assert_analyzer_contracts():
     assert definition_diagnostics(exported) == []
     assert_provider_keep(semantic_keeps(exported)[0],
                          '#include "export_carrier.hpp"', [
-                             "export_consumer.cc", "export_carrier.hpp",
-                             "template_bodies.hpp"])
+                             "export_consumer.cc", "export_carrier.hpp"])
 
     mapped, _ = analyze("mapped_consumer.cc", "-Xiwyu",
                         "--mapping_file=providers.imp")
     assert definition_diagnostics(mapped) == []
     assert_provider_keep(semantic_keeps(mapped)[0],
                          '#include "mapped_carrier.hpp"', [
-                             "mapped_consumer.cc", "mapped_carrier.hpp",
-                             "template_bodies.hpp"])
+                             "mapped_consumer.cc", "mapped_carrier.hpp"])
 
     repeated_zero, _ = analyze("repeated_provider.cc", "-DFEATURE=0")
     assert definition_diagnostics(repeated_zero) == []
     assert_provider_keep(semantic_keeps(repeated_zero)[0],
                          '#include "repeat_second.hpp"', [
-                             "repeated_provider.cc", "repeat_second.hpp",
-                             "template_bodies.hpp"])
+                             "repeated_provider.cc", "repeat_second.hpp"])
     repeated_one, _ = analyze("repeated_provider.cc", "-DFEATURE=1")
     assert [fact["code"] for fact in definition_diagnostics(repeated_one)] == [
         "definition_provider_unproven"]
@@ -217,15 +264,18 @@ def assert_analyzer_contracts():
     assert definition_diagnostics(associated) == []
     assert_provider_keep(semantic_keeps(associated)[0],
                          '#include "associated_owner.hpp"  // IWYU pragma: associated', [
-                             "associated_consumer.cc", "associated_owner.hpp",
-                             "template_bodies.hpp"])
+                             "associated_consumer.cc", "associated_owner.hpp"])
     assert [(op["subject_action"], op["disposition"], op["reason_code"])
             for op in associated["operations"]
             if op["spelling"] == '#include "template_bodies.hpp"'] == [
         ("add", "suppress", "provided_by_associated_header")]
     owner = next(record for record in associated_records
                  if record["file"]["path"] == "associated_owner.hpp")
-    assert semantic_keeps(owner)
+    assert semantic_keeps(owner) == []
+    assert all(use["location"]["path"] == owner["file"]["path"]
+               for operation in owner["operations"]
+               for symbol in operation["symbols"]
+               for use in symbol["uses"])
 
     # Both published schemas carry the same generic provider semantics.
     schema_two, _ = analyze("template_available.cc", schema=2)
@@ -245,11 +295,75 @@ def assert_link_fails(object_file, executable, symbols, cwd=CORPUS):
         assert symbol in output, output
 
 
+def assert_driver_contracts():
+    entries = [
+        ("available.cc", []),
+        ("duplicate_calls.cc", []),
+        ("duplicate_calls.cc", []),
+        ("export_consumer.cc", []),
+        ("mapped_consumer.cc",
+         ["-Xiwyu", "--mapping_file=providers.imp"]),
+        ("associated_consumer.cc", []),
+    ]
+    records = analyze_with_driver(entries)
+
+    source_records = {}
+    for record in records:
+        for operation in record["operations"]:
+            for symbol in operation["symbols"]:
+                assert all(use["location"]["path"] == record["file"]["path"]
+                           for use in symbol["uses"]), (record, operation)
+        index = record["invocation"]["index"]
+        if record["file"]["path"] == record["invocation"]["translation_unit"]:
+            source_records[index] = record
+    assert set(source_records) == set(range(len(entries)))
+
+    expected = {
+        0: ("available.cc", '#include "api.inline.hpp"'),
+        3: ("export_consumer.cc", '#include "export_carrier.hpp"'),
+        4: ("mapped_consumer.cc", '#include "mapped_carrier.hpp"'),
+        5: ("associated_consumer.cc",
+            '#include "associated_owner.hpp"  // IWYU pragma: associated'),
+    }
+    for index, (filename, spelling) in expected.items():
+        keep = semantic_keeps(source_records[index])
+        assert len(keep) == 1, (filename, keep)
+        selected_path = keep[0]["provider"]["selected"]["value"]["path"]
+        assert_provider_keep(
+            keep[0], spelling,
+            [source_records[index]["file"]["path"], selected_path])
+
+    # Two source calls become two sorted use facts on one symbol object, and
+    # duplicate compilation commands remain distinct driver invocations.
+    duplicate_ids = []
+    for index in (1, 2):
+        record = source_records[index]
+        duplicate_ids.append(record["invocation"]["id"])
+        keep = semantic_keeps(record)
+        assert len(keep) == 1
+        symbols = keep[0]["symbols"]
+        assert len(symbols) == 1, symbols
+        assert symbols[0]["qualified_name"]["value"] == "TemplateFunction"
+        assert len(symbols[0]["uses"]) == 2, symbols[0]
+        assert symbols[0]["uses"] == sorted(
+            symbols[0]["uses"],
+            key=lambda use: (use["location"]["path"],
+                             use["location"]["line"],
+                             use["location"]["column"]))
+    assert len(set(duplicate_ids)) == 2
+
+    owner = next(record for record in records
+                 if record["invocation"]["index"] == 5 and
+                 record["file"]["path"].endswith("associated_owner.hpp"))
+    assert semantic_keeps(owner) == []
+
+
 def assert_gcc_backstop(corpus=CORPUS):
     with tempfile.TemporaryDirectory(prefix="sem004-gcc-", dir=ROOT / "build") as tmp:
         out = Path(tmp)
         for source in ("available.cc", "contexts.cc", "pure_virtual_pointer.cc",
-                       "template_available.cc", "template_contexts.cc",
+                       "template_available.cc", "duplicate_calls.cc",
+                       "template_contexts.cc",
                        "direct_after.cc", "export_consumer.cc",
                        "mapped_consumer.cc", "associated_consumer.cc"):
             executable = out / source.removesuffix(".cc")
@@ -326,7 +440,7 @@ def assert_fixer_idempotence():
         cases = {
             "available.cc": [], "contexts.cc": [], "control.cc": [],
             "pure_virtual_pointer.cc": [], "template_available.cc": [],
-            "template_contexts.cc": [],
+            "duplicate_calls.cc": [], "template_contexts.cc": [],
             "export_consumer.cc": [], "mapped_consumer.cc": [
                 "-Xiwyu", "--mapping_file=providers.imp"],
             "conditional_dominating.cc": ["-DFEATURE=1"],
@@ -349,6 +463,7 @@ def assert_fixer_idempotence():
 
 if __name__ == "__main__":
     assert_analyzer_contracts()
+    assert_driver_contracts()
     assert_gcc_backstop()
     assert_fixer_idempotence()
     print("generic SEM-004 definition-availability contracts passed")

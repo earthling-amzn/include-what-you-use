@@ -61,13 +61,32 @@ locations, and chains assembled from a physical `FileEntry` union fail closed.
 Ordinary inline bodies may be introduced later in the same definition domain;
 an earlier declaration provider is retained separately when needed.
 
-Every covering edge is pinned by its includer `FileID`, directive location,
-includee `FileID`, spelling, and path. Output exposes a
-`semantic_definition_provider` keep operation with AST symbol uses, the selected
-spelling/path, concrete physical chain, use condition, and occurrence range.
-This pin is re-applied after ordinary duplicate pruning, so an equal spelling
-cannot substitute for the entered occurrence. No include is synthesized from an
-absent or unproved body.
+Every covering root is pinned by its includer `FileID`, directive location,
+includee `FileID`, logical include token, and resolved path. Output exposes a
+`semantic_definition_provider` keep operation only for the consumer's exact
+direct root occurrence. Its provider chain begins at that operation's analyzed
+file and ends at the selected direct include path. The internal proof may
+continue through export or mapping intermediates to the ultimate definition,
+but those deeper paths are not published as the selected operation's chain.
+The operation spelling and range retain exact physical source text, including a
+pragma comment; the selected provider spelling is always the logical quoted or
+angled token. Intermediate records never inherit consumer use locations. They
+retain their own includes only through source-local semantic obligations or
+existing export/keep analysis. This pin is re-applied after ordinary duplicate
+pruning, so an equal spelling cannot substitute for the entered occurrence. No
+include is synthesized from an absent or unproved body.
+
+Repeated observations are stored by include operation and canonical function.
+Structured output emits one symbol object per qualified identity with sorted,
+deduplicated use facts. Exact provider-proof queries are memoized by their full
+input key. On the review fixture `/tmp/sem004-adversarial/perf` (1,000 unrelated
+headers and 5,000 calls), baseline `411eec0` used 1.89 s, 421,540 KiB RSS, and
+3,007,009 output bytes; its schema-v2 driver rejected 5,000 duplicate symbol
+objects. After grouping, three analyzer runs used 1.93/1.76/1.57 s and
+257,880/257,980/258,064 KiB RSS, emitted 1,732,264 bytes as one symbol with 5,000
+uses, and the real driver accepted the record in 2.75 s at 258,024 KiB RSS. The
+non-inline control remained 620,944 bytes (baseline 1.01 s/120,056 KiB; after
+1.08/1.09/1.11 s and 119,580/119,632/119,728 KiB).
 
 An absent ordinary-inline body emits `missing_inline_definition`; an absent
 template pattern emits `missing_template_definition`; and a visible definition

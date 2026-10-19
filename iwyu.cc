@@ -2546,23 +2546,23 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
       SourceLocation definition_loc) {
     if (coverage.chain.empty())
       return;
-    for (size_t index = 0; index < coverage.chain.size(); ++index) {
-      const auto& occurrence = coverage.chain[index];
-      IwyuFileInfo* file_info =
-          preprocessor_info().FileInfoFor(occurrence.includer);
-      if (!file_info)
-        continue;
-      vector<string> chain;
-      chain.push_back(NormalizeFilePath(GetFilePath(occurrence.includer)));
-      for (size_t nested = index; nested < coverage.chain.size(); ++nested) {
-        chain.push_back(NormalizeFilePath(
-            GetFilePath(coverage.chain[nested].includee)));
-      }
-      file_info->ReportSemanticDefinitionProvider(
-          occurrence.location, occurrence.includee, callee, report_loc,
-          definition_loc, occurrence.spelling,
-          NormalizeFilePath(GetFilePath(occurrence.includee)), chain);
-    }
+
+    // The semantic proof may reach a definition through exported or mapped
+    // intermediate headers, but this obligation belongs to the consumer. Pin
+    // only its exact direct root occurrence. An intermediate file can retain
+    // one of its own includes only for a source-local obligation found while
+    // analyzing that file.
+    const auto& root = coverage.chain.front();
+    IwyuFileInfo* file_info = preprocessor_info().FileInfoFor(root.includer);
+    if (!file_info || GetFileEntry(report_loc) != root.includer)
+      return;
+    const string includer_path =
+        NormalizeFilePath(GetFilePath(root.includer));
+    const string selected_path =
+        NormalizeFilePath(GetFilePath(root.includee));
+    file_info->ReportSemanticDefinitionProvider(
+        root.location, root.includee, callee, report_loc, definition_loc,
+        root.spelling, selected_path, {includer_path, selected_path});
   }
 
   void RetainOrderedDeclarationProvider(const FunctionDecl* callee,

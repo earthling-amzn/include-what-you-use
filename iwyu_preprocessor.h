@@ -65,6 +65,7 @@
 #include <set>                          // for set
 #include <stack>                        // for stack
 #include <string>                       // for string
+#include <tuple>                        // for tuple
 #include <utility>                      // for pair
 #include <vector>                       // for vector
 
@@ -552,6 +553,25 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
   void PopulateTransitiveIncludeMap();
   void FinalizeProtectedIncludes();
 
+  using DefinitionProviderCoverageKey =
+      std::tuple<const clang::FileEntry*, string, string, unsigned, unsigned,
+                 bool>;
+  using AssociatedDefinitionProviderCoverageKey =
+      std::tuple<const clang::FileEntry*, const clang::FileEntry*, string,
+                 string, unsigned, unsigned, bool>;
+
+  // Uncached implementations used by the exact-proof memoization wrappers.
+  DefinitionProviderCoverage ComputeDefinitionProviderCoverageAt(
+      const clang::FileEntry* includer, const string& selected_spelling,
+      const string& selected_path, clang::SourceLocation definition_loc,
+      clang::SourceLocation use_loc, bool allow_later_root) const;
+  DefinitionProviderCoverage ComputeAssociatedDefinitionProviderCoverageAt(
+      const clang::FileEntry* includer,
+      const clang::FileEntry* associated_header,
+      const string& selected_spelling, const string& selected_path,
+      clang::SourceLocation definition_loc, clang::SourceLocation use_loc,
+      bool allow_later_root) const;
+
   // Return true if at the current point in the parse of the given file,
   // there is a pending "begin_exports" pragma.
   bool HasOpenBeginExports(const clang::FileEntry* file) const;
@@ -571,6 +591,12 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
   map<const clang::FileEntry*, vector<size_t>> conditional_regions_by_file_;
   vector<DirectIncludeCondition> direct_include_conditions_;
   vector<PendingDottedInlineExport> pending_dotted_inline_exports_;
+
+  mutable map<DefinitionProviderCoverageKey, DefinitionProviderCoverage>
+      definition_provider_coverage_cache_;
+  mutable map<AssociatedDefinitionProviderCoverageKey,
+              DefinitionProviderCoverage>
+      associated_definition_provider_coverage_cache_;
 
   // The C++ source file passed in as an argument to the compiler (as
   // opposed to other files seen via #includes).

@@ -19,6 +19,7 @@
 #include <map>                          // for map
 #include <set>                          // for set
 #include <string>                       // for string, operator<
+#include <utility>                      // for pair
 #include <vector>                       // for vector
 
 #include "iwyu_port.h"  // for CHECK_
@@ -495,14 +496,17 @@ class IwyuFileInfo {
     string reason_code;
     string reason;
   };
-  struct SemanticDefinitionProviderFact {
-    const clang::FunctionDecl* function;
-    clang::SourceLocation include_location;
+  struct SemanticDefinitionProviderUseFact {
     clang::SourceLocation use_location;
     clang::SourceLocation definition_location;
+  };
+  struct SemanticDefinitionProviderFact {
+    const clang::FunctionDecl* function = nullptr;
+    clang::SourceLocation include_location;
     string selected_spelling;
     string selected_path;
     vector<string> chain;
+    map<std::pair<unsigned, unsigned>, SemanticDefinitionProviderUseFact> uses;
   };
   struct MacroBodyDependencyFact {
     string macro_name;
@@ -544,8 +548,8 @@ class IwyuFileInfo {
                     &associated_desired_includes);
       for (const auto& line_facts :
            associated->semantic_definition_provider_facts_) {
-        for (const SemanticDefinitionProviderFact& fact : line_facts.second)
-          associated_desired_includes.insert(fact.selected_spelling);
+        for (const auto& fact : line_facts.second)
+          associated_desired_includes.insert(fact.second.selected_spelling);
       }
     }
     return associated_desired_includes;
@@ -600,7 +604,7 @@ class IwyuFileInfo {
   map<const clang::FileEntry*, KeepReason> kept_include_reasons_;
   map<const clang::FileEntry*, vector<MacroBodyDependencyFact>>
       macro_body_dependency_facts_;
-  map<int, vector<SemanticDefinitionProviderFact>>
+  map<int, map<const clang::FunctionDecl*, SemanticDefinitionProviderFact>>
       semantic_definition_provider_facts_;
   set<int> semantic_definition_provider_lines_;
   vector<StructuredDiagnostic> structured_diagnostics_;
