@@ -3000,6 +3000,277 @@ IwyuPreprocessorInfo::AssociatedProviderCoverageAt(
                  : DirectIncludeCoverage::kDoesNotCoverUse;
 }
 
+IwyuPreprocessorInfo::DefinitionProviderCoverage
+IwyuPreprocessorInfo::DefinitionProviderCoverageAt(
+    const FileEntry* includer, const string& selected_spelling,
+    const string& selected_path, SourceLocation definition_loc,
+    SourceLocation use_loc, bool allow_later_root) const {
+  DefinitionProviderCoverage result;
+  if (!includer || selected_spelling.empty() || definition_loc.isInvalid() ||
+      use_loc.isInvalid()) {
+    return result;
+  }
+
+  const auto& source_manager = preprocessor_->getSourceManager();
+  SourceLocation definition = source_manager.getExpansionLoc(definition_loc);
+  SourceLocation use = source_manager.getExpansionLoc(use_loc);
+  if (definition.isInvalid() || use.isInvalid() || !definition.isFileID() ||
+      !use.isFileID()) {
+    return result;
+  }
+  const FileID definition_id = source_manager.getFileID(definition);
+  const FileID use_id = source_manager.getFileID(use);
+  if (definition_id.isInvalid() || use_id.isInvalid() ||
+      source_manager.getFileEntryForID(use_id) != includer) {
+    return result;
+  }
+
+  // A same-instance definition requires no include. Its source condition must
+  // nevertheless dominate the concrete obligation. A later ordinary inline
+  // definition is valid in this definition domain.
+  if (definition_id == use_id) {
+    if (!ConditionAtLocationDominates(definition, use)) {
+      result.status = DirectIncludeCoverage::kDoesNotCoverUse;
+      return result;
+    }
+    if (!allow_later_root &&
+        source_manager.getFileOffset(definition) >=
+            source_manager.getFileOffset(use)) {
+      result.status = DirectIncludeCoverage::kDoesNotCoverUse;
+      return result;
+    }
+    result.status = DirectIncludeCoverage::kCoversUse;
+    return result;
+  }
+
+  vector<ProviderOccurrence> reverse_chain;
+  FileID current = definition_id;
+  bool unknown = false;
+  for (unsigned depth = 0; depth < 256 && current != use_id; ++depth) {
+    SourceLocation include_loc = source_manager.getIncludeLoc(current);
+    include_loc = source_manager.getExpansionLoc(include_loc);
+    if (include_loc.isInvalid() || !include_loc.isFileID()) {
+      result.status = DirectIncludeCoverage::kDoesNotCoverUse;
+      return result;
+    }
+    const FileID parent = source_manager.getFileID(include_loc);
+    if (parent.isInvalid())
+      return result;
+
+    const DirectIncludeCondition* exact = nullptr;
+    for (const DirectIncludeCondition& include : direct_include_conditions_) {
+      SourceLocation observed = source_manager.getExpansionLoc(include.location);
+      if (include.includee_file_id != current || observed.isInvalid() ||
+          !observed.isFileID() ||
+          source_manager.getFileID(observed) != parent) {
+        continue;
+      }
+      if (exact) {
+        // A FileID has one include parent. Multiple observations mean source
+        // identity was not precise enough to bind an occurrence.
+        return result;
+      }
+      exact = &include;
+    }
+    if (!exact || !exact->includer || !exact->includee)
+      return result;
+    reverse_chain.push_back(
+        {exact->includer, exact->includee, exact->quoted_include,
+         exact->location, parent, exact->includee_file_id});
+    current = parent;
+  }
+  if (current != use_id || reverse_chain.empty()) {
+    result.status = DirectIncludeCoverage::kDoesNotCoverUse;
+    return result;
+  }
+  std::reverse(reverse_chain.begin(), reverse_chain.end());
+  const ProviderOccurrence& root = reverse_chain.front();
+
+  bool saw_selected_occurrence = false;
+  for (const DirectIncludeCondition& include : direct_include_conditions_) {
+    SourceLocation observed = source_manager.getExpansionLoc(include.location);
+    if (include.includer == includer &&
+        include.quoted_include == selected_spelling && observed.isValid() &&
+        observed.isFileID() && source_manager.getFileID(observed) == use_id) {
+      saw_selected_occurrence = true;
+    }
+  }
+
+  const string expected_path = selected_path.empty()
+      ? string()
+      : NormalizeFilePath(MakeAbsolutePath(selected_path));
+  const string root_path = NormalizeFilePath(
+      MakeAbsolutePath(GetFilePath(root.includee)));
+  if (root.includer != includer || root.spelling != selected_spelling ||
+      (!expected_path.empty() && root_path != expected_path)) {
+    result.status = saw_selected_occurrence
+        ? DirectIncludeCoverage::kDoesNotCoverUse
+        : DirectIncludeCoverage::kNoDirectOccurrence;
+    return result;
+  }
+
+  vector<ActiveConditionalState> root_path_condition;
+  vector<ActiveConditionalState> use_path_condition;
+  if (!ConditionPathAt(root.location, &root_path_condition) ||
+      !ConditionPathAt(use, &use_path_condition)) {
+    return result;
+  }
+  SourceLocation root_loc = source_manager.getExpansionLoc(root.location);
+  if (root_loc.isInvalid() || !root_loc.isFileID() ||
+      source_manager.getFileID(root_loc) != use_id) {
+    return result;
+  }
+  if (root_path_condition.size() > use_path_condition.size() ||
+      !std::equal(root_path_condition.begin(), root_path_condition.end(),
+                  use_path_condition.begin())) {
+    result.status = DirectIncludeCoverage::kDoesNotCoverUse;
+    return result;
+  }
+  if (!allow_later_root &&
+      source_manager.getFileOffset(root_loc) >= source_manager.getFileOffset(use)) {
+    result.status = DirectIncludeCoverage::kDoesNotCoverUse;
+    return result;
+  }
+
+  for (size_t index = 1; index < reverse_chain.size(); ++index) {
+    const DirectIncludeCondition* nested = nullptr;
+    const ProviderOccurrence& occurrence = reverse_chain[index];
+    for (const DirectIncludeCondition& include : direct_include_conditions_) {
+      if (include.location == occurrence.location &&
+          include.includee_file_id == occurrence.includee_file_id) {
+        nested = &include;
+        break;
+      }
+    }
+    if (!nested)
+      return result;
+    if (!DirectOccurrenceIsUnconditional(*nested, &unknown)) {
+      result.status = unknown ? DirectIncludeCoverage::kUnknown
+                              : DirectIncludeCoverage::kDoesNotCoverUse;
+      return result;
+    }
+  }
+
+  result.status = DirectIncludeCoverage::kCoversUse;
+  result.chain = std::move(reverse_chain);
+  return result;
+}
+
+IwyuPreprocessorInfo::DefinitionProviderCoverage
+IwyuPreprocessorInfo::AssociatedDefinitionProviderCoverageAt(
+    const FileEntry* includer, const FileEntry* associated_header,
+    const string& selected_spelling, const string& selected_path,
+    SourceLocation definition_loc, SourceLocation use_loc,
+    bool allow_later_root) const {
+  DefinitionProviderCoverage result;
+  if (!includer || !associated_header || selected_spelling.empty())
+    return result;
+
+  const auto& source_manager = preprocessor_->getSourceManager();
+  SourceLocation definition = source_manager.getExpansionLoc(definition_loc);
+  SourceLocation use = source_manager.getExpansionLoc(use_loc);
+  if (definition.isInvalid() || use.isInvalid() || !definition.isFileID() ||
+      !use.isFileID()) {
+    return result;
+  }
+  const FileID definition_id = source_manager.getFileID(definition);
+  const FileID use_id = source_manager.getFileID(use);
+  if (definition_id.isInvalid() || use_id.isInvalid())
+    return result;
+
+  vector<ProviderOccurrence> reverse_chain;
+  FileID current = definition_id;
+  for (unsigned depth = 0; depth < 256 && current != use_id; ++depth) {
+    SourceLocation include_loc = source_manager.getExpansionLoc(
+        source_manager.getIncludeLoc(current));
+    if (include_loc.isInvalid() || !include_loc.isFileID())
+      return result;
+    const FileID parent = source_manager.getFileID(include_loc);
+    const DirectIncludeCondition* exact = nullptr;
+    for (const DirectIncludeCondition& include : direct_include_conditions_) {
+      SourceLocation observed = source_manager.getExpansionLoc(include.location);
+      if (include.includee_file_id == current && observed.isValid() &&
+          observed.isFileID() && source_manager.getFileID(observed) == parent) {
+        if (exact)
+          return result;
+        exact = &include;
+      }
+    }
+    if (!exact || !exact->includer || !exact->includee)
+      return result;
+    reverse_chain.push_back(
+        {exact->includer, exact->includee, exact->quoted_include,
+         exact->location, parent, exact->includee_file_id});
+    current = parent;
+  }
+  if (current != use_id || reverse_chain.empty()) {
+    result.status = DirectIncludeCoverage::kDoesNotCoverUse;
+    return result;
+  }
+  std::reverse(reverse_chain.begin(), reverse_chain.end());
+  if (reverse_chain.front().includer != includer ||
+      reverse_chain.front().includee != associated_header) {
+    result.status = DirectIncludeCoverage::kNoDirectOccurrence;
+    return result;
+  }
+
+  vector<ActiveConditionalState> association_path;
+  vector<ActiveConditionalState> use_path;
+  if (!ConditionPathAt(reverse_chain.front().location, &association_path) ||
+      !ConditionPathAt(use, &use_path)) {
+    return result;
+  }
+  if (association_path.size() > use_path.size() ||
+      !std::equal(association_path.begin(), association_path.end(),
+                  use_path.begin())) {
+    result.status = DirectIncludeCoverage::kDoesNotCoverUse;
+    return result;
+  }
+  SourceLocation association_loc = source_manager.getExpansionLoc(
+      reverse_chain.front().location);
+  if (!allow_later_root &&
+      source_manager.getFileOffset(association_loc) >=
+          source_manager.getFileOffset(use)) {
+    result.status = DirectIncludeCoverage::kDoesNotCoverUse;
+    return result;
+  }
+
+  const string expected_path = selected_path.empty()
+      ? string()
+      : NormalizeFilePath(MakeAbsolutePath(selected_path));
+  bool selected_on_chain = false;
+  bool unknown = false;
+  for (size_t index = 1; index < reverse_chain.size(); ++index) {
+    const ProviderOccurrence& occurrence = reverse_chain[index];
+    if (occurrence.spelling == selected_spelling &&
+        (expected_path.empty() ||
+         NormalizeFilePath(MakeAbsolutePath(GetFilePath(occurrence.includee))) ==
+             expected_path)) {
+      selected_on_chain = true;
+    }
+    const DirectIncludeCondition* nested = nullptr;
+    for (const DirectIncludeCondition& include : direct_include_conditions_) {
+      if (include.location == occurrence.location &&
+          include.includee_file_id == occurrence.includee_file_id) {
+        nested = &include;
+        break;
+      }
+    }
+    if (!nested || !DirectOccurrenceIsUnconditional(*nested, &unknown)) {
+      result.status = unknown ? DirectIncludeCoverage::kUnknown
+                              : DirectIncludeCoverage::kDoesNotCoverUse;
+      return result;
+    }
+  }
+  if (!selected_on_chain) {
+    result.status = DirectIncludeCoverage::kNoDirectOccurrence;
+    return result;
+  }
+  result.status = DirectIncludeCoverage::kCoversUse;
+  result.chain = std::move(reverse_chain);
+  return result;
+}
+
 IwyuPreprocessorInfo::DirectIncludeCoverage
 IwyuPreprocessorInfo::AssociatedDeclarationCoverageAt(
     const FileEntry* includer, const FileEntry* associated_header,

@@ -1077,6 +1077,12 @@ struct VisitorState {
   // instantiated calls, we can't store the exprs themselves, but have
   // to store their location.)
   set<SourceLocation> processed_overload_locs;
+
+  // SEM-004 is visited through calls, address expressions, lifecycle hooks,
+  // and concrete template re-traversal. Deduplicate only the same canonical
+  // specialization, concrete report site, and obligation kind.
+  set<std::tuple<const FunctionDecl*, unsigned, int>>
+      definition_obligations;
 };
 
 // ----------------------------------------------------------------------
@@ -1685,6 +1691,7 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
   // The latter two iwyu requirements can be overridden by the function
   // author; for details, see CodeAuthorWantsJustAForwardDeclare.
   bool VisitFunctionDecl(clang::FunctionDecl* decl) {
+    HandleExplicitInstantiationDefinition(decl);
     if (CanIgnoreCurrentASTNode())
       return true;
 
@@ -1704,6 +1711,15 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
       // Make all our types forward-declarable.
       current_ast_node()->set_in_forward_declare_context(true);
     }
+    return true;
+  }
+
+
+  bool VisitFunctionTemplateDecl(clang::FunctionTemplateDecl* declaration) {
+    if (!declaration)
+      return true;
+    for (FunctionDecl* specialization : declaration->specializations())
+      HandleExplicitInstantiationDefinition(specialization);
     return true;
   }
 
@@ -2406,13 +2422,79 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     return !member->performsVirtualDispatch(compiler()->getLangOpts());
   }
 
-  bool IsInlineDefinitionEligible(const FunctionDecl* callee) const {
-    if (callee->getTemplatedKind() == FunctionDecl::TK_NonTemplate)
-      return true;
-    return callee->getTemplatedKind() ==
-               FunctionDecl::TK_FunctionTemplateSpecialization &&
-           callee->getTemplateSpecializationKind() ==
-               clang::TSK_ExplicitSpecialization;
+  enum class DefinitionObligationKind {
+    kNone,
+    kOrdinaryInline,
+    kTemplateInstantiation,
+    kExplicitInstantiationDefinition,
+  };
+
+  DefinitionObligationKind ClassifyDefinitionObligation(
+      const FunctionDecl* callee) const {
+    if (!callee || callee->isDeleted() || callee->isDefaulted())
+      return DefinitionObligationKind::kNone;
+
+    const auto specialization_kind = callee->getTemplateSpecializationKind();
+    if (specialization_kind ==
+        clang::TSK_ExplicitInstantiationDeclaration) {
+      return DefinitionObligationKind::kTemplateInstantiation;
+    }
+    if (specialization_kind ==
+        clang::TSK_ExplicitInstantiationDefinition) {
+      return DefinitionObligationKind::kExplicitInstantiationDefinition;
+    }
+
+    switch (callee->getTemplatedKind()) {
+      case FunctionDecl::TK_NonTemplate:
+        break;
+      case FunctionDecl::TK_FunctionTemplateSpecialization:
+      case FunctionDecl::TK_MemberSpecialization:
+        if (specialization_kind != clang::TSK_ExplicitSpecialization)
+          return DefinitionObligationKind::kTemplateInstantiation;
+        // An explicit specialization is an independent ordinary function;
+        // inline does not propagate from its primary template.
+        break;
+      case FunctionDecl::TK_FunctionTemplate:
+      case FunctionDecl::TK_DependentFunctionTemplateSpecialization:
+      case FunctionDecl::TK_DependentNonTemplate:
+        return DefinitionObligationKind::kNone;
+    }
+
+    const bool semantically_inline = std::any_of(
+        callee->redecls_begin(), callee->redecls_end(),
+        [](const FunctionDecl* redecl) { return redecl->isInlined(); });
+    return semantically_inline ? DefinitionObligationKind::kOrdinaryInline
+                               : DefinitionObligationKind::kNone;
+  }
+
+  const FunctionDecl* DefinitionForObligation(
+      const FunctionDecl* callee,
+      DefinitionObligationKind kind) const {
+    if (!callee)
+      return nullptr;
+    if (kind !=
+            DefinitionObligationKind::kExplicitInstantiationDefinition) {
+      if (const FunctionDecl* definition = callee->getDefinition())
+        return definition;
+    }
+    if (kind == DefinitionObligationKind::kOrdinaryInline)
+      return nullptr;
+
+    // Instantiated functions and members can have a declaration-only
+    // specialization while the source-written pattern owns the body.
+    const FunctionDecl* pattern = callee;
+    set<const FunctionDecl*> seen;
+    while (pattern && seen.insert(pattern).second) {
+      FunctionDecl* next = pattern->getTemplateInstantiationPattern();
+      if (!next)
+        next = pattern->getInstantiatedFromMemberFunction();
+      if (!next || next == pattern)
+        break;
+      pattern = next;
+      if (const FunctionDecl* definition = pattern->getDefinition())
+        return definition;
+    }
+    return nullptr;
   }
 
   bool IsPotentiallyEvaluatedOdrUse(const FunctionDecl* callee,
@@ -2432,56 +2514,296 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     return true;
   }
 
+  void EmitDefinitionDiagnostic(SourceLocation report_loc,
+                                const FunctionDecl* callee,
+                                DefinitionObligationKind kind,
+                                const string& code,
+                                const string& detail) {
+    const FileEntry* report_file = GetFileEntry(report_loc);
+    if (!report_file)
+      return;
+    const string entity = kind == DefinitionObligationKind::kOrdinaryInline
+        ? "Inline function" : "Template specialization";
+    const string message = entity + " '" +
+        callee->getQualifiedNameAsString() + "' is odr-used, but " + detail;
+    IwyuFileInfo* file_info = preprocessor_info().FileInfoFor(report_file);
+    const bool added = file_info && file_info->AddStructuredDiagnostic(
+        report_loc, code, message);
+    // The generic completion is a native structured contract. Preserve the
+    // legacy text surface except for the pre-existing ordinary-inline missing
+    // body warning.
+    if (added &&
+        GlobalFlags().output_format == CommandlineFlags::kTextOutput &&
+        code == "missing_inline_definition") {
+      errs() << PrintableLoc(report_loc) << ": warning: " << code << ": "
+             << message << '\n';
+    }
+  }
+
+  void RetainDefinitionProvider(
+      const IwyuPreprocessorInfo::DefinitionProviderCoverage& coverage,
+      const FunctionDecl* callee, SourceLocation report_loc,
+      SourceLocation definition_loc) {
+    if (coverage.chain.empty())
+      return;
+    for (size_t index = 0; index < coverage.chain.size(); ++index) {
+      const auto& occurrence = coverage.chain[index];
+      IwyuFileInfo* file_info =
+          preprocessor_info().FileInfoFor(occurrence.includer);
+      if (!file_info)
+        continue;
+      vector<string> chain;
+      chain.push_back(NormalizeFilePath(GetFilePath(occurrence.includer)));
+      for (size_t nested = index; nested < coverage.chain.size(); ++nested) {
+        chain.push_back(NormalizeFilePath(
+            GetFilePath(coverage.chain[nested].includee)));
+      }
+      file_info->ReportSemanticDefinitionProvider(
+          occurrence.location, occurrence.includee, callee, report_loc,
+          definition_loc, occurrence.spelling,
+          NormalizeFilePath(GetFilePath(occurrence.includee)), chain);
+    }
+  }
+
+  void RetainOrderedDeclarationProvider(const FunctionDecl* callee,
+                                        SourceLocation report_loc) {
+    const FunctionDecl* declaration =
+        callee ? callee->getCanonicalDecl() : nullptr;
+    const FileEntry* declaration_file = GetFileEntry(declaration);
+    const FileEntry* use_file = GetFileEntry(report_loc);
+    if (!declaration || !declaration_file || !use_file)
+      return;
+    const string declaration_path = GetFilePath(declaration_file);
+    const string declaration_spelling =
+        ConvertToQuotedInclude(declaration_path);
+    auto coverage = preprocessor_info().DefinitionProviderCoverageAt(
+        use_file, declaration_spelling, declaration_path,
+        GetLocation(declaration), report_loc, false);
+    if (coverage.status ==
+        IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse) {
+      RetainDefinitionProvider(coverage, callee, report_loc,
+                               GetLocation(declaration));
+    }
+  }
+
+  bool ExternTemplateControls(const FunctionDecl* callee,
+                              SourceLocation report_loc) {
+    if (!callee || callee->getTemplateSpecializationKind() !=
+                       clang::TSK_ExplicitInstantiationDeclaration) {
+      return false;
+    }
+
+    SourceLocation control_loc = callee->getPointOfInstantiation();
+    if (control_loc.isInvalid())
+      return false;
+    if (const auto* method = dyn_cast<CXXMethodDecl>(callee)) {
+      const auto* parent = dyn_cast<ClassTemplateSpecializationDecl>(
+          method->getParent());
+      if (parent && parent->getTemplateSpecializationKind() ==
+                        clang::TSK_ExplicitInstantiationDeclaration) {
+        control_loc = parent->getLocation();
+      }
+    }
+    const FileEntry* control_file = GetFileEntry(control_loc);
+    const FileEntry* use_file = GetFileEntry(report_loc);
+    if (!control_file || !use_file)
+      return false;
+
+    vector<CandidateHeader> candidates =
+        GlobalIncludePicker().GetCandidateHeaderRefsForFilepathIncludedFrom(
+            GetFilePath(control_file), GetFilePath(report_loc));
+    const CandidateHeader physical{
+        ConvertToQuotedInclude(GetFilePath(control_file)),
+        GetFilePath(control_file)};
+    if (std::none_of(candidates.begin(), candidates.end(),
+                     [&](const CandidateHeader& candidate) {
+                       return candidate.spelling == physical.spelling &&
+                              candidate.path == physical.path;
+                     })) {
+      candidates.push_back(physical);
+    }
+    for (const CandidateHeader& candidate : candidates) {
+      if (preprocessor_info()
+              .DefinitionProviderCoverageAt(
+                  use_file, candidate.spelling, candidate.path, control_loc,
+                  report_loc, false)
+              .status ==
+          IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse) {
+        return true;
+      }
+    }
+    const IwyuFileInfo* use_info = preprocessor_info().FileInfoFor(use_file);
+    if (!use_info)
+      return false;
+    for (const FileEntry* associated :
+         use_info->SemanticAssociatedFileEntries()) {
+      for (const CandidateHeader& candidate : candidates) {
+        if (preprocessor_info()
+                .AssociatedDefinitionProviderCoverageAt(
+                    use_file, associated, candidate.spelling, candidate.path,
+                    control_loc, report_loc, false)
+                .status ==
+            IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  bool SatisfyDefinitionObligation(FunctionDecl* callee,
+                                   SourceLocation report_loc,
+                                   DefinitionObligationKind kind) {
+    if (!callee || report_loc.isInvalid() ||
+        kind == DefinitionObligationKind::kNone) {
+      return kind != DefinitionObligationKind::kNone;
+    }
+
+    const auto obligation_key = std::make_tuple(
+        callee->getCanonicalDecl(), report_loc.getRawEncoding(),
+        static_cast<int>(kind));
+    if (!visitor_state_->definition_obligations.insert(obligation_key).second)
+      return true;
+
+    const FunctionDecl* definition = DefinitionForObligation(callee, kind);
+    if (!definition) {
+      const bool ordinary_inline =
+          kind == DefinitionObligationKind::kOrdinaryInline;
+      EmitDefinitionDiagnostic(
+          report_loc, callee, kind,
+          ordinary_inline ? "missing_inline_definition"
+                          : "missing_template_definition",
+          ordinary_inline
+              ? "no definition is visible; include its inline-definition "
+                "provider before linking."
+              : "no definition is visible; include its definition provider "
+                "before linking.");
+      return true;
+    }
+
+    const FileEntry* use_file = GetFileEntry(report_loc);
+    const FileEntry* definition_file = GetFileEntry(definition);
+    if (!use_file || !definition_file)
+      return true;
+
+    vector<CandidateHeader> candidates =
+        GlobalIncludePicker().GetCandidateHeaderRefsForFilepathIncludedFrom(
+            GetFilePath(definition), GetFilePath(report_loc));
+    const CandidateHeader physical{
+        ConvertToQuotedInclude(GetFilePath(definition_file)),
+        GetFilePath(definition_file)};
+    if (std::none_of(candidates.begin(), candidates.end(),
+                     [&](const CandidateHeader& candidate) {
+                       return candidate.spelling == physical.spelling &&
+                              candidate.path == physical.path;
+                     })) {
+      candidates.push_back(physical);
+    }
+
+    const bool allow_later =
+        kind == DefinitionObligationKind::kOrdinaryInline;
+    bool unknown = false;
+    for (const CandidateHeader& candidate : candidates) {
+      auto coverage = preprocessor_info().DefinitionProviderCoverageAt(
+          use_file, candidate.spelling, candidate.path, GetLocation(definition),
+          report_loc, allow_later);
+      if (coverage.status ==
+          IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse) {
+        RetainDefinitionProvider(coverage, callee, report_loc,
+                                 GetLocation(definition));
+        if (allow_later && !coverage.chain.empty() &&
+            IsBeforeInTranslationUnit(report_loc,
+                                      coverage.chain.front().location)) {
+          RetainOrderedDeclarationProvider(callee, report_loc);
+        }
+        return true;
+      }
+      unknown = unknown || coverage.status ==
+          IwyuPreprocessorInfo::DirectIncludeCoverage::kUnknown;
+    }
+
+    const IwyuFileInfo* use_info =
+        preprocessor_info().FileInfoFor(use_file);
+    if (use_info) {
+      for (const FileEntry* associated :
+           use_info->SemanticAssociatedFileEntries()) {
+        for (const CandidateHeader& candidate : candidates) {
+          auto coverage =
+              preprocessor_info().AssociatedDefinitionProviderCoverageAt(
+                  use_file, associated, candidate.spelling, candidate.path,
+                  GetLocation(definition), report_loc, allow_later);
+          if (coverage.status ==
+              IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse) {
+            RetainDefinitionProvider(coverage, callee, report_loc,
+                                     GetLocation(definition));
+            if (allow_later && !coverage.chain.empty() &&
+                IsBeforeInTranslationUnit(report_loc,
+                                          coverage.chain.front().location)) {
+              RetainOrderedDeclarationProvider(callee, report_loc);
+            }
+            return true;
+          }
+          unknown = unknown || coverage.status ==
+              IwyuPreprocessorInfo::DirectIncludeCoverage::kUnknown;
+        }
+      }
+    }
+
+    EmitDefinitionDiagnostic(
+        report_loc, callee, kind, "definition_provider_unproven",
+        unknown
+            ? "the definition provider's exact entered include/condition "
+              "chain is unknown."
+            : "no entered include occurrence with a dominating condition "
+              "proves the visible definition provider.");
+    return true;
+  }
+
   bool HandleInlineDefinitionOdrUse(FunctionDecl* callee,
                                     const Expr* expr) {
     if (!IsPotentiallyEvaluatedOdrUse(callee, expr))
       return false;
     if (!PureVirtualUseRequiresDefinition(callee, expr))
       return true;
-
-    const SourceLocation use_loc = expr->getExprLoc();
-    const FileEntry* use_file = GetFileEntry(use_loc);
-    if (!use_file)
+    const DefinitionObligationKind kind =
+        ClassifyDefinitionObligation(callee);
+    if (kind == DefinitionObligationKind::kNone)
+      return false;
+    const SourceLocation report_loc =
+        static_cast<Derived*>(this)->DefinitionObligationReportLocation(expr);
+    if (ExternTemplateControls(callee, report_loc))
       return true;
-
-    if (const FunctionDecl* definition = callee->getDefinition()) {
-      const FileEntry* definition_file = GetFileEntry(definition);
-      if (definition_file && definition_file != use_file &&
-          GlobalIncludePicker().IsVerifiedDottedInlineEndpoint(
-              GetFilePath(definition_file)) &&
-          ContainsKey(preprocessor_info()
-                          .FileInfoOrEmptyFor(use_file)
-                          .direct_includes_as_fileentries(),
-                      definition_file)) {
-        // The ODR-use needs the selected definition, not only the declaration
-        // in the dotted inline header's plain counterpart.
-        ReportDeclUse(use_loc, definition, "(for inline definition)");
-        return true;
+    if (kind ==
+        DefinitionObligationKind::kExplicitInstantiationDefinition) {
+      // The explicit-instantiation declaration owns this specialization's
+      // single local body obligation. Calls after it need only the ordinary
+      // declaration requirement.
+      return true;
+    }
+    if (GlobalFlags().output_format == CommandlineFlags::kTextOutput) {
+      // Legacy text has no occurrence/provider structure. Preserve its prior
+      // SEM-004 surface: only an ordinary inline body that is truly absent is
+      // diagnostic; generic template and unproven-provider facts are native.
+      if (kind != DefinitionObligationKind::kOrdinaryInline ||
+          DefinitionForObligation(callee, kind)) {
+        return false;
       }
-      return false;
     }
+    return SatisfyDefinitionObligation(callee, report_loc, kind);
+  }
 
-    if (!IsInlineDefinitionEligible(callee))
-      return false;
-    const bool declared_inline = std::any_of(
-        callee->redecls_begin(), callee->redecls_end(),
-        [](const FunctionDecl* redecl) { return redecl->isInlineSpecified(); });
-    if (!declared_inline)
-      return false;
-
-    const string name = callee->getQualifiedNameAsString();
-    const string message =
-        "Inline function '" + name +
-        "' is odr-used, but no definition is visible; include its "
-        "inline-definition provider before linking.";
-    IwyuFileInfo* file_info = preprocessor_info().FileInfoFor(use_file);
-    if (file_info && file_info->AddStructuredDiagnostic(
-                         use_loc, "missing_inline_definition", message) &&
-        GlobalFlags().output_format == CommandlineFlags::kTextOutput) {
-      errs() << PrintableLoc(use_loc)
-             << ": warning: missing_inline_definition: " << message << '\n';
-    }
-    return true;
+  void HandleExplicitInstantiationDefinition(FunctionDecl* declaration) {
+    if (GlobalFlags().output_format == CommandlineFlags::kTextOutput)
+      return;
+    if (!declaration || declaration->getTemplateSpecializationKind() !=
+                            clang::TSK_ExplicitInstantiationDefinition)
+      return;
+    SourceLocation report_loc = declaration->getPointOfInstantiation();
+    if (report_loc.isInvalid())
+      report_loc = GetLocation(declaration);
+    SatisfyDefinitionObligation(
+        declaration, report_loc,
+        DefinitionObligationKind::kExplicitInstantiationDefinition);
   }
 
   bool VisitDeclRefExpr(clang::DeclRefExpr* expr) {
@@ -3136,6 +3458,10 @@ class InstantiatedTemplateVisitor
     return " in tpl";
   }
 
+  SourceLocation DefinitionObligationReportLocation(const Expr*) const {
+    return caller_loc();
+  }
+
   bool CanIgnoreType(const Type* type, IgnoreKind ignore_kind =
                                            IgnoreKind::ForUse) const override {
     if (!type)
@@ -3252,6 +3578,8 @@ class InstantiatedTemplateVisitor
   // The 'convenience' HandleFunctionCall is perfect for us!
   bool HandleFunctionCall(FunctionDecl* callee, const Type* parent_type,
                           const clang::Expr* calling_expr) {
+    if (callee && calling_expr && CanIgnoreCurrentASTNode())
+      HandleInlineDefinitionOdrUse(callee, calling_expr);
     if (const Type* resugared_type = ResugarType(parent_type))
       parent_type = resugared_type;
     if (!Base::HandleFunctionCall(callee, parent_type, calling_expr))
@@ -3259,6 +3587,24 @@ class InstantiatedTemplateVisitor
     if (!callee || CanIgnoreCurrentASTNode() || CanIgnoreDecl(callee))
       return true;
     return TraverseExpandedTemplateFunctionHelper(callee, parent_type);
+  }
+
+  bool VisitDeclRefExpr(clang::DeclRefExpr* expr) {
+    if (CanIgnoreCurrentASTNode()) {
+      if (auto* function = dyn_cast<FunctionDecl>(expr->getDecl()))
+        HandleInlineDefinitionOdrUse(function, expr);
+      return true;
+    }
+    return Base::VisitDeclRefExpr(expr);
+  }
+
+  bool VisitMemberExpr(clang::MemberExpr* expr) {
+    if (CanIgnoreCurrentASTNode()) {
+      if (auto* function = dyn_cast<FunctionDecl>(expr->getMemberDecl()))
+        HandleInlineDefinitionOdrUse(function, expr);
+      return true;
+    }
+    return Base::VisitMemberExpr(expr);
   }
 
   bool TraverseUnaryExprOrTypeTraitExpr(clang::UnaryExprOrTypeTraitExpr* expr) {
@@ -3998,6 +4344,10 @@ class IwyuAstConsumer
 
   string GetSymbolAnnotation() const override {
     return "";
+  }
+
+  SourceLocation DefinitionObligationReportLocation(const Expr* expr) const {
+    return expr ? expr->getExprLoc() : SourceLocation();
   }
 
   // We are interested in all types for iwyu checking.

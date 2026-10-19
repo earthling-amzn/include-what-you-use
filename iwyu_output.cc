@@ -818,9 +818,39 @@ bool IwyuFileInfo::AddStructuredDiagnostic(SourceLocation location,
                diagnostic.severity == severity;
       });
   if (duplicate != structured_diagnostics_.end())
+
     return false;
   structured_diagnostics_.push_back({location, code, message, severity});
   return true;
+}
+
+void IwyuFileInfo::ReportSemanticDefinitionProvider(
+    SourceLocation include_location, const FileEntry* included_file,
+    const FunctionDecl* function, SourceLocation use_location,
+    SourceLocation definition_location, const string& selected_spelling,
+    const string& selected_path, const vector<string>& chain) {
+  if (!included_file || !function || include_location.isInvalid())
+    return;
+  const int line = GetLineNumber(include_location);
+  if (line <= 0)
+    return;
+  semantic_definition_provider_lines_.insert(line);
+  auto& facts = semantic_definition_provider_facts_[line];
+  const auto duplicate = std::find_if(
+      facts.begin(), facts.end(), [&](const auto& fact) {
+        return fact.function->getCanonicalDecl() ==
+                   function->getCanonicalDecl() &&
+               fact.include_location == include_location &&
+               fact.use_location == use_location &&
+               fact.definition_location == definition_location &&
+               fact.selected_spelling == selected_spelling &&
+               fact.selected_path == selected_path && fact.chain == chain;
+      });
+  if (duplicate == facts.end()) {
+    facts.push_back({function, include_location, use_location,
+                     definition_location, selected_spelling, selected_path,
+                     chain});
+  }
 }
 
 void IwyuFileInfo::ReportForwardDeclareUse(SourceLocation use_loc,
@@ -2739,7 +2769,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
     }
   }
 
-  const auto operation_key = [](const OperationRef& operation) {
+  const auto operation_key = [&](const OperationRef& operation) {
     const map<string, int> subject_rank = {
         {"remove", 0}, {"add", 1}, {"keep", 2}};
     const map<string, int> disposition_rank = {
@@ -2752,9 +2782,35 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
     const string spelling = exact_present_spelling
                                 ? operation.line->source_spelling()
                                 : operation.line->line();
+    const bool semantic_range =
+        operation.reason_code == "semantic_definition_provider";
+    const int range_rank = semantic_range ? 0 :
+        (operation.subject_action == "add" ? 3 : 2);
+    const int range_line =
+        semantic_range ? operation.line->start_linenum() : 0;
+    int range_column = 0;
+    if (semantic_range) {
+      const auto found = semantic_definition_provider_facts_.find(
+          operation.line->start_linenum());
+      if (found != semantic_definition_provider_facts_.end() &&
+          !found->second.empty()) {
+        StructuredLocationValue range_location;
+        if (StructuredLocation(found->second.front().include_location, false,
+                               &range_location)) {
+          range_column = range_location.column;
+        }
+      }
+    }
     return std::make_tuple(subject_rank.at(operation.subject_action),
                            disposition_rank.at(operation.disposition),
-                           kind_rank, spelling, operation.reason_code);
+                           kind_rank, range_rank,
+                           semantic_range ? file_path() : string(),
+                           range_line, range_column, range_line,
+                           semantic_range
+                               ? range_column +
+                                     operation.line->quoted_include().size()
+                               : 0,
+                           spelling, operation.reason_code);
   };
 
   const auto operation_spelling = [](const OperationRef& operation) {
@@ -2766,6 +2822,56 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
   };
 
   const auto operation_symbols = [&](const OperationRef& operation) {
+    if (operation.reason_code == "semantic_definition_provider") {
+      llvm::json::Array symbols;
+      const auto found = semantic_definition_provider_facts_.find(
+          operation.line->start_linenum());
+      if (found == semantic_definition_provider_facts_.end())
+        return symbols;
+      vector<const SemanticDefinitionProviderFact*> facts;
+      for (const auto& fact : found->second)
+        facts.push_back(&fact);
+      std::sort(facts.begin(), facts.end(), [](const auto* lhs,
+                                               const auto* rhs) {
+        return std::make_tuple(
+                   lhs->function->getQualifiedNameAsString(),
+                   lhs->use_location.getRawEncoding(),
+                   lhs->definition_location.getRawEncoding()) <
+               std::make_tuple(
+                   rhs->function->getQualifiedNameAsString(),
+                   rhs->use_location.getRawEncoding(),
+                   rhs->definition_location.getRawEncoding());
+      });
+      for (const auto* fact : facts) {
+        StructuredLocationValue use_location;
+        StructuredLocationValue declaration;
+        if (!StructuredLocation(fact->use_location, true, &use_location) ||
+            !StructuredLocation(fact->definition_location, false,
+                                &declaration)) {
+          continue;
+        }
+        llvm::json::Array uses;
+        uses.push_back(llvm::json::Object{
+            {"location", LocationObject(use_location)},
+            {"requirement", "full"},
+            {"origin", "ast"},
+            {"condition", ConditionObject(
+                preprocessor_info_->ActiveConditionAt(fact->use_location))},
+            {"macro", UnavailableValue()}});
+        llvm::json::Object symbol{
+            {"name", fact->function->getNameAsString()},
+            {"qualified_name", KnownString(
+                fact->function->getQualifiedNameAsString())},
+            {"declaration", llvm::json::Object{
+                {"status", "known"},
+                {"value", LocationObject(declaration)}}},
+            {"uses", std::move(uses)}};
+        if (GlobalFlags().output_schema_version >= 2)
+          symbol["declaration_kind"] = UnavailableValue();
+        symbols.push_back(std::move(symbol));
+      }
+      return symbols;
+    }
     if (operation.reason_code == "macro_body_dependency_unavailable")
       return llvm::json::Array{};
     if (operation.reason_code == "macro_body_dependency") {
@@ -3000,6 +3106,44 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
 
   const auto operation_provider = [&](const OperationRef& operation) {
     llvm::json::Object provider;
+    if (operation.reason_code == "semantic_definition_provider") {
+      const auto found = semantic_definition_provider_facts_.find(
+          operation.line->start_linenum());
+      if (found == semantic_definition_provider_facts_.end() ||
+          found->second.empty()) {
+        provider["selected"] = UnavailableValue();
+        provider["candidates"] = UnavailableValue();
+        provider["chain"] = UnavailableValue();
+        return provider;
+      }
+      const SemanticDefinitionProviderFact* selected_fact =
+          &found->second.front();
+      for (const SemanticDefinitionProviderFact& candidate : found->second) {
+        if (candidate.chain.size() > selected_fact->chain.size() ||
+            (candidate.chain.size() == selected_fact->chain.size() &&
+             candidate.chain < selected_fact->chain)) {
+          selected_fact = &candidate;
+        }
+      }
+      const SemanticDefinitionProviderFact& fact = *selected_fact;
+      llvm::json::Object selected{
+          {"spelling", fact.selected_spelling},
+          {"path", fact.selected_path}};
+      llvm::json::Array candidates;
+      candidates.push_back(llvm::json::Object{
+          {"spelling", fact.selected_spelling},
+          {"path", fact.selected_path}});
+      llvm::json::Array chain;
+      for (const string& path : fact.chain)
+        chain.push_back(path);
+      provider["selected"] = llvm::json::Object{
+          {"status", "known"}, {"value", std::move(selected)}};
+      provider["candidates"] = llvm::json::Object{
+          {"status", "known"}, {"value", std::move(candidates)}};
+      provider["chain"] = llvm::json::Object{
+          {"status", "known"}, {"value", std::move(chain)}};
+      return provider;
+    }
     if (operation.reason_code == "macro_body_dependency_unavailable") {
       provider["selected"] = UnavailableValue();
       provider["candidates"] = UnavailableValue();
@@ -3236,9 +3380,29 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
     value["disposition"] = operation.disposition;
     value["item_kind"] = operation.item_kind;
     value["spelling"] = operation_spelling(operation);
-    value["source_range"] = operation.subject_action == "add"
-                                ? NotApplicableValue()
-                                : UnavailableValue();
+    if (operation.reason_code == "semantic_definition_provider") {
+      const auto found = semantic_definition_provider_facts_.find(
+          operation.line->start_linenum());
+      StructuredLocationValue start;
+      if (found != semantic_definition_provider_facts_.end() &&
+          !found->second.empty() &&
+          StructuredLocation(found->second.front().include_location, false,
+                             &start)) {
+        StructuredLocationValue end = start;
+        end.column += operation.line->quoted_include().size();
+        value["source_range"] = llvm::json::Object{
+            {"status", "known"},
+            {"value", llvm::json::Object{
+                {"start", LocationObject(start)},
+                {"end", LocationObject(end)}}}};
+      } else {
+        value["source_range"] = UnavailableValue();
+      }
+    } else {
+      value["source_range"] = operation.subject_action == "add"
+                                  ? NotApplicableValue()
+                                  : UnavailableValue();
+    }
     value["reason_code"] = operation.reason_code;
     value["reason"] = operation.reason;
     value["symbols"] = operation_symbols(operation);
@@ -3565,6 +3729,30 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
     EmitWarningMessages(symbol_uses_);
   internal::CalculateDesiredIncludesAndForwardDeclares(
       symbol_uses_, associated_desired_includes, kept_includes_,  &lines_);
+
+  // SEM-004 requirements are occurrence-specific. Re-assert only the exact
+  // directive lines selected from concrete FileID ancestry after ordinary
+  // spelling-based duplicate pruning has run.
+  if (GlobalFlags().output_format == CommandlineFlags::kJsonOutput) {
+    for (OneIncludeOrForwardDeclareLine& line : lines_) {
+      if (!line.IsIncludeLine() || !line.is_present() ||
+          !ContainsKey(semantic_definition_provider_lines_,
+                       line.start_linenum())) {
+        continue;
+      }
+      line.set_desired();
+      const auto facts = semantic_definition_provider_facts_.find(
+          line.start_linenum());
+      if (facts != semantic_definition_provider_facts_.end()) {
+        for (const SemanticDefinitionProviderFact& fact : facts->second)
+          line.AddSymbolUse(fact.function->getQualifiedNameAsString());
+      }
+      line.SetStructuredDecision(
+          "keep", "keep", "semantic_definition_provider",
+          "This exact entered include occurrence supplies an evaluated inline "
+          "or template definition obligation.");
+    }
+  }
 
   // Keep decisions are operations even though the protected item is present in
   // both the input and desired state. Preserve the recommendation that policy

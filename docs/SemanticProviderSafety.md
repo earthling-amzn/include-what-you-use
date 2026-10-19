@@ -28,33 +28,53 @@ ancestry. Relative spellings can therefore identify the right local provider,
 while unresolved, shadowed, or merely globally observed endpoints remain
 unavailable rather than guessing from the filesystem.
 
-## SEM-004 inline-definition availability
+## SEM-004 inline and template definition availability
 
-The implemented source-fact slice covers direct calls, member calls,
-constructor/destructor callbacks, ordinary function addresses, member pointers,
-and Clang-resolved explicit function-template specializations. Clang's semantic
-parent map and `EvaluatedExprVisitor` decide whether the expression is
-potentially evaluated. `decltype`, `sizeof`-like and `noexcept` operands, unused
-default arguments, discarded `if constexpr` branches, pure virtual dispatch,
-pure virtual member-pointer formation, and unused deleted/defaulted controls do
-not create diagnostics. A direct call explicitly qualified with its pure base
-class suppresses virtual dispatch and still requires the pure declaration's
-out-of-class definition, so it remains diagnostic. Primary and implicitly
-instantiated templates remain excluded.
+SEM-004 creates a concrete body obligation for each potentially evaluated ODR
+use of an ordinary semantically-inline function, an implicit function-template
+specialization, or an instantiated class-template member. Explicit
+instantiation definitions own one obligation at Clang's point of instantiation.
+A prior selected `extern template` declaration transfers body ownership to
+another translation unit. Explicit non-inline specializations retain ordinary
+out-of-line ownership.
 
-When Clang resolves an ODR-used definition to a directly included, verified
-generic dotted `.inline.<header-extension>` endpoint, that definition is
-recorded as a full use. Verification still requires that the dotted inline
-header directly and unconditionally self-include its exact plain counterpart.
+The obligation follows Clang's canonical specialization and recursively peels
+function-template and instantiated-member patterns to the source-written body.
+Concrete template traversal reports at the caller/instantiation site and
+reconsiders pattern-identical nodes as well as dependent calls resolved by the
+instantiation. Uninstantiated primaries and unresolved dependent calls create no
+obligation. Clang's semantic parent map and `EvaluatedExprVisitor` exclude
+`decltype`, `sizeof`-like and `noexcept` operands, unused default arguments, and
+discarded `if constexpr` branches. Deleted/defaulted functions, virtual dispatch
+to a pure function, and pure member-pointer formation are excluded. An
+explicitly qualified pure call still requires the pure declaration's body.
 
-A potentially evaluated ODR-use of an eligible function explicitly declared
-`inline` with no visible definition produces `missing_inline_definition` at the
-call, address, member-pointer, or lifecycle site. This catches ordinary member,
-free-function, constructor, destructor, and explicit-specialization shapes
-before the GCC `-fno-inline` link backstop.
+A definition is available only through one concrete entered `FileID` ancestry.
+IncludePicker supplies candidate public, mapping-file, pragma-export, and
+verified dotted-inline intent. The preprocessor proof separately binds the
+candidate to an exact root directive, resolved physical path, entered includee
+`FileID`, and source condition that dominates the use. Every nested edge must
+belong to that same ancestry and be semantically unconditional. An associated
+owner contributes one exact root hop before the same proof. Skipped re-entry,
+wrong repeated instances, inactive or sibling branches, shadowed paths, unknown
+locations, and chains assembled from a physical `FileEntry` union fail closed.
+Ordinary inline bodies may be introduced later in the same definition domain;
+an earlier declaration provider is retained separately when needed.
 
-This slice deliberately does not guess an absent provider filename, infer
-availability through conditional includes, prove arbitrary re-export chains, or
-remove broad project policy. The existing SEM-004 policy keep for direct
-`.inline.hpp` includes remains required until those cases have equivalent source
-facts. Standalone GCC compile/link probes remain part of the opaque corpus.
+Every covering edge is pinned by its includer `FileID`, directive location,
+includee `FileID`, spelling, and path. Output exposes a
+`semantic_definition_provider` keep operation with AST symbol uses, the selected
+spelling/path, concrete physical chain, use condition, and occurrence range.
+This pin is re-applied after ordinary duplicate pruning, so an equal spelling
+cannot substitute for the entered occurrence. No include is synthesized from an
+absent or unproved body.
+
+An absent ordinary-inline body emits `missing_inline_definition`; an absent
+template pattern emits `missing_template_definition`; and a visible definition
+without a proved entered/dominating provider emits
+`definition_provider_unproven`. Schema versions 1 and 2 use their existing
+operation, provider, symbol-use, condition, range, and diagnostic structures.
+The opaque corpus validates deterministic output, two fixer passes, both schemas,
+conditional configurations, direct/associated/exported/mapped/repeated provider
+instances, GCC `-fno-inline` compile-link-run success, and expected unresolved
+symbols for missing bodies.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opaque SEM-004 inline-definition availability contracts."""
+"""Opaque generic SEM-004 definition-availability contracts."""
 
 import json
 from pathlib import Path
@@ -24,22 +24,53 @@ def run(command, cwd=CORPUS, stdin=None, expect=0):
     return result
 
 
-def analyze(filename, corpus=CORPUS):
-    command = [IWYU, "-Xiwyu", "--output_format=json", "-I", ".",
-               "-std=c++17", filename]
+def analyze(filename, *options, corpus=CORPUS, schema=1):
+    command = [IWYU, "-Xiwyu", "--output_format=json"]
+    if schema != 1:
+        command += ["-Xiwyu", f"--output_schema={schema}"]
+    command += ["-I", ".", "-std=c++17", *options, filename]
     first = run(command, cwd=corpus)
     second = run(command, cwd=corpus)
     assert second.stdout == first.stdout, filename
     records = [json.loads(line) for line in first.stdout.splitlines()]
     return next(record for record in records
-                if record["file"]["path"] == filename)
+                if record["file"]["path"] == filename), records
+
+
+def definition_diagnostics(record):
+    return [fact for fact in record["diagnostics"]
+            if fact["code"] in {"missing_inline_definition",
+                                "missing_template_definition",
+                                "definition_provider_unproven"}]
+
+
+def semantic_keeps(record):
+    return [op for op in record["operations"]
+            if op["reason_code"] == "semantic_definition_provider"]
+
+
+def assert_provider_keep(operation, spelling, chain):
+    assert (operation["subject_action"], operation["disposition"],
+            operation["spelling"]) == ("keep", "keep", spelling)
+    assert operation["source_range"]["status"] == "known"
+    assert operation["provider"]["selected"]["status"] == "known"
+    assert operation["provider"]["chain"] == {
+        "status": "known", "value": chain}
+    assert operation["symbols"]
+    for symbol in operation["symbols"]:
+        assert symbol["qualified_name"]["status"] == "known"
+        assert symbol["declaration"]["status"] == "known"
+        assert symbol["uses"][0]["origin"] == "ast"
+        assert symbol["uses"][0]["requirement"] == "full"
 
 
 def assert_analyzer_contracts():
-    available = analyze("available.cc")
+    available, _ = analyze("available.cc")
     assert available["status"] == "correct"
-    assert available["operations"] == []
     assert available["diagnostics"] == []
+    assert_provider_keep(semantic_keeps(available)[0],
+                         '#include "api.inline.hpp"',
+                         ["available.cc", "api.inline.hpp"])
     assert available["desired_state"]["items"] == [{
         "item_kind": "include",
         "spelling": '#include "api.inline.hpp"',
@@ -51,76 +82,180 @@ def assert_analyzer_contracts():
         ],
     }]
 
-    missing = analyze("missing.cc")
-    assert missing["status"] == "correct"
-    assert missing["operations"] == []
+    missing, _ = analyze("missing.cc")
+    assert not [op for op in missing["operations"]
+                if op["subject_action"] == "add"]
     facts = [diagnostic for diagnostic in missing["diagnostics"]
              if diagnostic["code"] == "missing_inline_definition"]
-    assert [(fact["message"], fact["location"]["value"]) for fact in facts] == [
-        ("Inline function 'InlineLifecycle::InlineLifecycle' is odr-used, "
-         "but no definition is visible; include its inline-definition "
-         "provider before linking.",
-         {"column": 19, "line": 4, "path": "missing.cc"}),
-        ("Inline function 'InlineLifecycle::~InlineLifecycle' is odr-used, "
-         "but no definition is visible; include its inline-definition "
-         "provider before linking.",
-         {"column": 19, "line": 4, "path": "missing.cc"}),
-        ("Inline function 'InlineAddress' is odr-used, but no definition is "
-         "visible; include its inline-definition provider before linking.",
-         {"column": 29, "line": 5, "path": "missing.cc"}),
-        ("Inline function 'InlineLifecycle::AddressMember' is odr-used, but "
-         "no definition is visible; include its inline-definition provider "
-         "before linking.",
-         {"column": 26, "line": 6, "path": "missing.cc"}),
-        ("Inline function 'InlineLifecycle::Member' is odr-used, but no "
-         "definition is visible; include its inline-definition provider "
-         "before linking.",
-         {"column": 16, "line": 7, "path": "missing.cc"}),
-        ("Inline function 'InlineFree' is odr-used, but no definition is "
-         "visible; include its inline-definition provider before linking.",
-         {"column": 27, "line": 7, "path": "missing.cc"}),
-        ("Inline function 'InlineTemplate' is odr-used, but no definition is "
-         "visible; include its inline-definition provider before linking.",
-         {"column": 38, "line": 8, "path": "missing.cc"}),
-    ]
+    assert [fact["location"]["value"]["line"] for fact in facts] == [
+        4, 4, 5, 6, 7, 7, 8]
+    assert all("inline-definition provider" in fact["message"]
+               for fact in facts)
 
-    contexts = analyze("contexts.cc")
-    assert not [diagnostic for diagnostic in contexts["diagnostics"]
-                if diagnostic["code"] == "missing_inline_definition"]
-
-    pure_pointer = analyze("pure_virtual_pointer.cc")
-    assert pure_pointer["status"] == "correct"
-    assert pure_pointer["operations"] == []
-    assert pure_pointer["diagnostics"] == []
-    assert pure_pointer["desired_state"]["items"] == []
-
-    pure_qualified = analyze("pure_virtual_qualified.cc")
-    pure_qualified_facts = [
-        diagnostic for diagnostic in pure_qualified["diagnostics"]
-        if diagnostic["code"] == "missing_inline_definition"]
-    assert [(fact["message"], fact["location"]["value"])
-            for fact in pure_qualified_facts] == [
-        ("Inline function 'PureBase::MissingBody' is odr-used, but no "
-         "definition is visible; include its inline-definition provider "
-         "before linking.",
-         {"column": 49, "line": 8, "path": "pure_virtual_qualified.cc"}),
-    ]
-
-    control = analyze("control.cc")
-    assert not [diagnostic for diagnostic in control["diagnostics"]
-                if diagnostic["code"] == "missing_inline_definition"]
+    contexts, _ = analyze("contexts.cc")
+    assert definition_diagnostics(contexts) == []
+    pure_pointer, _ = analyze("pure_virtual_pointer.cc")
+    assert definition_diagnostics(pure_pointer) == []
+    pure_qualified, _ = analyze("pure_virtual_qualified.cc")
+    assert [fact["code"] for fact in definition_diagnostics(pure_qualified)] == [
+        "missing_inline_definition"]
+    control, _ = analyze("control.cc")
+    assert definition_diagnostics(control) == []
     assert [(op["subject_action"], op["disposition"], op["spelling"])
             for op in control["operations"]] == [
         ("remove", "apply", '#include "unused.inline.hpp"')]
+
+    template_available, _ = analyze("template_available.cc")
+    assert definition_diagnostics(template_available) == []
+    keep = semantic_keeps(template_available)
+    assert len(keep) == 1
+    assert_provider_keep(keep[0], '#include "template_bodies.hpp"', [
+        "template_available.cc", "template_bodies.hpp", "templates.hpp"])
+    qualified = {symbol["qualified_name"]["value"]
+                 for symbol in keep[0]["symbols"]}
+    assert {"TemplateFunction", "TemplateBox<int>::Member",
+            "TemplateBox<int>::AddressMember",
+            "TemplateBox<int>::MemberTemplate"} <= qualified
+
+    template_missing, _ = analyze("template_missing.cc")
+    missing_templates = [fact for fact in definition_diagnostics(template_missing)
+                         if fact["code"] == "missing_template_definition"]
+    names = {fact["message"].split("'")[1] for fact in missing_templates}
+    assert {"TemplateFunction", "TemplateBox<int>::TemplateBox",
+            "TemplateBox<int>::~TemplateBox", "TemplateBox<int>::Member",
+            "TemplateBox<int>::AddressMember",
+            "TemplateBox<int>::MemberTemplate"} <= names
+    assert not [op for op in template_missing["operations"]
+                if op["subject_action"] == "add"]
+
+    template_contexts, _ = analyze("template_contexts.cc")
+    assert definition_diagnostics(template_contexts) == []
+
+    extern_consumer, _ = analyze("extern_consumer.cc")
+    assert definition_diagnostics(extern_consumer) == []
+    assert semantic_keeps(extern_consumer) == []
+    late_extern, _ = analyze("late_extern.cc")
+    assert [fact["code"] for fact in definition_diagnostics(late_extern)] == [
+        "missing_template_definition"]
+    assert definition_diagnostics(late_extern)[0]["location"]["value"]["line"] == 3
+    for feature in (0, 1):
+        conditional_extern, _ = analyze(
+            "conditional_extern.cc", f"-DFEATURE={feature}")
+        assert [fact["code"] for fact in
+                definition_diagnostics(conditional_extern)] == [
+            "missing_template_definition"]
+    instantiations, _ = analyze("extern_instantiations.cc")
+    assert definition_diagnostics(instantiations) == []
+    instantiation_keep = semantic_keeps(instantiations)[0]
+    assert_provider_keep(instantiation_keep,
+                         '#include "template_bodies.hpp"', [
+                             "extern_instantiations.cc",
+                             "template_bodies.hpp"])
+    instantiation_names = {symbol["qualified_name"]["value"]
+                           for symbol in instantiation_keep["symbols"]}
+    assert "TemplateFunction" in instantiation_names
+    assert "TemplateBox<int>::TemplateBox" in instantiation_names
+    assert all(use["location"]["line"] <= 4
+               for symbol in instantiation_keep["symbols"]
+               for use in symbol["uses"])
+
+    direct_after, _ = analyze("direct_after.cc")
+    assert definition_diagnostics(direct_after) == []
+    body_keep = next(op for op in semantic_keeps(direct_after)
+                     if op["spelling"] == '#include "api.inline.hpp"')
+    assert_provider_keep(body_keep,
+                         '#include "api.inline.hpp"',
+                         ["direct_after.cc", "api.inline.hpp"])
+    assert body_keep["source_range"]["value"]["start"]["line"] == 5
+
+    dominating, _ = analyze("conditional_dominating.cc", "-DFEATURE=1")
+    assert definition_diagnostics(dominating) == []
+    dominating_body = next(
+        op for op in semantic_keeps(dominating)
+        if op["spelling"] == '#include "api.inline.hpp"')
+    assert dominating_body["edit_condition"]["status"] == "known"
+    inactive, _ = analyze("conditional_dominating.cc", "-DFEATURE=0")
+    assert definition_diagnostics(inactive) == []
+
+    nondominating, _ = analyze("conditional_nondominating.cc", "-DFEATURE=1")
+    assert [fact["code"] for fact in definition_diagnostics(nondominating)] == [
+        "definition_provider_unproven"]
+    assert semantic_keeps(nondominating) == []
+    nondominating_inactive, _ = analyze(
+        "conditional_nondominating.cc", "-DFEATURE=0")
+    assert [fact["code"] for fact in
+            definition_diagnostics(nondominating_inactive)] == [
+        "missing_inline_definition"]
+
+    exported, _ = analyze("export_consumer.cc")
+    assert definition_diagnostics(exported) == []
+    assert_provider_keep(semantic_keeps(exported)[0],
+                         '#include "export_carrier.hpp"', [
+                             "export_consumer.cc", "export_carrier.hpp",
+                             "template_bodies.hpp"])
+
+    mapped, _ = analyze("mapped_consumer.cc", "-Xiwyu",
+                        "--mapping_file=providers.imp")
+    assert definition_diagnostics(mapped) == []
+    assert_provider_keep(semantic_keeps(mapped)[0],
+                         '#include "mapped_carrier.hpp"', [
+                             "mapped_consumer.cc", "mapped_carrier.hpp",
+                             "template_bodies.hpp"])
+
+    repeated_zero, _ = analyze("repeated_provider.cc", "-DFEATURE=0")
+    assert definition_diagnostics(repeated_zero) == []
+    assert_provider_keep(semantic_keeps(repeated_zero)[0],
+                         '#include "repeat_second.hpp"', [
+                             "repeated_provider.cc", "repeat_second.hpp",
+                             "template_bodies.hpp"])
+    repeated_one, _ = analyze("repeated_provider.cc", "-DFEATURE=1")
+    assert [fact["code"] for fact in definition_diagnostics(repeated_one)] == [
+        "definition_provider_unproven"]
+    assert semantic_keeps(repeated_one) == []
+
+    associated, associated_records = analyze("associated_consumer.cc")
+    assert definition_diagnostics(associated) == []
+    assert_provider_keep(semantic_keeps(associated)[0],
+                         '#include "associated_owner.hpp"  // IWYU pragma: associated', [
+                             "associated_consumer.cc", "associated_owner.hpp",
+                             "template_bodies.hpp"])
+    assert [(op["subject_action"], op["disposition"], op["reason_code"])
+            for op in associated["operations"]
+            if op["spelling"] == '#include "template_bodies.hpp"'] == [
+        ("add", "suppress", "provided_by_associated_header")]
+    owner = next(record for record in associated_records
+                 if record["file"]["path"] == "associated_owner.hpp")
+    assert semantic_keeps(owner)
+
+    # Both published schemas carry the same generic provider semantics.
+    schema_two, _ = analyze("template_available.cc", schema=2)
+    schema_two_keep = semantic_keeps(schema_two)[0]
+    assert schema_two["schema_version"] == 2
+    assert all(symbol["declaration_kind"] == {
+        "status": "unavailable", "value": None}
+        for symbol in schema_two_keep["symbols"])
+
+
+def assert_link_fails(object_file, executable, symbols, cwd=CORPUS):
+    link = subprocess.run([str(CXX), str(object_file), "-o", str(executable)],
+                          cwd=cwd, text=True, capture_output=True)
+    assert link.returncode != 0, link.stdout + link.stderr
+    output = link.stdout + link.stderr
+    for symbol in symbols:
+        assert symbol in output, output
 
 
 def assert_gcc_backstop(corpus=CORPUS):
     with tempfile.TemporaryDirectory(prefix="sem004-gcc-", dir=ROOT / "build") as tmp:
         out = Path(tmp)
-        available = out / "available"
-        run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "available.cc",
-             "-o", available], cwd=corpus)
-        run([available], cwd=corpus)
+        for source in ("available.cc", "contexts.cc", "pure_virtual_pointer.cc",
+                       "template_available.cc", "template_contexts.cc",
+                       "direct_after.cc", "export_consumer.cc",
+                       "mapped_consumer.cc", "associated_consumer.cc"):
+            executable = out / source.removesuffix(".cc")
+            run([CXX, "-std=c++17", "-fno-inline", "-I", ".", source,
+                 "-o", executable], cwd=corpus)
+            run([executable], cwd=corpus)
 
         control = out / "control"
         run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "control.cc",
@@ -130,58 +265,84 @@ def assert_gcc_backstop(corpus=CORPUS):
         missing_object = out / "missing.o"
         run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "-c",
              "missing.cc", "-o", missing_object], cwd=corpus)
-        link = subprocess.run([str(CXX), str(missing_object), "-o",
-                               str(out / "missing")], cwd=corpus,
-                              text=True, capture_output=True)
-        assert link.returncode != 0, link.stdout + link.stderr
-        linker_output = link.stdout + link.stderr
-        for symbol in ("InlineLifecycle::InlineLifecycle()",
-                       "InlineLifecycle::AddressMember() const",
-                       "InlineLifecycle::Member() const", "InlineAddress(int)",
-                       "InlineFree(int)", "int InlineTemplate<int>(int)",
-                       "InlineLifecycle::~InlineLifecycle()"):
-            assert symbol in linker_output, linker_output
+        assert_link_fails(missing_object, out / "missing", [
+            "InlineLifecycle::InlineLifecycle()", "InlineAddress(int)",
+            "InlineFree(int)", "int InlineTemplate<int>(int)"], cwd=corpus)
 
-        contexts = out / "contexts"
-        run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "contexts.cc",
-             "-o", contexts], cwd=corpus)
-        run([contexts], cwd=corpus)
+        template_missing_object = out / "template_missing.o"
+        run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "-c",
+             "template_missing.cc", "-o", template_missing_object], cwd=corpus)
+        assert_link_fails(template_missing_object, out / "template_missing", [
+            "int TemplateFunction<int>(int)",
+            "TemplateBox<int>::TemplateBox()",
+            "TemplateBox<int>::Member() const"], cwd=corpus)
 
-        pure_pointer = out / "pure_virtual_pointer"
-        run([CXX, "-std=c++17", "-fno-inline", "-I", ".",
-             "pure_virtual_pointer.cc", "-o", pure_pointer], cwd=corpus)
-        run([pure_pointer], cwd=corpus)
+        late_extern_object = out / "late_extern.o"
+        run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "-c",
+             "late_extern.cc", "-o", late_extern_object], cwd=corpus)
+        assert_link_fails(late_extern_object, out / "late_extern", [
+            "int TemplateFunction<int>(int)"], cwd=corpus)
+
+        instantiations = out / "extern_instantiations.o"
+        consumer = out / "extern_consumer.o"
+        run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "-c",
+             "extern_instantiations.cc", "-o", instantiations], cwd=corpus)
+        run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "-c",
+             "extern_consumer.cc", "-o", consumer], cwd=corpus)
+        extern_program = out / "extern_consumer"
+        run([CXX, consumer, instantiations, "-o", extern_program], cwd=corpus)
+        run([extern_program], cwd=corpus)
+
+        for feature in (0, 1):
+            for source in ("conditional_dominating.cc", "repeated_provider.cc"):
+                executable = out / f"{source.removesuffix('.cc')}-{feature}"
+                run([CXX, "-std=c++17", "-fno-inline", "-I", ".",
+                     f"-DFEATURE={feature}", source, "-o", executable], cwd=corpus)
+                run([executable], cwd=corpus)
+        nondominating = out / "conditional_nondominating-1"
+        run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "-DFEATURE=1",
+             "conditional_nondominating.cc", "-o", nondominating], cwd=corpus)
+        run([nondominating], cwd=corpus)
+        nondominating_object = out / "conditional_nondominating-0.o"
+        run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "-DFEATURE=0",
+             "-c", "conditional_nondominating.cc", "-o",
+             nondominating_object], cwd=corpus)
+        assert_link_fails(nondominating_object,
+                          out / "conditional_nondominating-0",
+                          ["InlineFree(int)"], cwd=corpus)
 
         pure_qualified_object = out / "pure_virtual_qualified.o"
         run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "-c",
              "pure_virtual_qualified.cc", "-o", pure_qualified_object],
             cwd=corpus)
-        pure_qualified_link = subprocess.run(
-            [str(CXX), str(pure_qualified_object), "-o",
-             str(out / "pure_virtual_qualified")], cwd=corpus,
-            text=True, capture_output=True)
-        assert pure_qualified_link.returncode != 0, (
-            pure_qualified_link.stdout + pure_qualified_link.stderr)
-        assert "PureBase::MissingBody()" in (
-            pure_qualified_link.stdout + pure_qualified_link.stderr)
+        assert_link_fails(pure_qualified_object, out / "pure_virtual_qualified",
+                          ["PureBase::MissingBody()"], cwd=corpus)
 
 
 def assert_fixer_idempotence():
     with tempfile.TemporaryDirectory(prefix="sem004-fix-", dir=ROOT / "build") as tmp:
         corpus = Path(tmp) / "inline_definition_availability"
         shutil.copytree(CORPUS, corpus)
-        for filename in ("available.cc", "contexts.cc", "control.cc",
-                         "pure_virtual_pointer.cc",
-                         "pure_virtual_qualified.cc"):
-            first = run([IWYU, "-I", ".", "-std=c++17", filename], cwd=corpus)
+        cases = {
+            "available.cc": [], "contexts.cc": [], "control.cc": [],
+            "pure_virtual_pointer.cc": [], "template_available.cc": [],
+            "template_contexts.cc": [],
+            "export_consumer.cc": [], "mapped_consumer.cc": [
+                "-Xiwyu", "--mapping_file=providers.imp"],
+            "conditional_dominating.cc": ["-DFEATURE=1"],
+            "repeated_provider.cc": ["-DFEATURE=0"],
+            "extern_consumer.cc": [], "extern_instantiations.cc": [],
+        }
+        for filename, options in cases.items():
+            command = [IWYU, "-I", ".", "-std=c++17", *options, filename]
+            first = run(command, cwd=corpus)
             run([sys.executable, ROOT / "fix_includes.py", "--nosafe_headers",
                  "--nocomments", "--noblank_lines"], cwd=corpus,
                 stdin=first.stderr)
-            second = run([IWYU, "-I", ".", "-std=c++17", filename], cwd=corpus)
+            second = run(command, cwd=corpus)
             assert "should add these lines:" not in second.stderr, second.stderr
             assert "should remove these lines:" not in second.stderr, second.stderr
-        assert '#include "api.inline.hpp"' in (
-            corpus / "available.cc").read_text()
+        assert '#include "api.inline.hpp"' in (corpus / "available.cc").read_text()
         assert "unused.inline.hpp" not in (corpus / "control.cc").read_text()
         assert_gcc_backstop(corpus)
 
@@ -190,4 +351,4 @@ if __name__ == "__main__":
     assert_analyzer_contracts()
     assert_gcc_backstop()
     assert_fixer_idempotence()
-    print("SEM-004 inline-definition availability contracts passed")
+    print("generic SEM-004 definition-availability contracts passed")

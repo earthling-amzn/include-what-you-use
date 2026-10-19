@@ -1,0 +1,4 @@
+#ifndef TESTS_INLINE_DEFINITION_AVAILABILITY_REPEAT_FIRST_HPP_
+#define TESTS_INLINE_DEFINITION_AVAILABILITY_REPEAT_FIRST_HPP_
+#include "template_bodies.hpp"  // IWYU pragma: export
+#endif

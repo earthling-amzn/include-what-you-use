@@ -280,6 +280,42 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
       clang::SourceLocation declaration_loc,
       clang::SourceLocation use_loc) const;
 
+  // One physically entered include edge. FileIDs distinguish repeated
+  // entries of the same FileEntry; location identifies the exact directive.
+  struct ProviderOccurrence {
+    const clang::FileEntry* includer = nullptr;
+    const clang::FileEntry* includee = nullptr;
+    string spelling;
+    clang::SourceLocation location;
+    clang::FileID includer_file_id;
+    clang::FileID includee_file_id;
+  };
+
+  struct DefinitionProviderCoverage {
+    DirectIncludeCoverage status = DirectIncludeCoverage::kUnknown;
+    vector<ProviderOccurrence> chain;
+  };
+
+  // Proves inline/template-definition availability through one concrete
+  // entered ancestry. The selected root is supplied by IncludePicker, which
+  // proves public/export intent; this query independently proves the physical
+  // FileID chain and condition coverage. Nested edges must be unconditional.
+  // allow_later_root implements the C++ rule that an ordinary inline
+  // definition may be introduced later in the same definition domain.
+  DefinitionProviderCoverage DefinitionProviderCoverageAt(
+      const clang::FileEntry* includer, const string& selected_spelling,
+      const string& selected_path, clang::SourceLocation definition_loc,
+      clang::SourceLocation use_loc, bool allow_later_root) const;
+
+  // The associated owner is one exact root hop. The selected provider must
+  // occur on that same entered ancestry; no FileEntry-union chain is inferred.
+  DefinitionProviderCoverage AssociatedDefinitionProviderCoverageAt(
+      const clang::FileEntry* includer,
+      const clang::FileEntry* associated_header,
+      const string& selected_spelling, const string& selected_path,
+      clang::SourceLocation definition_loc,
+      clang::SourceLocation use_loc, bool allow_later_root) const;
+
   // Proves only the root associated-header occurrence and declaration
   // instance, for forward declarations supplied by the associated header.
   DirectIncludeCoverage AssociatedDeclarationCoverageAt(

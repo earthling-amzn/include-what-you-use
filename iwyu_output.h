@@ -433,6 +433,23 @@ class IwyuFileInfo {
       const string& qualified_name,
       clang::SourceLocation declaration_location);
 
+  // Pins one exact physical include directive as a definition provider. The
+  // selected provider and concrete chain are emitted on the keep operation;
+  // duplicate pruning must not substitute a same-spelling occurrence.
+  void ReportSemanticDefinitionProvider(
+      clang::SourceLocation include_location,
+      const clang::FileEntry* included_file,
+      const clang::FunctionDecl* function,
+      clang::SourceLocation use_location,
+      clang::SourceLocation definition_location,
+      const string& selected_spelling,
+      const string& selected_path,
+      const vector<string>& chain);
+
+  set<const clang::FileEntry*> SemanticAssociatedFileEntries() const {
+    return AssociatedFileEntries();
+  }
+
   // Retains a recoverable analysis diagnostic for schema-v1 JSON output.
   // Returns true when a new diagnostic was inserted.
   bool AddStructuredDiagnostic(clang::SourceLocation location,
@@ -478,6 +495,15 @@ class IwyuFileInfo {
     string reason_code;
     string reason;
   };
+  struct SemanticDefinitionProviderFact {
+    const clang::FunctionDecl* function;
+    clang::SourceLocation include_location;
+    clang::SourceLocation use_location;
+    clang::SourceLocation definition_location;
+    string selected_spelling;
+    string selected_path;
+    vector<string> chain;
+  };
   struct MacroBodyDependencyFact {
     string macro_name;
     clang::SourceLocation macro_definition_location;
@@ -513,9 +539,15 @@ class IwyuFileInfo {
 
   set<string> AssociatedDesiredIncludes() const {
     set<string> associated_desired_includes;
-    for (const IwyuFileInfo* associated : associated_headers_)
+    for (const IwyuFileInfo* associated : associated_headers_) {
       InsertAllInto(associated->desired_includes(),
                     &associated_desired_includes);
+      for (const auto& line_facts :
+           associated->semantic_definition_provider_facts_) {
+        for (const SemanticDefinitionProviderFact& fact : line_facts.second)
+          associated_desired_includes.insert(fact.selected_spelling);
+      }
+    }
     return associated_desired_includes;
   }
 
@@ -568,6 +600,9 @@ class IwyuFileInfo {
   map<const clang::FileEntry*, KeepReason> kept_include_reasons_;
   map<const clang::FileEntry*, vector<MacroBodyDependencyFact>>
       macro_body_dependency_facts_;
+  map<int, vector<SemanticDefinitionProviderFact>>
+      semantic_definition_provider_facts_;
+  set<int> semantic_definition_provider_lines_;
   vector<StructuredDiagnostic> structured_diagnostics_;
 
   // Holds files using macros defined in this file.
