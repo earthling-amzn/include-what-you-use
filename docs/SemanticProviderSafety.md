@@ -32,9 +32,10 @@ unavailable rather than guessing from the filesystem.
 
 SEM-004 creates a concrete body obligation for each potentially evaluated ODR
 use of an ordinary semantically-inline function, an implicit function-template
-specialization, or an instantiated class-template member. Each source-written
-explicit-instantiation definition owns one obligation at its recovered request
-point. A prior selected `extern template` declaration transfers body ownership to
+specialization, or an instantiated class-template member. Every specialization
+whose final semantic kind is an explicit-instantiation definition owns one
+obligation for its actual source-written body/pattern. A prior selected `extern
+template` declaration transfers body ownership to
 another translation unit. Explicit non-inline specializations retain ordinary
 out-of-line ownership.
 
@@ -67,17 +68,20 @@ lifecycle destroys the base; forming a member pointer or making a virtual call
 to other pure methods remains excluded, while an explicitly qualified pure call
 still requires its body.
 
-An explicit-instantiation definition is recovered from its source-written
-non-`extern` `template` request even when Clang keeps an earlier `extern
-template` location as the specialization's point of instantiation. The request
-is accepted only when the final specialization is an explicit definition, its
-instantiation pattern has a selected source-written body (including `= default`),
-and the recovered request is active and names that function or enclosing class.
-Explicit-instantiation declarations create no local body obligation. Multiple
-same-name requests receive distinct source points, while members produced by one
-explicit class instantiation share its class request. This source point anchors
-the exact entered body-provider proof and is retained in both structured output
-and the legacy fixer projection.
+An explicit-instantiation definition is selected only from Clang's final
+`TSK_ExplicitInstantiationDefinition` semantic kind. The specialization is
+peeled through its function-template or instantiated-member pattern to the
+actual source-written body, including `= default`. No request line is recovered:
+the implementation does not pair declarations by identifier, qualified name,
+or source/traversal order. If the body is outside the analyzed file, its exact
+entered `FileID` ancestry identifies every concrete direct root occurrence that
+delivered it. Each root is retained and owns a source-local use fact at the
+include directive. Skipped duplicate routes have no entered `FileID` and cannot
+substitute; if distinct entered routes reach the same body source offset, all
+of their concrete roots are retained. A same-file body needs no provider
+include. Explicit-instantiation declarations create no local body obligation.
+Mapped, exported, and associated roots keep the existing exact entered-ancestry
+and selected-root provider-chain output contracts.
 
 A definition is available only through one concrete entered `FileID` ancestry.
 IncludePicker supplies candidate public, mapping-file, pragma-export, and

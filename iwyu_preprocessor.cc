@@ -3000,6 +3000,129 @@ IwyuPreprocessorInfo::AssociatedProviderCoverageAt(
                  : DirectIncludeCoverage::kDoesNotCoverUse;
 }
 
+vector<IwyuPreprocessorInfo::DefinitionProviderCoverage>
+IwyuPreprocessorInfo::EnteredDefinitionProviderCoverages(
+    const FileEntry* includer, SourceLocation definition_loc) const {
+  vector<DefinitionProviderCoverage> coverages;
+  if (!includer || definition_loc.isInvalid())
+    return coverages;
+
+  const auto& source_manager = preprocessor_->getSourceManager();
+  SourceLocation definition = source_manager.getExpansionLoc(definition_loc);
+  if (definition.isInvalid() || !definition.isFileID())
+    return coverages;
+  const FileID definition_id = source_manager.getFileID(definition);
+  const FileEntry* definition_file =
+      source_manager.getFileEntryForID(definition_id);
+  if (definition_id.isInvalid() || !definition_file)
+    return coverages;
+
+  // A source-written body in the analyzed file has no provider include.
+  if (definition_file == includer)
+    return coverages;
+
+  vector<FileID> body_instances;
+  const auto entered = entered_file_ids_.find(definition_file);
+  if (entered != entered_file_ids_.end())
+    body_instances = entered->second;
+  if (std::find(body_instances.begin(), body_instances.end(), definition_id) ==
+      body_instances.end()) {
+    body_instances.push_back(definition_id);
+  }
+
+  const unsigned definition_offset = source_manager.getFileOffset(definition);
+  set<std::tuple<unsigned, unsigned, unsigned>> seen_roots;
+  for (FileID body_id : body_instances) {
+    if (body_id.isInvalid())
+      continue;
+    SourceLocation instance_definition =
+        source_manager.getLocForStartOfFile(body_id).getLocWithOffset(
+            definition_offset);
+    const ActiveCondition body_condition =
+        ActiveConditionAt(instance_definition);
+    if (body_id != definition_id &&
+        (body_condition.status == ActiveCondition::Status::kUnknown ||
+         (body_condition.status == ActiveCondition::Status::kKnown &&
+          !body_condition.active_branch))) {
+      continue;
+    }
+
+    vector<ProviderOccurrence> reverse_chain;
+    FileID current = body_id;
+    bool reached_includer = false;
+    for (unsigned depth = 0; depth < 256; ++depth) {
+      SourceLocation include_loc = source_manager.getExpansionLoc(
+          source_manager.getIncludeLoc(current));
+      if (include_loc.isInvalid() || !include_loc.isFileID())
+        break;
+      const FileID parent = source_manager.getFileID(include_loc);
+      if (parent.isInvalid())
+        break;
+
+      const DirectIncludeCondition* exact = nullptr;
+      for (const DirectIncludeCondition& include :
+           direct_include_conditions_) {
+        const SourceLocation observed =
+            source_manager.getExpansionLoc(include.location);
+        if (include.includee_file_id != current || observed.isInvalid() ||
+            !observed.isFileID() || observed != include_loc ||
+            source_manager.getFileID(observed) != parent) {
+          continue;
+        }
+        if (!exact)
+          exact = &include;
+      }
+      if (!exact || !exact->includer || !exact->includee) {
+        reverse_chain.clear();
+        break;
+      }
+      reverse_chain.push_back(
+          {exact->includer, exact->includee, exact->quoted_include,
+           exact->location, parent, exact->includee_file_id});
+      current = parent;
+      if (source_manager.getFileEntryForID(current) == includer) {
+        reached_includer = true;
+        break;
+      }
+    }
+    if (!reached_includer || reverse_chain.empty())
+      continue;
+
+    std::reverse(reverse_chain.begin(), reverse_chain.end());
+    const ProviderOccurrence& root = reverse_chain.front();
+    if (root.includer != includer)
+      continue;
+    const auto root_key = std::make_tuple(
+        root.location.getRawEncoding(), root.includer_file_id.getHashValue(),
+        root.includee_file_id.getHashValue());
+    if (!seen_roots.insert(root_key).second)
+      continue;
+    DefinitionProviderCoverage coverage;
+    coverage.status = DirectIncludeCoverage::kCoversUse;
+    coverage.chain = std::move(reverse_chain);
+    coverages.push_back(std::move(coverage));
+  }
+
+  std::sort(coverages.begin(), coverages.end(),
+            [&](const DefinitionProviderCoverage& lhs,
+                const DefinitionProviderCoverage& rhs) {
+              const ProviderOccurrence& lhs_root = lhs.chain.front();
+              const ProviderOccurrence& rhs_root = rhs.chain.front();
+              const SourceLocation lhs_loc =
+                  source_manager.getExpansionLoc(lhs_root.location);
+              const SourceLocation rhs_loc =
+                  source_manager.getExpansionLoc(rhs_root.location);
+              if (source_manager.getFileID(lhs_loc) ==
+                  source_manager.getFileID(rhs_loc)) {
+                return source_manager.getFileOffset(lhs_loc) <
+                       source_manager.getFileOffset(rhs_loc);
+              }
+              return lhs_root.location.getRawEncoding() <
+                     rhs_root.location.getRawEncoding();
+            });
+  return coverages;
+}
+
 IwyuPreprocessorInfo::DefinitionProviderCoverage
 IwyuPreprocessorInfo::DefinitionProviderCoverageAt(
     const FileEntry* includer, const string& selected_spelling,

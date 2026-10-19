@@ -324,7 +324,7 @@ def assert_analyzer_contracts():
         "ExplicitMemberBox<int>::Member"}
     assert {use["location"]["line"]
             for symbol in explicit_keeps[0]["symbols"]
-            for use in symbol["uses"]} == {3, 4, 5, 6}
+            for use in symbol["uses"]} == {1}
 
     body_first, _ = analyze("explicit_body_first.cc", schema=2)
     assert definition_diagnostics(body_first) == []
@@ -367,6 +367,73 @@ def assert_analyzer_contracts():
     explicit_declaration, _ = analyze(
         "explicit_declaration_only.cc", schema=2)
     assert semantic_keeps(explicit_declaration) == []
+
+    ambiguity_cases = {
+        "ambiguity_free": {
+            '#include "ambiguity_free_two_carrier.hpp"':
+                "AmbiguousClash",
+            '#include "ambiguity_free_one_carrier.hpp"':
+                "AmbiguousClash",
+        },
+        "ambiguity_member": {
+            '#include "ambiguity_member_two_carrier.hpp"':
+                "AmbiguousMemberBox<int>::Second",
+            '#include "ambiguity_member_one_carrier.hpp"':
+                "AmbiguousMemberBox<int>::First",
+        },
+        "ambiguity_class": {
+            '#include "ambiguity_class_two_carrier.hpp"':
+                "AmbiguousTwo::Box<int>::Get",
+            ('#include "ambiguity_class_one_carrier.hpp"  '
+             '// IWYU pragma: associated'):
+                "AmbiguousOne::Box<int>::Get",
+        },
+    }
+    for stem, expected_roots in ambiguity_cases.items():
+        active, _ = analyze(
+            f"{stem}.cc", "-DFEATURE=1", "-Xiwyu",
+            f"--mapping_file={stem}.imp", schema=2)
+        assert definition_diagnostics(active) == []
+        keeps = semantic_keeps(active)
+        assert {operation["spelling"] for operation in keeps} == \
+            set(expected_roots)
+        for operation in keeps:
+            spelling = operation["spelling"]
+            assert_provider_keep(operation, spelling, [
+                f"{stem}.cc",
+                spelling.split('"')[1],
+            ])
+            assert [symbol["qualified_name"]["value"]
+                    for symbol in operation["symbols"]] == [
+                        expected_roots[spelling]]
+            expected_line = 3 if "two_carrier" in spelling else 6
+            assert {use["location"]["line"]
+                    for symbol in operation["symbols"]
+                    for use in symbol["uses"]} == {expected_line}
+        duplicate = f'#include "{stem}_duplicate_carrier.hpp"'
+        assert [(operation["subject_action"], operation["disposition"])
+                for operation in active["operations"]
+                if operation["spelling"] == duplicate] == [
+            ("remove", "apply")]
+
+        inactive, _ = analyze(
+            f"{stem}.cc", "-DFEATURE=0", "-Xiwyu",
+            f"--mapping_file={stem}.imp", schema=2)
+        assert definition_diagnostics(inactive) == []
+        inactive_keeps = semantic_keeps(inactive)
+        expected_one = f'#include "{stem}_one_carrier.hpp"'
+        if stem == "ambiguity_class":
+            expected_one += "  // IWYU pragma: associated"
+        assert [operation["spelling"] for operation in inactive_keeps] == [
+            expected_one]
+        assert all(use["location"]["path"] == f"{stem}.cc"
+                   for operation in inactive_keeps
+                   for symbol in operation["symbols"]
+                   for use in symbol["uses"])
+
+    explicit_same_file, _ = analyze("explicit_same_file.cc", schema=2)
+    assert semantic_keeps(explicit_same_file) == []
+    assert definition_diagnostics(explicit_same_file) == []
     assert definition_diagnostics(explicit_declaration) == []
     assert [(operation["subject_action"], operation["disposition"],
              operation["spelling"])
@@ -505,6 +572,19 @@ def assert_driver_contracts():
             "-Xiwyu", "--mapping_file=explicit_providers.imp"]),
         ("explicit_conditional.cc", ["-DFEATURE=1"]),
         ("explicit_declaration_only.cc", []),
+        ("ambiguity_free.cc", ["-DFEATURE=1", "-Xiwyu",
+                               "--mapping_file=ambiguity_free.imp"]),
+        ("ambiguity_free.cc", ["-DFEATURE=0", "-Xiwyu",
+                               "--mapping_file=ambiguity_free.imp"]),
+        ("ambiguity_member.cc", ["-DFEATURE=1", "-Xiwyu",
+                                 "--mapping_file=ambiguity_member.imp"]),
+        ("ambiguity_member.cc", ["-DFEATURE=0", "-Xiwyu",
+                                 "--mapping_file=ambiguity_member.imp"]),
+        ("ambiguity_class.cc", ["-DFEATURE=1", "-Xiwyu",
+                                "--mapping_file=ambiguity_class.imp"]),
+        ("ambiguity_class.cc", ["-DFEATURE=0", "-Xiwyu",
+                                "--mapping_file=ambiguity_class.imp"]),
+        ("explicit_same_file.cc", []),
     ]
     records = analyze_with_driver(entries)
 
@@ -593,6 +673,43 @@ def assert_driver_contracts():
                '#include "explicit_body_first.inline.hpp"'] == [
         ("remove", "apply")]
 
+    ambiguity_driver_cases = {
+        17: ("ambiguity_free", {"two", "one"}),
+        18: ("ambiguity_free", {"one"}),
+        19: ("ambiguity_member", {"two", "one"}),
+        20: ("ambiguity_member", {"one"}),
+        21: ("ambiguity_class", {"two", "one"}),
+        22: ("ambiguity_class", {"one"}),
+    }
+    for index, (stem, routes) in ambiguity_driver_cases.items():
+        record = source_records[index]
+        assert definition_diagnostics(record) == []
+        expected_spelling = {
+            f'#include "{stem}_{route}_carrier.hpp"' for route in routes}
+        if stem == "ambiguity_class" and "one" in routes:
+            expected_spelling.remove(
+                '#include "ambiguity_class_one_carrier.hpp"')
+            expected_spelling.add(
+                '#include "ambiguity_class_one_carrier.hpp"  '
+                '// IWYU pragma: associated')
+        assert {operation["spelling"]
+                for operation in semantic_keeps(record)} == expected_spelling
+        for operation in semantic_keeps(record):
+            route = ("two" if "_two_carrier" in operation["spelling"]
+                     else "one")
+            expected_line = 3 if route == "two" else 6
+            assert {use["location"]["line"]
+                    for symbol in operation["symbols"]
+                    for use in symbol["uses"]} == {expected_line}
+        assert [(operation["subject_action"], operation["disposition"])
+                for operation in record["operations"]
+                if operation["spelling"] ==
+                   f'#include "{stem}_duplicate_carrier.hpp"'] == [
+            ("remove", "apply")]
+
+    assert semantic_keeps(source_records[23]) == []
+    assert definition_diagnostics(source_records[23]) == []
+
     owner = next(record for record in records
                  if record["invocation"]["index"] == 5 and
                  record["file"]["path"].endswith("associated_owner.hpp"))
@@ -614,7 +731,8 @@ def assert_gcc_backstop(corpus=CORPUS):
                        "uninstantiated_nondependent.cc",
                        "explicit_instantiations.cc",
                        "explicit_body_first.cc", "explicit_export.cc",
-                       "explicit_mapped.cc", "explicit_declaration_only.cc"):
+                       "explicit_mapped.cc", "explicit_declaration_only.cc",
+                       "explicit_same_file.cc"):
             executable = out / source.removesuffix(".cc")
             run([CXX, "-std=c++17", "-fno-inline", "-I", ".", source,
                  "-o", executable], cwd=corpus)
@@ -659,7 +777,9 @@ def assert_gcc_backstop(corpus=CORPUS):
         for feature in (0, 1):
             for source in ("conditional_dominating.cc", "repeated_provider.cc",
                            "explicit_conditional.cc",
-                           "later_definition_matching.cc"):
+                           "later_definition_matching.cc",
+                           "ambiguity_free.cc", "ambiguity_member.cc",
+                           "ambiguity_class.cc"):
                 executable = out / f"{source.removesuffix('.cc')}-{feature}"
                 run([CXX, "-std=c++17", "-fno-inline", "-I", ".",
                      f"-DFEATURE={feature}", source, "-o", executable], cwd=corpus)
@@ -731,7 +851,17 @@ def assert_fixer_idempotence():
                 "-Xiwyu", "--mapping_file=explicit_providers.imp"],
             "explicit_conditional.cc": ["-DFEATURE=1"],
             "explicit_declaration_only.cc": [],
+            "explicit_same_file.cc": [],
             "later_definition_matching.cc": ["-DFEATURE=1"],
+            "ambiguity_free.cc": [
+                "-DFEATURE=1", "-Xiwyu",
+                "--mapping_file=ambiguity_free.imp"],
+            "ambiguity_member.cc": [
+                "-DFEATURE=1", "-Xiwyu",
+                "--mapping_file=ambiguity_member.imp"],
+            "ambiguity_class.cc": [
+                "-DFEATURE=1", "-Xiwyu",
+                "--mapping_file=ambiguity_class.imp"],
         }
         for filename, options in cases.items():
             command = [IWYU, "-I", ".", "-std=c++17", *options, filename]
@@ -742,6 +872,11 @@ def assert_fixer_idempotence():
             second = run(command, cwd=corpus)
             assert "should add these lines:" not in second.stderr, second.stderr
             assert "should remove these lines:" not in second.stderr, second.stderr
+        for stem in ("ambiguity_free", "ambiguity_member", "ambiguity_class"):
+            source = (corpus / f"{stem}.cc").read_text()
+            assert f'#include "{stem}_two_carrier.hpp"' in source
+            assert f'#include "{stem}_one_carrier.hpp"' in source
+            assert f'#include "{stem}_duplicate_carrier.hpp"' not in source
         assert '#include "api.inline.hpp"' in (corpus / "available.cc").read_text()
         for filename, include in {
             "explicit_instantiations.cc":

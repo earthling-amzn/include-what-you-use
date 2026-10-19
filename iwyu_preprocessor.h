@@ -297,6 +297,16 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
     vector<ProviderOccurrence> chain;
   };
 
+  // Returns every concrete entered ancestry that delivered the source-written
+  // body at definition_loc to includer. The result is rooted at an exact direct
+  // include occurrence in includer. Equivalent entered instances of the same
+  // body source offset are retained independently; skipped includes contribute
+  // no FileID and therefore no ancestry. This query deliberately does not need
+  // or infer an explicit-instantiation request location.
+  vector<DefinitionProviderCoverage> EnteredDefinitionProviderCoverages(
+      const clang::FileEntry* includer,
+      clang::SourceLocation definition_loc) const;
+
   // Proves inline/template-definition availability through one concrete
   // entered ancestry. The selected root is supplied by IncludePicker, which
   // proves public/export intent; this query independently proves the physical

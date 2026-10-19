@@ -137,7 +137,6 @@
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendAction.h"
-#include "clang/Lex/Lexer.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/PreprocessorOptions.h"
 #include "clang/Sema/Sema.h"
@@ -1055,11 +1054,6 @@ AstFlattenerVisitor::nodeset_decl_cache_;
 // each of which gets its own copy of IwyuBaseASTVisitor data.  So to
 // share data, we need to hold it somewhere else.
 
-struct ExplicitInstantiationDefinitionSyntax {
-  SourceLocation location;
-  set<string> identifiers;
-};
-
 struct VisitorState {
   VisitorState(CompilerInstance* c, const IwyuPreprocessorInfo& ipi)
       : compiler(c), preprocessor_info(ipi) {}
@@ -1095,18 +1089,6 @@ struct VisitorState {
   // the source-written template pattern and a concrete instantiation.
   map<const Stmt*, set<const Stmt*>> potentially_evaluated_nodes;
   map<std::pair<const Expr*, bool>, bool> potentially_evaluated_exprs;
-
-  // Clang folds an explicit-instantiation definition into the specialization
-  // declaration and can retain an earlier extern-template point of
-  // instantiation. Preserve independently lexed source-written definition
-  // points so duplicate traversal sees the same exact obligation location.
-  bool explicit_instantiation_syntax_scanned = false;
-  vector<ExplicitInstantiationDefinitionSyntax>
-      explicit_instantiation_definitions;
-  map<const FunctionDecl*, SourceLocation>
-      explicit_instantiation_definition_locations;
-  map<unsigned, const FunctionDecl*>
-      explicit_instantiation_definition_location_owners;
 
   // A defaulted special member can invoke another defaulted special member.
   // Keep that generated call graph cycle-safe at each concrete use site.
@@ -3037,201 +3019,43 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     return HandleConcreteDefinitionUse(callee, expr, report_loc);
   }
 
-  void ScanExplicitInstantiationDefinitionSyntax() {
-    if (visitor_state_->explicit_instantiation_syntax_scanned)
-      return;
-    visitor_state_->explicit_instantiation_syntax_scanned = true;
-
-    const clang::SourceManager& source_manager =
-        compiler()->getSourceManager();
-    const clang::FileID file_id = source_manager.getMainFileID();
-    bool invalid = false;
-    const llvm::StringRef buffer =
-        source_manager.getBufferData(file_id, &invalid);
-    if (invalid)
-      return;
-
-    const SourceLocation file_start =
-        source_manager.getLocForStartOfFile(file_id);
-    clang::Lexer lexer(file_start, compiler()->getLangOpts(), buffer.begin(),
-                       buffer.begin(), buffer.end());
-    bool saw_extern = false;
-    clang::Token token;
-    while (true) {
-      const bool at_end = lexer.LexFromRawLexer(token);
-      if (token.is(clang::tok::eof))
-        break;
-      bool spelling_invalid = false;
-      const string spelling = clang::Lexer::getSpelling(
-          token, source_manager, compiler()->getLangOpts(),
-          &spelling_invalid);
-      if (spelling_invalid)
-        return;
-      if (spelling == ";" || spelling == "{" || spelling == "}") {
-        saw_extern = false;
-        if (at_end)
-          break;
-        continue;
-      }
-      if (spelling == "extern") {
-        saw_extern = true;
-        if (at_end)
-          break;
-        continue;
-      }
-      if (spelling != "template") {
-        if (at_end)
-          break;
-        continue;
-      }
-
-      clang::Token next;
-      lexer.LexFromRawLexer(next);
-      bool next_invalid = false;
-      const string next_spelling = clang::Lexer::getSpelling(
-          next, source_manager, compiler()->getLangOpts(), &next_invalid);
-      if (next_invalid)
-        return;
-      // A template parameter list introduces a primary/specialization, not an
-      // explicit-instantiation request. An extern request is a declaration and
-      // deliberately creates no local body obligation.
-      if (next_spelling == "<" || saw_extern) {
-        saw_extern = false;
-        continue;
-      }
-
-      ExplicitInstantiationDefinitionSyntax candidate;
-      candidate.location = token.getLocation();
-      clang::Token current = next;
-      string current_spelling = next_spelling;
-      bool complete = false;
-      while (!current.is(clang::tok::eof)) {
-        if (current_spelling == ";") {
-          complete = true;
-          break;
-        }
-        if (current.is(clang::tok::raw_identifier) ||
-            current.is(clang::tok::identifier)) {
-          candidate.identifiers.insert(current_spelling);
-        }
-        lexer.LexFromRawLexer(current);
-        bool current_invalid = false;
-        current_spelling = clang::Lexer::getSpelling(
-            current, source_manager, compiler()->getLangOpts(),
-            &current_invalid);
-        if (current_invalid)
-          return;
-      }
-      saw_extern = false;
-      if (!complete || candidate.identifiers.empty())
-        continue;
-      const auto condition =
-          preprocessor_info().ActiveConditionAt(candidate.location);
-      if (condition.status ==
-              IwyuPreprocessorInfo::ActiveCondition::Status::kUnknown ||
-          (condition.status ==
-               IwyuPreprocessorInfo::ActiveCondition::Status::kKnown &&
-           !condition.active_branch)) {
-        continue;
-      }
-      visitor_state_->explicit_instantiation_definitions.push_back(
-          std::move(candidate));
-      if (at_end)
-        break;
-    }
-  }
-
-  SourceLocation ExplicitInstantiationDefinitionLocation(
-      FunctionDecl* declaration) {
+  void HandleExplicitInstantiationDefinition(FunctionDecl* declaration) {
     if (!declaration || declaration->getTemplateSpecializationKind() !=
                             clang::TSK_ExplicitInstantiationDefinition) {
-      return SourceLocation();
-    }
-
-    // Require the semantic specialization, its instantiation pattern, and the
-    // selected source-written body. Final specialization kind alone is not
-    // evidence: Clang can preserve an earlier extern-template POI while a later
-    // explicit definition upgrades the same specialization.
-    FunctionDecl* pattern = declaration->getTemplateInstantiationPattern();
-    if (!pattern)
-      pattern = declaration->getInstantiatedFromMemberFunction();
-    const FunctionDecl* body = pattern ? pattern->getDefinition() : nullptr;
-    if (!pattern || !body || (!body->getBody() && !body->isDefaulted()))
-      return SourceLocation();
-    const SourceLocation declaration_loc = GetLocation(declaration);
-    const SourceLocation body_loc = GetLocation(body);
-    const SourceLocation point = declaration->getPointOfInstantiation();
-    if (declaration_loc.isInvalid() || body_loc.isInvalid() ||
-        GetFileEntry(declaration_loc) != GetFileEntry(body_loc) ||
-        point.isInvalid()) {
-      return SourceLocation();
-    }
-
-    const FunctionDecl* canonical = declaration->getCanonicalDecl();
-    const auto cached =
-        visitor_state_->explicit_instantiation_definition_locations.find(
-            canonical);
-    if (cached !=
-        visitor_state_->explicit_instantiation_definition_locations.end()) {
-      return cached->second;
-    }
-
-    ScanExplicitInstantiationDefinitionSyntax();
-    set<string> accepted_names{declaration->getNameAsString()};
-    if (const auto* method = dyn_cast<CXXMethodDecl>(declaration)) {
-      const string parent_name = method->getParent()->getNameAsString();
-      if (!parent_name.empty())
-        accepted_names = {parent_name};
-    }
-
-    auto select_candidate = [&](bool allow_assigned) {
-      SourceLocation selected;
-      for (const ExplicitInstantiationDefinitionSyntax& candidate :
-           visitor_state_->explicit_instantiation_definitions) {
-        const bool name_matches = std::any_of(
-            accepted_names.begin(), accepted_names.end(),
-            [&](const string& name) {
-              return !name.empty() && candidate.identifiers.count(name) != 0;
-            });
-        if (!name_matches)
-          continue;
-        const auto owner =
-            visitor_state_->explicit_instantiation_definition_location_owners
-                .find(candidate.location.getRawEncoding());
-        if (!allow_assigned && owner !=
-                visitor_state_->explicit_instantiation_definition_location_owners
-                    .end() &&
-            owner->second != canonical) {
-          continue;
-        }
-        if (selected.isInvalid() ||
-            IsBeforeInTranslationUnit(candidate.location, selected)) {
-          selected = candidate.location;
-        }
-      }
-      return selected;
-    };
-
-    SourceLocation selected = select_candidate(false);
-    if (selected.isInvalid())
-      selected = select_candidate(true);
-    if (selected.isValid()) {
-      visitor_state_->explicit_instantiation_definition_location_owners
-          .emplace(selected.getRawEncoding(), canonical);
-    }
-    visitor_state_->explicit_instantiation_definition_locations.emplace(
-        canonical, selected);
-    return selected;
-  }
-
-  void HandleExplicitInstantiationDefinition(FunctionDecl* declaration) {
-    const SourceLocation report_loc =
-        ExplicitInstantiationDefinitionLocation(declaration);
-    if (report_loc.isInvalid())
       return;
-    SatisfyDefinitionObligation(
-        declaration, report_loc,
+    }
+
+    // Clang may retain an earlier extern-template point of instantiation when
+    // a later explicit definition upgrades the same specialization. Do not
+    // assign source request lines by spelling, name, or traversal order.
+    // Instead, require the final semantic kind and follow the specialization's
+    // actual source-written pattern to its selected body.
+    const FunctionDecl* definition = DefinitionForObligation(
+        declaration,
         DefinitionObligationKind::kExplicitInstantiationDefinition);
+    if (!definition || (!definition->getBody() && !definition->isDefaulted()))
+      return;
+    const SourceLocation definition_loc = GetLocation(definition);
+    const FileEntry* definition_file = GetFileEntry(definition_loc);
+    const FileEntry* analyzed_file = preprocessor_info().main_file();
+    if (!definition_file || !analyzed_file || definition_file == analyzed_file)
+      return;
+
+    // Every result starts at an exact direct include occurrence in the
+    // analyzed file and follows one concrete FileID ancestry to this body.
+    // Repeated entered routes remain separate roots; skipped routes have no
+    // FileID and cannot substitute. Attribute the obligation to each root
+    // include itself so all structured use facts remain source-local.
+    const vector<IwyuPreprocessorInfo::DefinitionProviderCoverage> coverages =
+        preprocessor_info().EnteredDefinitionProviderCoverages(
+            analyzed_file, definition_loc);
+    for (const auto& coverage : coverages) {
+      if (coverage.chain.empty())
+        continue;
+      RetainDefinitionProvider(coverage, declaration,
+                               coverage.chain.front().location,
+                               definition_loc);
+    }
   }
 
   bool VisitDeclRefExpr(clang::DeclRefExpr* expr) {
