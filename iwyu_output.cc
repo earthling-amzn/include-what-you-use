@@ -3768,15 +3768,17 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
 
   // SEM-004 requirements are occurrence-specific. Re-assert only the exact
   // directive lines selected from concrete FileID ancestry after ordinary
-  // spelling-based duplicate pruning has run.
-  if (GlobalFlags().output_format == CommandlineFlags::kJsonOutput) {
-    for (OneIncludeOrForwardDeclareLine& line : lines_) {
-      if (!line.IsIncludeLine() || !line.is_present() ||
-          !ContainsKey(semantic_definition_provider_lines_,
-                       line.start_linenum())) {
-        continue;
-      }
-      line.set_desired();
+  // spelling-based duplicate pruning has run. Legacy text has no structured
+  // keep operation, but restoring the desired line keeps fix_includes from
+  // deleting the selected body provider.
+  for (OneIncludeOrForwardDeclareLine& line : lines_) {
+    if (!line.IsIncludeLine() || !line.is_present() ||
+        !ContainsKey(semantic_definition_provider_lines_,
+                     line.start_linenum())) {
+      continue;
+    }
+    line.set_desired();
+    if (GlobalFlags().output_format == CommandlineFlags::kJsonOutput) {
       const auto facts = semantic_definition_provider_facts_.find(
           line.start_linenum());
       if (facts != semantic_definition_provider_facts_.end()) {
@@ -3786,8 +3788,8 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
       }
       line.SetStructuredDecision(
           "keep", "keep", "semantic_definition_provider",
-          "This exact entered include occurrence supplies an evaluated inline "
-          "or template definition obligation.");
+          "This exact entered include occurrence supplies an evaluated "
+          "inline or template definition obligation.");
     }
   }
 

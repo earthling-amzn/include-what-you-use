@@ -310,6 +310,94 @@ def assert_analyzer_contracts():
                for symbol in instantiation_keep["symbols"]
                for use in symbol["uses"])
 
+    explicit, _ = analyze("explicit_instantiations.cc", schema=2)
+    assert definition_diagnostics(explicit) == []
+    explicit_keeps = semantic_keeps(explicit)
+    assert len(explicit_keeps) == 1
+    assert_provider_keep(explicit_keeps[0],
+                         '#include "explicit_api.inline.hpp"', [
+                             "explicit_instantiations.cc",
+                             "explicit_api.inline.hpp"])
+    assert {symbol["qualified_name"]["value"]
+            for symbol in explicit_keeps[0]["symbols"]} == {
+        "Explicit", "ExplicitClassBox<int>::Member",
+        "ExplicitMemberBox<int>::Member"}
+    assert {use["location"]["line"]
+            for symbol in explicit_keeps[0]["symbols"]
+            for use in symbol["uses"]} == {3, 4, 5, 6}
+
+    body_first, _ = analyze("explicit_body_first.cc", schema=2)
+    assert definition_diagnostics(body_first) == []
+    assert_provider_keep(semantic_keeps(body_first)[0],
+                         '#include "explicit_body_first.inline.hpp"', [
+                             "explicit_body_first.cc",
+                             "explicit_body_first.inline.hpp"])
+
+    explicit_export, _ = analyze("explicit_export.cc", schema=2)
+    assert definition_diagnostics(explicit_export) == []
+    assert_provider_keep(semantic_keeps(explicit_export)[0],
+                         '#include "explicit_export_carrier.hpp"', [
+                             "explicit_export.cc",
+                             "explicit_export_carrier.hpp"])
+    explicit_mapped, _ = analyze(
+        "explicit_mapped.cc", "-Xiwyu",
+        "--mapping_file=explicit_providers.imp", schema=2)
+    assert definition_diagnostics(explicit_mapped) == []
+    assert_provider_keep(semantic_keeps(explicit_mapped)[0],
+                         '#include "explicit_mapped_carrier.hpp"', [
+                             "explicit_mapped.cc",
+                             "explicit_mapped_carrier.hpp"])
+
+    explicit_conditional, _ = analyze(
+        "explicit_conditional.cc", "-DFEATURE=1", schema=2)
+    assert definition_diagnostics(explicit_conditional) == []
+    conditional_keep = next(
+        operation for operation in semantic_keeps(explicit_conditional)
+        if operation["spelling"] == '#include "explicit_api.inline.hpp"')
+    assert_provider_keep(conditional_keep,
+                         '#include "explicit_api.inline.hpp"', [
+                             "explicit_conditional.cc",
+                             "explicit_api.inline.hpp"])
+    assert conditional_keep["edit_condition"]["status"] == "known"
+    explicit_conditional_inactive, _ = analyze(
+        "explicit_conditional.cc", "-DFEATURE=0", schema=2)
+    assert semantic_keeps(explicit_conditional_inactive) == []
+    assert definition_diagnostics(explicit_conditional_inactive) == []
+
+    explicit_declaration, _ = analyze(
+        "explicit_declaration_only.cc", schema=2)
+    assert semantic_keeps(explicit_declaration) == []
+    assert definition_diagnostics(explicit_declaration) == []
+    assert [(operation["subject_action"], operation["disposition"],
+             operation["spelling"])
+            for operation in explicit_declaration["operations"]
+            if operation["spelling"] ==
+               '#include "explicit_body_first.inline.hpp"'] == [
+        ("remove", "apply",
+         '#include "explicit_body_first.inline.hpp"')]
+
+    later_matching, _ = analyze(
+        "later_definition_matching.cc", "-DFEATURE=1", schema=2)
+    assert definition_diagnostics(later_matching) == []
+    later_matching_inactive, _ = analyze(
+        "later_definition_matching.cc", "-DFEATURE=0", schema=2)
+    assert definition_diagnostics(later_matching_inactive) == []
+    later_mismatched, _ = analyze(
+        "later_definition_mismatched.cc", "-DFEATURE=1", schema=2)
+    assert [(fact["code"], fact["location"]["value"]["line"])
+            for fact in definition_diagnostics(later_mismatched)] == [
+        ("definition_provider_unproven", 4)]
+    later_inactive, _ = analyze(
+        "later_definition_mismatched.cc", "-DFEATURE=0", schema=2)
+    assert [(fact["code"], fact["location"]["value"]["line"])
+            for fact in definition_diagnostics(later_inactive)] == [
+        ("missing_template_definition", 4)]
+    later_sibling, _ = analyze(
+        "later_definition_sibling.cc", "-DFEATURE=1", schema=2)
+    assert [(fact["code"], fact["location"]["value"]["line"])
+            for fact in definition_diagnostics(later_sibling)] == [
+        ("missing_template_definition", 4)]
+
     direct_after, _ = analyze("direct_after.cc")
     assert definition_diagnostics(direct_after) == []
     body_keep = next(op for op in semantic_keeps(direct_after)
@@ -409,6 +497,14 @@ def assert_driver_contracts():
         ("defaulted_provider.cc", []),
         ("late_template_provider.cc", []),
         ("default_provider_instantiated.cc", []),
+        ("explicit_instantiations.cc", []),
+        ("explicit_instantiations.cc", []),
+        ("explicit_body_first.cc", []),
+        ("explicit_export.cc", []),
+        ("explicit_mapped.cc", [
+            "-Xiwyu", "--mapping_file=explicit_providers.imp"]),
+        ("explicit_conditional.cc", ["-DFEATURE=1"]),
+        ("explicit_declaration_only.cc", []),
     ]
     records = analyze_with_driver(entries)
 
@@ -437,6 +533,18 @@ def assert_driver_contracts():
             '#include "late_template_provider.inline.hpp"'),
         9: ("default_provider_instantiated.cc",
             '#include "default_provider.inline.hpp"'),
+        10: ("explicit_instantiations.cc",
+             '#include "explicit_api.inline.hpp"'),
+        11: ("explicit_instantiations.cc",
+             '#include "explicit_api.inline.hpp"'),
+        12: ("explicit_body_first.cc",
+             '#include "explicit_body_first.inline.hpp"'),
+        13: ("explicit_export.cc",
+             '#include "explicit_export_carrier.hpp"'),
+        14: ("explicit_mapped.cc",
+             '#include "explicit_mapped_carrier.hpp"'),
+        15: ("explicit_conditional.cc",
+             '#include "explicit_api.inline.hpp"'),
     }
     for index, (filename, spelling) in expected.items():
         keeps = [operation for operation in semantic_keeps(source_records[index])
@@ -467,6 +575,24 @@ def assert_driver_contracts():
                              use["location"]["column"]))
     assert len(set(duplicate_ids)) == 2
 
+    explicit_ids = []
+    for index in (10, 11):
+        record = source_records[index]
+        explicit_ids.append(record["invocation"]["id"])
+        keeps = semantic_keeps(record)
+        assert len(keeps) == 1
+        assert {symbol["qualified_name"]["value"]
+                for symbol in keeps[0]["symbols"]} == {
+            "Explicit", "ExplicitClassBox<int>::Member",
+            "ExplicitMemberBox<int>::Member"}
+    assert len(set(explicit_ids)) == 2
+    assert semantic_keeps(source_records[16]) == []
+    assert [(operation["subject_action"], operation["disposition"])
+            for operation in source_records[16]["operations"]
+            if operation["spelling"] ==
+               '#include "explicit_body_first.inline.hpp"'] == [
+        ("remove", "apply")]
+
     owner = next(record for record in records
                  if record["invocation"]["index"] == 5 and
                  record["file"]["path"].endswith("associated_owner.hpp"))
@@ -485,7 +611,10 @@ def assert_gcc_backstop(corpus=CORPUS):
                        "default_provider_instantiated.cc",
                        "defaulted_provider.cc", "defaulted_trivial.cc",
                        "late_same.cc", "late_template_provider.cc",
-                       "uninstantiated_nondependent.cc"):
+                       "uninstantiated_nondependent.cc",
+                       "explicit_instantiations.cc",
+                       "explicit_body_first.cc", "explicit_export.cc",
+                       "explicit_mapped.cc", "explicit_declaration_only.cc"):
             executable = out / source.removesuffix(".cc")
             run([CXX, "-std=c++17", "-fno-inline", "-I", ".", source,
                  "-o", executable], cwd=corpus)
@@ -528,11 +657,22 @@ def assert_gcc_backstop(corpus=CORPUS):
         run([extern_program], cwd=corpus)
 
         for feature in (0, 1):
-            for source in ("conditional_dominating.cc", "repeated_provider.cc"):
+            for source in ("conditional_dominating.cc", "repeated_provider.cc",
+                           "explicit_conditional.cc",
+                           "later_definition_matching.cc"):
                 executable = out / f"{source.removesuffix('.cc')}-{feature}"
                 run([CXX, "-std=c++17", "-fno-inline", "-I", ".",
                      f"-DFEATURE={feature}", source, "-o", executable], cwd=corpus)
                 run([executable], cwd=corpus)
+        later_mismatched = out / "later_definition_mismatched-1"
+        run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "-DFEATURE=1",
+             "later_definition_mismatched.cc", "-o", later_mismatched],
+            cwd=corpus)
+        run([later_mismatched], cwd=corpus)
+        later_sibling = out / "later_definition_sibling-0"
+        run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "-DFEATURE=0",
+             "later_definition_sibling.cc", "-o", later_sibling], cwd=corpus)
+        run([later_sibling], cwd=corpus)
         nondominating = out / "conditional_nondominating-1"
         run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "-DFEATURE=1",
              "conditional_nondominating.cc", "-o", nondominating], cwd=corpus)
@@ -584,6 +724,14 @@ def assert_fixer_idempotence():
             "defaulted_provider.cc": [], "defaulted_trivial.cc": [],
             "late_same.cc": [], "late_template_provider.cc": [],
             "uninstantiated_nondependent.cc": [],
+            "explicit_instantiations.cc": [],
+            "explicit_body_first.cc": [],
+            "explicit_export.cc": [],
+            "explicit_mapped.cc": [
+                "-Xiwyu", "--mapping_file=explicit_providers.imp"],
+            "explicit_conditional.cc": ["-DFEATURE=1"],
+            "explicit_declaration_only.cc": [],
+            "later_definition_matching.cc": ["-DFEATURE=1"],
         }
         for filename, options in cases.items():
             command = [IWYU, "-I", ".", "-std=c++17", *options, filename]
@@ -595,6 +743,21 @@ def assert_fixer_idempotence():
             assert "should add these lines:" not in second.stderr, second.stderr
             assert "should remove these lines:" not in second.stderr, second.stderr
         assert '#include "api.inline.hpp"' in (corpus / "available.cc").read_text()
+        for filename, include in {
+            "explicit_instantiations.cc":
+                '#include "explicit_api.inline.hpp"',
+            "explicit_body_first.cc":
+                '#include "explicit_body_first.inline.hpp"',
+            "explicit_export.cc":
+                '#include "explicit_export_carrier.hpp"',
+            "explicit_mapped.cc":
+                '#include "explicit_mapped_carrier.hpp"',
+            "explicit_conditional.cc":
+                '#include "explicit_api.inline.hpp"',
+        }.items():
+            assert include in (corpus / filename).read_text(), filename
+        assert "explicit_body_first.inline.hpp" not in (
+            corpus / "explicit_declaration_only.cc").read_text()
         assert "unused.inline.hpp" not in (corpus / "control.cc").read_text()
         assert_gcc_backstop(corpus)
 

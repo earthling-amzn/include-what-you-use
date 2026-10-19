@@ -32,9 +32,9 @@ unavailable rather than guessing from the filesystem.
 
 SEM-004 creates a concrete body obligation for each potentially evaluated ODR
 use of an ordinary semantically-inline function, an implicit function-template
-specialization, or an instantiated class-template member. Explicit
-instantiation definitions own one obligation at Clang's point of instantiation.
-A prior selected `extern template` declaration transfers body ownership to
+specialization, or an instantiated class-template member. Each source-written
+explicit-instantiation definition owns one obligation at its recovered request
+point. A prior selected `extern template` declaration transfers body ownership to
 another translation unit. Explicit non-inline specializations retain ordinary
 out-of-line ownership.
 
@@ -67,6 +67,18 @@ lifecycle destroys the base; forming a member pointer or making a virtual call
 to other pure methods remains excluded, while an explicitly qualified pure call
 still requires its body.
 
+An explicit-instantiation definition is recovered from its source-written
+non-`extern` `template` request even when Clang keeps an earlier `extern
+template` location as the specialization's point of instantiation. The request
+is accepted only when the final specialization is an explicit definition, its
+instantiation pattern has a selected source-written body (including `= default`),
+and the recovered request is active and names that function or enclosing class.
+Explicit-instantiation declarations create no local body obligation. Multiple
+same-name requests receive distinct source points, while members produced by one
+explicit class instantiation share its class request. This source point anchors
+the exact entered body-provider proof and is retained in both structured output
+and the legacy fixer projection.
+
 A definition is available only through one concrete entered `FileID` ancestry.
 IncludePicker supplies candidate public, mapping-file, pragma-export, and
 verified dotted-inline intent. The preprocessor proof separately binds the
@@ -95,9 +107,11 @@ pruning, so an equal spelling cannot substitute for the entered occurrence. No
 include is synthesized from an absent or unproved body. An implicit template
 instantiation may use a later definition at its legal point of instantiation.
 A later same-TU definition is accepted only from the actual entered definition
-declaration; a later header provider is retained only through its exact entered
-root occurrence and physical chain. Inactive, sibling, and unentered providers
-still fail closed. Explicit instantiation declarations/definitions and `extern
+declaration after its active condition path is proved to dominate the legal
+instantiation/use point. Matching active branches and unconditional definitions
+cover the use; inactive, sibling, and mismatched branches remain unproven. A
+later header provider is retained only through its exact entered root occurrence
+and physical chain. Explicit instantiation declarations/definitions and `extern
 template` keep their separate ownership rules.
 
 Repeated observations are stored by include operation and canonical function.
