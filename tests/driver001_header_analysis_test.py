@@ -18,7 +18,7 @@ def run_driver(source_root, analyzer, arguments, extra_env=None):
     return subprocess.run(
         [sys.executable, str(source_root / 'iwyu_tool.py')] + arguments,
         cwd=str(source_root), env=env, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, check=False)
+        stderr=subprocess.PIPE, check=False, timeout=60)
 
 
 def write_database(directory, entries):
@@ -52,7 +52,8 @@ if os.environ['WRAPPER_MODE'] == 'extra' and tu.endswith('target.hpp'):
 if os.environ['WRAPPER_MODE'] == 'capture' and tu.endswith(os.environ['CAPTURE_TU']):
     with open(os.environ['CAPTURE_LOG'], 'a', encoding='utf-8') as stream:
         stream.write(json.dumps(args) + '\\n')
-result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        timeout=60)
 output = result.stdout
 if os.environ['WRAPPER_MODE'] == 'skip-real' and tu.endswith('source.cc'):
     changed = []
@@ -167,6 +168,49 @@ def main():
             '--analyze-header-glob', '**/*.hpp',
             '--max-synthetic-header-invocations', '20',
         ]
+        # Binary PCH state and an excessive prospective product both fail
+        # before phase 1. The sentinel analyzer must never be launched.
+        sentinel = temp / 'fake-analyzer-launched'
+        fake_analyzer = temp / 'fake-analyzer.py'
+        fake_analyzer.write_text(
+            '#!/usr/bin/env python3\nfrom pathlib import Path\n'
+            'Path(%r).write_text("launched\\n", encoding="utf-8")\n'
+            'raise SystemExit(99)\n' % str(sentinel), encoding='utf-8')
+        fake_analyzer.chmod(fake_analyzer.stat().st_mode | stat.S_IXUSR)
+
+        pch_db_dir = temp / 'pch-db'
+        pch_db_dir.mkdir()
+        pch_db = write_database(pch_db_dir, [{
+            'directory': str(temp), 'file': str(server_a),
+            'arguments': ['clang++', '-include-pch', 'forced.pch',
+                          '-include', 'forced.hpp', '-c', str(server_a)],
+        }])
+        pch_rejected = run_driver(source_root, fake_analyzer, [
+            '-o', 'json', '--output-schema', '2', '--configuration', 'pch',
+            '-p', str(pch_db), '--analyze-header-root', str(headers),
+            '--analyze-header-glob', '*.hpp',
+            '--max-synthetic-header-invocations', '20'])
+        if (pch_rejected.returncode == 0 or pch_rejected.stdout or
+                b'binary precompiled-header option' not in pch_rejected.stderr or
+                sentinel.exists()):
+            raise AssertionError(
+                'binary PCH preflight launched a child or was not atomic: '
+                'rc=%d stdout=%r stderr=%r sentinel=%r' %
+                (pch_rejected.returncode, pch_rejected.stdout,
+                 pch_rejected.stderr, sentinel.exists()))
+
+        capped_preflight = run_driver(
+            source_root, fake_analyzer,
+            base[:-2] + ['--max-synthetic-header-invocations', '1'])
+        if (capped_preflight.returncode == 0 or capped_preflight.stdout or
+                b'prospective synthetic header invocation count' not in
+                capped_preflight.stderr or sentinel.exists()):
+            raise AssertionError(
+                'prospective cap preflight launched a child or was not atomic: '
+                'rc=%d stdout=%r stderr=%r sentinel=%r' %
+                (capped_preflight.returncode, capped_preflight.stdout,
+                 capped_preflight.stderr, sentinel.exists()))
+
         first = run_driver(source_root, analyzer, base)
         second = run_driver(source_root, analyzer, base)
         assert_ok(first, 'named real analysis')

@@ -214,7 +214,9 @@ We also include a tool that automatically fixes up your source files based on th
 
 Schema-2 JSON runs can also guarantee coverage of a strict rooted header set,
 synthesizing direct header invocations only where real translation units do not
-already provide coverage. See
+already provide coverage. Binary forced-PCH/PTH options are rejected during
+profile preflight before any analyzer child starts; ordinary textual `-include`
+and `-imacros` inputs remain part of the profile. See
 [Complete header analysis from compilation databases](docs/DriverHeaderAnalysis.md)
 for its CLI, canonical manifest, compile-profile, indexing, and atomicity
 contracts.

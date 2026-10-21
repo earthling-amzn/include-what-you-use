@@ -55,10 +55,20 @@ the transaction instead of suppressing synthesis.
 For each header without terminal coverage by physical `source_identity` in a
 configuration, phase 2 runs the header directly under every distinct semantic
 compile profile from that configuration's selected real entries. Profiles retain
-compiler macros, include paths and their order, target options, forced inputs,
-and semantic module inputs. The profile key binds both the canonical working
-directory and the exact rewritten argv, so relative paths from different working
-directories cannot be merged. Response files are expanded and exactly one
+compiler macros, include paths and their order, target options, ordinary textual
+`-include` and `-imacros` inputs, and semantic module inputs. Binary PCH/PTH
+state is tied to the original compilation and is not a reusable semantic profile
+for a different header main file. Profile preflight therefore rejects, rather
+than preserves or strips, GCC/Clang `-include-pch`, `-include-pth`, PTH
+`-token-cache`, `-pch-through-header`, header-stop, PCH chaining,
+precompiled-preamble, verification, and PCH/PTH-generation controls, including
+their separate, joined, and `-Xclang` forms. It likewise rejects clang-cl/MSVC
+`/Yu`, `/Yc`, and `/Fp` forms. This preflight completes for every selected entry
+before any phase-1 analyzer child starts. Compile databases produced by the
+HotSpot IWYU toolkit already remove forced PCH options.
+
+The profile key binds the canonical working directory and exact rewritten argv,
+so relative paths from different working directories cannot be merged. Response files are expanded and exactly one
 physical source input is replaced. Separate and joined `-x` selectors are
 removed; the last effective selector, or the source suffix after `-xnone`, yields
 exactly one C, C++, Objective-C, or Objective-C++ selector.
@@ -73,10 +83,14 @@ Only profiles with the same working directory and rewritten argv are
 deduplicated.
 
 `--max-synthetic-header-invocations` is a positive safety cap and defaults to
-1000. The driver reserves deterministic per-database index blocks before phase
-1, so covered synthetic slots remain gaps and named output stays grouped by
-configuration. Command digests and invocation IDs include the actual bound
-compile command, forwarded options, and exact synthetic header.
+1000. Before phase 1, the driver computes the complete prospective product of
+selected headers and distinct profiles in every configuration. Exceeding the cap
+fails with zero stdout before any analyzer child starts; real-header coverage is
+not used to lower this preflight bound. The driver reserves deterministic
+per-database index blocks before phase 1, so covered synthetic slots remain gaps
+and named output stays grouped by configuration. Command digests and invocation
+IDs include the actual bound compile command, forwarded options, and exact
+synthetic header.
 
 Each synthetic child must return exactly one schema-2 record for its target with
 the selected configuration, physical identity, snapshotted digest, and status

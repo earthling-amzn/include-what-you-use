@@ -429,6 +429,23 @@ SYNTHETIC_REJECT_PREFIXES = (
     '-fcas-path=', '-fcas-plugin-path=', '-fthinlto-index=',
     '-module-dependency-dir=', '--emit-symbol-graph=',
 )
+# A binary precompiled-header state belongs to the original compilation. It is
+# not a reusable semantic input for a different main file. Reject these before
+# locating or replacing the source input; preserving or silently removing one
+# would both synthesize a profile with unproved semantics.
+SYNTHETIC_BINARY_PCH_OPTIONS = frozenset([
+    '-include-pch', '-include-pth', '-token-cache', '-chain-include',
+    '-pch-through-header', '-pch-through-hdrstop-create',
+    '-pch-through-hdrstop-use', '-preamble-bytes', '-print-preamble',
+    '-verify-pch', '-emit-pch', '-emit-pth', '-precompile', '--precompile',
+    '-relocatable-pch', '-building-pch-with-obj',
+])
+SYNTHETIC_BINARY_PCH_PREFIXES = (
+    '-include-pch', '-include-pth', '-token-cache', '-chain-include',
+    '-pch-through-header', '-pch-through-hdrstop-', '-preamble-bytes',
+    '-print-preamble=', '-verify-pch=', '-emit-pch=', '-emit-pth=', '-fpch-',
+    '-fno-pch-', '-relocatable-pch=', '-building-pch-with-obj=',
+)
 # Options with a separate operand. Semantic module inputs intentionally remain
 # here and are copied unchanged: -fmodule-file, -fmodule-map-file and
 # -fprebuilt-module-path (including their joined spellings).
@@ -818,9 +835,33 @@ def _is_rejected_synthetic_option(argument):
                 for prefix in SYNTHETIC_REJECT_PREFIXES))
 
 
+def _binary_pch_option(argument, windows_args):
+    """Return the binary PCH/PTH control represented by argument, if any."""
+    candidate = (argument.split('=', 1)[1]
+                 if argument.startswith('-Xclang=') else argument)
+    if (candidate in SYNTHETIC_BINARY_PCH_OPTIONS or
+            any(candidate.startswith(prefix)
+                for prefix in SYNTHETIC_BINARY_PCH_PREFIXES)):
+        return candidate
+    if windows_args and candidate.startswith(('/Yu', '-Yu', '/Yc', '-Yc',
+                                              '/Fp', '-Fp')):
+        return candidate
+    return None
+
+
+def _reject_binary_pch_arguments(arguments, windows_args):
+    for argument in arguments[1:]:
+        option = _binary_pch_option(argument, windows_args)
+        if option is not None:
+            raise ValueError(
+                'binary precompiled-header option is unsafe for synthetic '
+                'header analysis: %s' % option)
+
+
 def synthetic_compile_profile(entry):
     """Return a deterministic, side-effect-free semantic compile profile."""
     arguments, windows_args = _canonical_compile_arguments(entry)
+    _reject_binary_pch_arguments(arguments, windows_args)
     directory = os.path.realpath(entry['directory'])
     source = os.path.realpath(entry['file'])
     source_index = _source_argument_index(arguments, directory, source)
@@ -2820,6 +2861,19 @@ def execute_header_analysis(database_plans, real_invocations, headers,
     buffered_stderr = []
     all_errors = []
 
+    # Bound the complete prospective product before phase 1. Coverage is known
+    # only after real children run, so checking merely the uncovered remainder
+    # would allow a selected database to start children before failing its cap.
+    prospective_count = 0
+    for plan in database_plans:
+        prospective_count += len(headers) * len(plan['profiles'])
+        if prospective_count > max_synthetic_invocations:
+            print('error: prospective synthetic header invocation count %d '
+                  'exceeds cap %d' %
+                  (prospective_count, max_synthetic_invocations),
+                  file=sys.stderr)
+            return 1
+
     # Selection and every phase boundary revalidate both bytes and filesystem
     # identity before any buffered native output can become public.
     try:
@@ -2872,23 +2926,6 @@ def execute_header_analysis(database_plans, real_invocations, headers,
     if all_errors:
         _emit_buffered_json_stderr(buffered_stderr, all_errors)
         return 1
-
-    # Count the complete product before constructing entries, Invocations, or
-    # expected-record maps. This keeps a low cap memory-safe for huge products.
-    prospective_count = 0
-    for plan in database_plans:
-        configuration = plan['configuration']
-        uncovered_count = sum(
-            1 for _, path, _, _, _ in headers
-            if (configuration, normcase(path.replace(os.path.sep, '/')))
-            not in covered)
-        prospective_count += uncovered_count * len(plan['profiles'])
-        if prospective_count > max_synthetic_invocations:
-            _emit_buffered_json_stderr(buffered_stderr, all_errors)
-            print('error: synthetic header invocation count %d exceeds cap %d' %
-                  (prospective_count, max_synthetic_invocations),
-                  file=sys.stderr)
-            return 1
 
     synthetic = []
     expected = {}

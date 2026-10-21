@@ -929,6 +929,130 @@ class HeaderAnalysisTests(unittest.TestCase):
             self.assertEqual(profiles[0]['arguments'], profiles[1]['arguments'])
             self.assertNotEqual(profiles[0]['key'], profiles[1]['key'])
 
+    def test_binary_pch_state_is_rejected_but_textual_forced_inputs_remain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, 'source.cc')
+            open(source, 'w').close()
+            unix_cases = [
+                ['-include-pch', 'forced.pch'],
+                ['-include-pch=forced.pch'],
+                ['-include-pchforced.pch'],
+                ['-include-pth', 'forced.pth'],
+                ['-include-pth=forced.pth'],
+                ['-include-pthforced.pth'],
+                ['-token-cache', 'forced.pth'],
+                ['-token-cache=forced.pth'],
+                ['-chain-include', 'prefix.hpp'],
+                ['-chain-include=prefix.hpp'],
+                ['-pch-through-header', 'prefix.hpp'],
+                ['-pch-through-header=prefix.hpp'],
+                ['-pch-through-hdrstop-create'],
+                ['-pch-through-hdrstop-use'],
+                ['-preamble-bytes=12,1'],
+                ['-print-preamble'],
+                ['-verify-pch'],
+                ['-emit-pch'],
+                ['-emit-pth'],
+                ['--precompile'],
+                ['-relocatable-pch'],
+                ['-fpch-preprocess'],
+                ['-fpch-deps'],
+                ['-fno-pch-timestamp'],
+                ['-Xclang', '-include-pch', '-Xclang', 'forced.pch'],
+                ['-Xclang=-include-pch=forced.pch'],
+            ]
+            for options in unix_cases:
+                entry = {
+                    'directory': directory, 'file': source,
+                    'arguments': ['clang++'] + options + ['-c', source],
+                }
+                with self.subTest(options=options):
+                    with self.assertRaisesRegex(
+                            ValueError, 'binary precompiled-header option'):
+                        iwyu_tool.synthetic_compile_profile(entry)
+
+            for option in ['/Yu', '/Yuprefix.hpp', '/Yc', '/Ycprefix.hpp',
+                           '/Fp', '/Fpforced.pch', '-Yuprefix.hpp',
+                           '-Ycprefix.hpp', '-Fpforced.pch']:
+                entry = {
+                    'directory': directory, 'file': source,
+                    'arguments': ['clang-cl', option, '/c', source],
+                }
+                with self.subTest(option=option):
+                    with self.assertRaisesRegex(
+                            ValueError, 'binary precompiled-header option'):
+                        iwyu_tool.synthetic_compile_profile(entry)
+
+            textual = iwyu_tool.synthetic_compile_profile({
+                'directory': directory, 'file': source,
+                'arguments': ['clang++', '-include', 'forced.hpp',
+                              '-imacros', 'macros.hpp', '-Winvalid-pch',
+                              '-c', source],
+            })['arguments']
+            self.assertIn('-include', textual)
+            self.assertIn('forced.hpp', textual)
+            self.assertIn('-imacros', textual)
+            self.assertIn('macros.hpp', textual)
+            self.assertIn('-Winvalid-pch', textual)
+
+    def test_profile_and_prospective_cap_preflight_never_launch_analyzer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, 'headers')
+            os.mkdir(root)
+            header = os.path.join(root, 'orphan.hpp')
+            source_a = os.path.join(directory, 'a.cc')
+            source_b = os.path.join(directory, 'b.cc')
+            for path in (header, source_a, source_b):
+                open(path, 'w').close()
+            sentinel = os.path.join(directory, 'analyzer-launched')
+            fake = os.path.join(directory, 'fake-analyzer')
+            with open(fake, 'w') as stream:
+                stream.write('#!/bin/sh\n: > %s\nexit 99\n' % sentinel)
+            os.chmod(fake, os.stat(fake).st_mode | stat.S_IXUSR)
+
+            database_path = os.path.join(directory, 'compile_commands.json')
+            old_executable = iwyu_tool.IWYU_EXECUTABLE
+            old_stdout = iwyu_tool.sys.stdout
+            old_stderr = iwyu_tool.sys.stderr
+            try:
+                iwyu_tool.IWYU_EXECUTABLE = fake
+                for label, database, cap, error_text in [
+                        ('binary-pch', [{
+                            'directory': directory, 'file': source_a,
+                            'arguments': ['clang++', '-include-pch',
+                                          'forced.pch', '-c', source_a],
+                        }], 10, 'binary precompiled-header option'),
+                        ('prospective-cap', [
+                            {'directory': directory, 'file': source_a,
+                             'arguments': ['clang++', '-DPROFILE=A', '-c',
+                                           source_a]},
+                            {'directory': directory, 'file': source_b,
+                             'arguments': ['clang++', '-DPROFILE=B', '-c',
+                                           source_b]},
+                        ], 1, 'prospective synthetic header invocation count')]:
+                    with self.subTest(label=label):
+                        with open(database_path, 'w') as stream:
+                            json.dump(database, stream)
+                        stdout = StringIO()
+                        stderr = StringIO()
+                        iwyu_tool.sys.stdout = stdout
+                        iwyu_tool.sys.stderr = stderr
+                        result = iwyu_tool.main(
+                            database_path, [], False, None, 1, 0, [], 'json',
+                            output_schema_version=2,
+                            configuration='server',
+                            analyze_header_root=root,
+                            analyze_header_globs=['*.hpp'],
+                            max_synthetic_header_invocations=cap)
+                        self.assertEqual(1, result)
+                        self.assertEqual('', stdout.getvalue())
+                        self.assertIn(error_text, stderr.getvalue())
+                        self.assertFalse(os.path.exists(sentinel))
+            finally:
+                iwyu_tool.IWYU_EXECUTABLE = old_executable
+                iwyu_tool.sys.stdout = old_stdout
+                iwyu_tool.sys.stderr = old_stderr
+
     def test_joined_language_selectors_use_last_effective_language(self):
         with tempfile.TemporaryDirectory() as directory:
             cases = [
