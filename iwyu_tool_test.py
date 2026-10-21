@@ -899,6 +899,140 @@ class HeaderAnalysisTests(unittest.TestCase):
                 profile['key'],
                 iwyu_tool.synthetic_compile_profile(changed)['key'])
 
+    def test_compile_profile_discards_only_random_seed_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, 'source.cc')
+            open(source, 'w').close()
+            common = [
+                '-DPROFILE=A', '-UOLD_PROFILE', '-Ione', '-Itwo',
+                '--target=x86_64-unknown-linux-gnu', '-xc++',
+                '-include', 'forced-a.hpp', '-std=c++17', '-c', source,
+            ]
+
+            def profile(arguments, working_directory=directory, file=source):
+                return iwyu_tool.synthetic_compile_profile({
+                    'directory': working_directory,
+                    'file': file,
+                    'arguments': ['clang++'] + arguments,
+                })
+
+            baseline = profile(common)
+            for seed_arguments in [
+                    ['-frandom-seed=' + source] + common,
+                    ['-frandom-seed=different-source.cc'] + common,
+                    ['-frandom-seed', source] + common,
+                    ['-frandom-seed', 'different-source.cc'] + common]:
+                with self.subTest(seed_arguments=seed_arguments[:2]):
+                    seeded = profile(seed_arguments)
+                    self.assertEqual(baseline['key'], seeded['key'])
+                    self.assertEqual(baseline['arguments'], seeded['arguments'])
+                    self.assertFalse(any(
+                        argument.startswith('-frandom-seed')
+                        for argument in seeded['arguments']))
+
+            distinct_arguments = {
+                'define': ['-DPROFILE=B', '-UOLD_PROFILE', '-Ione', '-Itwo',
+                           '--target=x86_64-unknown-linux-gnu', '-xc++',
+                           '-include', 'forced-a.hpp', '-std=c++17', '-c', source],
+                'undefine': ['-DPROFILE=A', '-UNEW_PROFILE', '-Ione', '-Itwo',
+                             '--target=x86_64-unknown-linux-gnu', '-xc++',
+                             '-include', 'forced-a.hpp', '-std=c++17', '-c', source],
+                'include-order': [
+                    '-DPROFILE=A', '-UOLD_PROFILE', '-Itwo', '-Ione',
+                    '--target=x86_64-unknown-linux-gnu', '-xc++',
+                    '-include', 'forced-a.hpp', '-std=c++17', '-c', source],
+                'target': [
+                    '-DPROFILE=A', '-UOLD_PROFILE', '-Ione', '-Itwo',
+                    '--target=aarch64-unknown-linux-gnu', '-xc++',
+                    '-include', 'forced-a.hpp', '-std=c++17', '-c', source],
+                'language': [
+                    '-DPROFILE=A', '-UOLD_PROFILE', '-Ione', '-Itwo',
+                    '--target=x86_64-unknown-linux-gnu', '-xc',
+                    '-include', 'forced-a.hpp', '-std=c++17', '-c', source],
+                'forced-include': [
+                    '-DPROFILE=A', '-UOLD_PROFILE', '-Ione', '-Itwo',
+                    '--target=x86_64-unknown-linux-gnu', '-xc++',
+                    '-include', 'forced-b.hpp', '-std=c++17', '-c', source],
+                'semantic-standard': [
+                    '-DPROFILE=A', '-UOLD_PROFILE', '-Ione', '-Itwo',
+                    '--target=x86_64-unknown-linux-gnu', '-xc++',
+                    '-include', 'forced-a.hpp', '-std=c++20', '-c', source],
+            }
+            for label, arguments in distinct_arguments.items():
+                with self.subTest(label=label):
+                    self.assertNotEqual(baseline['key'], profile(arguments)['key'])
+
+    def test_hotspot_random_seeds_reduce_95_rows_before_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, 'headers')
+            os.mkdir(root)
+            header = os.path.join(root, 'orphan.hpp')
+            open(header, 'w').close()
+            database = []
+            for index in range(95):
+                source = os.path.join(directory, 'hotspot_%02d.cpp' % index)
+                open(source, 'w').close()
+                arguments = [
+                    'clang++', '-Ihotspot/share',
+                    '-DHOTSPOT_PROFILE=' + ('ZERO' if index == 94 else 'SERVER')]
+                if index % 2:
+                    arguments.extend(['-frandom-seed', source])
+                else:
+                    arguments.append('-frandom-seed=' + source)
+                arguments.extend(['-c', source, '-o', source + '.o'])
+                database.append({
+                    'directory': directory, 'file': source,
+                    'arguments': arguments,
+                })
+            database_path = os.path.join(directory, 'compile_commands.json')
+            with open(database_path, 'w') as stream:
+                json.dump(database, stream)
+
+            old_collect = iwyu_tool._collect_json_processes
+            old_executable = iwyu_tool.IWYU_EXECUTABLE
+            old_stdout = iwyu_tool.sys.stdout
+            old_stderr = iwyu_tool.sys.stderr
+            collected = []
+            try:
+                iwyu_tool.IWYU_EXECUTABLE = 'include-what-you-use'
+
+                def collect(invocations, *args):
+                    collected.append(len(invocations))
+                    return [], []
+
+                iwyu_tool._collect_json_processes = collect
+                iwyu_tool.sys.stdout = StringIO()
+                iwyu_tool.sys.stderr = StringIO()
+                result = iwyu_tool.main(
+                    database_path, [], False, None, 1, 0, [], 'json',
+                    output_schema_version=2, configuration='hotspot',
+                    analyze_header_root=root,
+                    analyze_header_globs=['*.hpp'],
+                    max_synthetic_header_invocations=2)
+                self.assertEqual(0, result)
+                self.assertEqual([95, 2], collected)
+                self.assertEqual('', iwyu_tool.sys.stderr.getvalue())
+
+                collected[:] = []
+                iwyu_tool.sys.stdout = StringIO()
+                iwyu_tool.sys.stderr = StringIO()
+                result = iwyu_tool.main(
+                    database_path, [], False, None, 1, 0, [], 'json',
+                    output_schema_version=2, configuration='hotspot',
+                    analyze_header_root=root,
+                    analyze_header_globs=['*.hpp'],
+                    max_synthetic_header_invocations=1)
+                self.assertEqual(1, result)
+                self.assertEqual([], collected)
+                self.assertIn(
+                    'prospective synthetic header invocation count 2 exceeds cap 1',
+                    iwyu_tool.sys.stderr.getvalue())
+            finally:
+                iwyu_tool._collect_json_processes = old_collect
+                iwyu_tool.IWYU_EXECUTABLE = old_executable
+                iwyu_tool.sys.stdout = old_stdout
+                iwyu_tool.sys.stderr = old_stderr
+
     def test_source_input_must_be_unique_and_replaceable(self):
         with tempfile.TemporaryDirectory() as directory:
             source = os.path.join(directory, 'source.cc')

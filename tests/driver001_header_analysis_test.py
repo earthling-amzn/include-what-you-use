@@ -211,6 +211,43 @@ def main():
                 (capped_preflight.returncode, capped_preflight.stdout,
                  capped_preflight.stderr, sentinel.exists()))
 
+        # Per-source GCC random seeds affect code generation only. Separate and
+        # joined spellings must collapse to one synthetic parse profile, so a
+        # cap of one accepts this two-row database.
+        seed_root = temp / 'random-seed-profiles'
+        seed_headers = seed_root / 'headers'
+        seed_headers.mkdir(parents=True)
+        seed_target = seed_headers / 'orphan.hpp'
+        seed_target.write_text(
+            '#pragma once\n#ifdef SAME_PROFILE\nstruct Seeded {};\n#endif\n',
+            encoding='utf-8')
+        seed_entries = []
+        for index in range(2):
+            source = seed_root / ('source%d.cc' % index)
+            source.write_text('int source%d;\n' % index, encoding='utf-8')
+            seed = (['-frandom-seed=' + str(source)] if index == 0 else
+                    ['-frandom-seed', str(source)])
+            seed_entries.append({
+                'directory': str(seed_root), 'file': str(source),
+                'arguments': ['clang++', '-DSAME_PROFILE'] + seed +
+                             ['-c', str(source), '-o', str(source) + '.o'],
+            })
+        seed_db_dir = seed_root / 'db'
+        seed_db_dir.mkdir()
+        seed_db = write_database(seed_db_dir, seed_entries)
+        seed_run = run_driver(source_root, analyzer, [
+            '-o', 'json', '--output-schema', '2', '--configuration', 'seed',
+            '-p', str(seed_db), '--analyze-header-root', str(seed_headers),
+            '--analyze-header-glob', '*.hpp',
+            '--max-synthetic-header-invocations', '1'])
+        assert_ok(seed_run, 'random-seed profile deduplication')
+        seed_records = [record for record in records(seed_run.stdout)
+                        if record['source_identity'] == str(seed_target)]
+        if (len(seed_records) != 1 or
+                seed_records[0]['invocation']['index'] != 2):
+            raise AssertionError(
+                'per-source random seeds did not collapse to one synthetic profile')
+
         first = run_driver(source_root, analyzer, base)
         second = run_driver(source_root, analyzer, base)
         assert_ok(first, 'named real analysis')

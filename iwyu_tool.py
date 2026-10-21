@@ -411,6 +411,12 @@ SYNTHETIC_OUTPUT_PREFIXES = (
     '-gen-cdb-fragment-path=', '-dsym-dir=',
     '-fsanitize-coverage=', '-fno-sanitize-coverage=',
 )
+# GCC's random seed stabilizes generated symbol names and other code-generation
+# output. Once the source is replaced by a header and the action is syntax-only,
+# it cannot affect preprocessing or AST semantics and must not split otherwise
+# identical synthetic parse profiles. Accept both GCC spellings.
+SYNTHETIC_NONSEMANTIC_OPTIONS = frozenset(['-frandom-seed'])
+SYNTHETIC_NONSEMANTIC_PREFIXES = ('-frandom-seed=',)
 # These options can make Clang write module/cache artifacts. Silently removing
 # them could change lookup semantics, so header synthesis fails closed instead.
 SYNTHETIC_REJECT_OPTIONS = frozenset([
@@ -450,7 +456,7 @@ SYNTHETIC_BINARY_PCH_PREFIXES = (
 # here and are copied unchanged: -fmodule-file, -fmodule-map-file and
 # -fprebuilt-module-path (including their joined spellings).
 SYNTHETIC_OPTION_OPERANDS = frozenset([
-    '-o', '--output', '-MF', '-MT', '-MQ', '-MJ', '-x',
+    '-o', '--output', '-MF', '-MT', '-MQ', '-MJ', '-x', '-frandom-seed',
     '-include', '-imacros', '-include-pch', '-isysroot', '--sysroot',
     '-I', '-isystem', '-iquote', '-idirafter', '-iprefix', '-iwithprefix',
     '-iwithprefixbefore', '-F', '-iframework', '-resource-dir',
@@ -881,6 +887,16 @@ def synthetic_compile_profile(entry):
             index += 2
             continue
         if argument.startswith('-x') and len(argument) > 2:
+            index += 1
+            continue
+        if argument in SYNTHETIC_NONSEMANTIC_OPTIONS:
+            if index + 1 >= len(arguments):
+                raise ValueError(
+                    'compile command has an incomplete nonsemantic option')
+            index += 2
+            continue
+        if any(argument.startswith(prefix)
+               for prefix in SYNTHETIC_NONSEMANTIC_PREFIXES):
             index += 1
             continue
         if _is_rejected_synthetic_option(argument):

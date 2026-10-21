@@ -75,12 +75,16 @@ exactly one C, C++, Objective-C, or Objective-C++ selector.
 
 Both real and synthetic header-analysis commands remove dependency, object,
 save-temps, serialized-diagnostic, coverage/profile, time-trace, optimization,
-statistics, and crash-reproducer outputs. They use a syntax-only action with
-crash diagnostics disabled. Module/cache output modes and other uncertain output
-actions fail closed, while semantic module inputs remain unchanged. The header
-itself is the synthetic main file; no wrapper or temporary source is created.
-Only profiles with the same working directory and rewritten argv are
-deduplicated.
+statistics, and crash-reproducer outputs. They also discard separate or joined
+`-frandom-seed` options from synthetic profiles: this GCC determinism control
+changes code-generation output, not preprocessing or AST semantics, and the
+synthetic command replaces the source with a header and uses a syntax-only
+action. Keeping a per-source seed would therefore create duplicate parse
+profiles. Crash diagnostics are disabled. Module/cache output modes and other
+uncertain output actions fail closed, while semantic module inputs remain
+unchanged. The header itself is the synthetic main file; no wrapper or temporary
+source is created. Only profiles with the same working directory and normalized
+rewritten argv are deduplicated.
 
 `--max-synthetic-header-invocations` is a positive safety cap and defaults to
 1000. Before phase 1, the driver computes the complete prospective product of
