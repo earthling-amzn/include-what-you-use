@@ -111,6 +111,7 @@ add_llvm_executable(include-what-you-use
   iwyu_output.cc
   iwyu_path_util.cc
   iwyu_preprocessor.cc
+  iwyu_projected_use.cc
   iwyu_project_policy.cc
   iwyu_regex.cc
   iwyu_verrs.cc
@@ -217,6 +218,27 @@ find_package(Python3 COMPONENTS Interpreter)
 if (Python3_Interpreter_FOUND)
   # Map the various IWYU test scripts to CTest tests.
   enable_testing()
+
+  add_llvm_executable(iwyu-projected-use-test NO_INSTALL_RPATH
+    tests/projected_use_test.cc
+    iwyu_projected_use.cc
+  )
+  set_target_properties(iwyu-projected-use-test PROPERTIES
+    CXX_STANDARD_REQUIRED ON
+    CXX_STANDARD 17
+    CXX_EXTENSIONS OFF
+  )
+  target_compile_definitions(iwyu-projected-use-test PRIVATE
+    ${LLVM_DEFINITIONS}
+  )
+  target_include_directories(iwyu-projected-use-test PRIVATE
+    ${iwyu_include_dirs}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  add_test(NAME projected_use_test
+    COMMAND $<TARGET_FILE:iwyu-projected-use-test>
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
 
   function(iwyu_add_test name file)
     add_test(NAME ${name}

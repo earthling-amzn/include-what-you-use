@@ -24,6 +24,7 @@
 #include "iwyu_location_util.h"
 #include "iwyu_path_util.h"
 #include "iwyu_preprocessor.h"
+#include "iwyu_projected_use.h"
 #include "iwyu_project_policy.h"
 #include "iwyu_stl_util.h"
 #include "iwyu_string_util.h"
@@ -2856,19 +2857,10 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
               preprocessor_info_->ActiveConditionAt(use.use_location)});
         }
       }
-      const auto use_key = [](const SemanticFact& fact) {
+      const auto fact_key = [](const SemanticFact& fact) {
         return std::make_tuple(
-            fact.use_location.path, fact.use_location.line,
-            fact.use_location.column, static_cast<int>(fact.condition.status),
-            fact.condition.expression,
-            fact.condition.directive_location.getRawEncoding(),
-            fact.condition.active_branch, fact.condition.source_region_id,
-            fact.condition.source_region_path);
-      };
-      const auto fact_key = [&](const SemanticFact& fact) {
-        return std::make_tuple(
-            fact.qualified_name, fact.name, fact.declaration.path,
-            fact.declaration.line, fact.declaration.column, use_key(fact));
+            fact.qualified_name, fact.declaration.path,
+            fact.declaration.line, fact.declaration.column, fact.name);
       };
       std::sort(facts.begin(), facts.end(),
                 [&](const SemanticFact& lhs, const SemanticFact& rhs) {
@@ -2880,26 +2872,22 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       while (begin < facts.size()) {
         size_t end = begin + 1;
         while (end < facts.size() &&
-               facts[end].qualified_name == facts[begin].qualified_name &&
-               facts[end].name == facts[begin].name) {
+               facts[end].qualified_name == facts[begin].qualified_name) {
           ++end;
         }
-        llvm::json::Array uses;
-        bool have_previous = false;
-        decltype(use_key(facts[begin])) previous;
+        vector<llvm::json::Object> projected_uses;
+        projected_uses.reserve(end - begin);
         for (size_t index = begin; index < end; ++index) {
-          const auto key = use_key(facts[index]);
-          if (have_previous && key == previous)
-            continue;
-          have_previous = true;
-          previous = key;
-          uses.push_back(llvm::json::Object{
+          projected_uses.push_back(llvm::json::Object{
               {"location", LocationObject(facts[index].use_location)},
               {"requirement", "full"},
               {"origin", "ast"},
               {"condition", ConditionObject(facts[index].condition)},
               {"macro", UnavailableValue()}});
         }
+        // fact_key puts the exact canonical emitted declaration first. This
+        // deliberately collapses redeclarations/instantiations sharing the
+        // stable qualified identity instead of emitting duplicate symbols.
         const SemanticFact& first = facts[begin];
         llvm::json::Object symbol{
             {"name", first.name},
@@ -2907,7 +2895,8 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
             {"declaration", llvm::json::Object{
                 {"status", "known"},
                 {"value", LocationObject(first.declaration)}}},
-            {"uses", std::move(uses)}};
+            {"uses", internal::SortAndDeduplicateProjectedUses(
+                         std::move(projected_uses))}};
         if (GlobalFlags().output_schema_version >= 2)
           symbol["declaration_kind"] = UnavailableValue();
         symbols.push_back(std::move(symbol));
@@ -2949,9 +2938,9 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       }
       const auto fact_key = [](const MacroFact& fact) {
         return std::make_tuple(
-            fact.fact->qualified_name, fact.fact->symbol_name,
-            fact.declaration.path, fact.declaration.line,
-            fact.declaration.column, fact.reference.path, fact.reference.line,
+            fact.fact->qualified_name, fact.declaration.path,
+            fact.declaration.line, fact.declaration.column,
+            fact.fact->symbol_name, fact.reference.path, fact.reference.line,
             fact.reference.column, fact.fact->macro_name,
             fact.definition.path, fact.definition.line, fact.definition.column,
             static_cast<int>(fact.condition.status), fact.condition.expression);
@@ -2960,11 +2949,6 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
                 [&](const MacroFact& lhs, const MacroFact& rhs) {
                   return fact_key(lhs) < fact_key(rhs);
                 });
-      facts.erase(std::unique(
-          facts.begin(), facts.end(), [&](const MacroFact& lhs,
-                                          const MacroFact& rhs) {
-            return fact_key(lhs) == fact_key(rhs);
-          }), facts.end());
 
       llvm::json::Array symbols;
       size_t begin = 0;
@@ -2972,19 +2956,14 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
         size_t end = begin + 1;
         while (end < facts.size() &&
                facts[end].fact->qualified_name ==
-                   facts[begin].fact->qualified_name &&
-               facts[end].fact->symbol_name ==
-                   facts[begin].fact->symbol_name &&
-               facts[end].declaration.path == facts[begin].declaration.path &&
-               facts[end].declaration.line == facts[begin].declaration.line &&
-               facts[end].declaration.column ==
-                   facts[begin].declaration.column) {
+                   facts[begin].fact->qualified_name) {
           ++end;
         }
-        llvm::json::Array uses;
+        vector<llvm::json::Object> projected_uses;
+        projected_uses.reserve(end - begin);
         for (size_t index = begin; index < end; ++index) {
           const MacroFact& fact = facts[index];
-          uses.push_back(llvm::json::Object{
+          projected_uses.push_back(llvm::json::Object{
               {"location", LocationObject(fact.reference)},
               {"requirement", "unknown"},
               {"origin", "macro"},
@@ -3005,7 +2984,8 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
             {"declaration", llvm::json::Object{
                 {"status", "known"},
                 {"value", LocationObject(first.declaration)}}},
-            {"uses", std::move(uses)}};
+            {"uses", internal::SortAndDeduplicateProjectedUses(
+                         std::move(projected_uses))}};
         if (GlobalFlags().output_schema_version >= 2)
           symbol["declaration_kind"] = UnavailableValue();
         symbols.push_back(std::move(symbol));
@@ -3072,23 +3052,10 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
           fact.location.column, requirement, identity_availability,
           static_cast<int>(fact.condition.status), fact.condition.expression);
     };
-    const auto use_identity_key = [](const UseFact& fact) {
-      const string primary = fact.has_qualified_name
-          ? fact.qualified_name : fact.name;
-      const int requirement = fact.use->is_full_use() ? 0 : 1;
-      return std::make_tuple(
-          primary, fact.name, fact.location.path, fact.location.line,
-          fact.location.column, requirement,
-          static_cast<int>(fact.condition.status), fact.condition.expression);
-    };
     std::sort(facts.begin(), facts.end(),
               [&](const UseFact& lhs, const UseFact& rhs) {
                 return fact_key(lhs) < fact_key(rhs);
               });
-    facts.erase(std::unique(
-        facts.begin(), facts.end(), [&](const UseFact& lhs, const UseFact& rhs) {
-          return use_identity_key(lhs) == use_identity_key(rhs);
-        }), facts.end());
 
     llvm::json::Array symbols;
     size_t begin = 0;
@@ -3102,10 +3069,11 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
                  group_identity) {
         ++end;
       }
-      llvm::json::Array uses;
+      vector<llvm::json::Object> projected_uses;
+      projected_uses.reserve(end - begin);
       for (size_t index = begin; index < end; ++index) {
         const UseFact& fact = facts[index];
-        uses.push_back(llvm::json::Object{
+        projected_uses.push_back(llvm::json::Object{
             {"location", LocationObject(fact.location)},
             {"requirement", fact.use->is_full_use()
                                 ? "full" : "forward_declaration"},
@@ -3140,7 +3108,8 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
         symbol["declaration_kind"] = declaration_kind.empty()
             ? UnavailableValue() : KnownString(declaration_kind);
       }
-      symbol["uses"] = std::move(uses);
+      symbol["uses"] = internal::SortAndDeduplicateProjectedUses(
+          std::move(projected_uses));
       symbols.push_back(std::move(symbol));
       begin = end;
     }
