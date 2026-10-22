@@ -544,6 +544,298 @@ rules:
     assert add["multi_config"]["status"] == "not_applicable"
     assert use["macro"]["status"] == "unavailable"
     assert changed["diagnostics"]
+
+    # Policy schema 2 authorizes only exact active file-scope additions.
+    exact_allow_policy = """schema_version: 2
+rules:
+  - id: exact-file-allow
+    action: allow_add
+    match:
+      includer: { glob: "*condition_add.cc" }
+      includee: { glob: "*tests/cxx/indirect.h" }
+      file_kind: source
+      active_condition: ENABLE_NATIVE_JSON_CONDITION
+      edit_lexical_scope: file
+      symbol: IndirectClass
+      configuration: policy-v2
+"""
+    exact_allow_result, exact_allow_path = run_with_temporary_policy(
+        "tests/native_json/condition_add.cc", exact_allow_policy,
+        "--configuration=policy-v2")
+    assert exact_allow_result.returncode == 0, exact_allow_result.stderr
+    assert exact_allow_result.stderr == ""
+    exact_allow_record = by_path(records(exact_allow_result), "condition_add.cc")
+    exact_allow_add = next(
+        operation for operation in exact_allow_record["operations"]
+        if operation["subject_action"] == "add" and
+        "tests/cxx/indirect.h" in operation["spelling"])
+    assert (exact_allow_add["disposition"], exact_allow_add["reason_code"]) == \
+        ("apply", "project_policy_allow_add")
+    assert exact_allow_add["policy"] == {
+        "status": "known",
+        "value": {"policy_file": exact_allow_path,
+                  "rule_id": "exact-file-allow", "decision": "allow"},
+    }
+    assert exact_allow_add["spelling"] in {
+        item["spelling"] for item in exact_allow_record["desired_state"]["items"]}
+    assert not any(diagnostic["code"].startswith("project_policy_")
+                   for diagnostic in exact_allow_record["diagnostics"])
+
+    # An allow is authorization, not a warning or an --error violation.
+    exact_allow_error, _ = run_with_temporary_policy(
+        "tests/native_json/condition_add.cc", exact_allow_policy,
+        "--configuration=policy-v2", "--error=9")
+    assert exact_allow_error.returncode == 0, exact_allow_error.stderr
+    records(exact_allow_error)
+
+    nested_allow_policy = """schema_version: 2
+rules:
+  - id: nested-file-allow
+    action: allow_add
+    match:
+      includee: { glob: "*tests/cxx/indirect.h" }
+      active_condition: "(ENABLE_OUTER_CONDITION) && (!(SELECT_LEFT_CONDITION))"
+      edit_lexical_scope: file
+"""
+    nested_allow_result, _ = run_with_temporary_policy(
+        "tests/native_json/condition_nested_else.cc", nested_allow_policy)
+    assert nested_allow_result.returncode == 0, nested_allow_result.stderr
+    nested_allow_record = by_path(records(nested_allow_result),
+                                  "condition_nested_else.cc")
+    nested_allow_add = next(operation for operation
+                            in nested_allow_record["operations"]
+                            if operation["subject_action"] == "add")
+    assert nested_allow_add["reason_code"] == "project_policy_allow_add"
+    nested_path = nested_allow_add["edit_condition"]["value"][
+        "source_region_path"]
+    nested_regions = {region["source_region_id"]: region
+                      for region in nested_allow_record["conditional_regions"]}
+    assert len(nested_path) == 2
+    assert [nested_regions[region]["lexical_scope"]
+            for region in nested_path] == ["file", "file"]
+
+    def ordered_policy(first_action, second_action):
+        return f"""schema_version: 2
+rules:
+  - id: first-{first_action}
+    action: {first_action}
+    match:
+      includee: {{ glob: "*tests/cxx/indirect.h" }}
+      active_condition: ENABLE_NATIVE_JSON_CONDITION
+      edit_lexical_scope: file
+  - id: second-{second_action}
+    action: {second_action}
+    match:
+      includee: {{ glob: "*tests/cxx/indirect.h" }}
+      active_condition: ENABLE_NATIVE_JSON_CONDITION
+      edit_lexical_scope: file
+"""
+
+    for first_action, second_action, reason, decision in (
+            ("deny_add", "allow_add", "project_policy_deny_add", "deny"),
+            ("allow_add", "deny_add", "project_policy_allow_add", "allow")):
+        ordered_result, _ = run_with_temporary_policy(
+            "tests/native_json/condition_add.cc",
+            ordered_policy(first_action, second_action))
+        assert ordered_result.returncode == 0, ordered_result.stderr
+        ordered_record = by_path(records(ordered_result), "condition_add.cc")
+        ordered_add = next(operation for operation
+                           in ordered_record["operations"]
+                           if operation["subject_action"] == "add")
+        assert ordered_add["reason_code"] == reason
+        assert ordered_add["policy"]["value"]["decision"] == decision
+        assert ordered_add["policy"]["value"]["rule_id"] == \
+            "first-" + first_action
+
+    # Every known mismatch continues to the later deny, including
+    # configuration, includer/includee, and source platform condition.
+    mismatch_allow_policy = """schema_version: 2
+rules:
+  - id: wrong-configuration
+    action: allow_add
+    match:
+      includee: { glob: "*tests/cxx/indirect.h" }
+      active_condition: ENABLE_NATIVE_JSON_CONDITION
+      edit_lexical_scope: file
+      configuration: other-config
+  - id: wrong-includee
+    action: allow_add
+    match:
+      includee: { glob: "*other-platform.hpp" }
+      active_condition: ENABLE_NATIVE_JSON_CONDITION
+      edit_lexical_scope: file
+  - id: wrong-includer
+    action: allow_add
+    match:
+      includer: { glob: "*other-platform.cc" }
+      active_condition: ENABLE_NATIVE_JSON_CONDITION
+      edit_lexical_scope: file
+  - id: wrong-platform-condition
+    action: allow_add
+    match:
+      includee: { glob: "*tests/cxx/indirect.h" }
+      active_condition: defined(OTHER_PLATFORM)
+      edit_lexical_scope: file
+  - id: later-deny-after-known-mismatches
+    action: deny_add
+    match: { includee: { glob: "*tests/cxx/indirect.h" } }
+"""
+    mismatch_allow_result, _ = run_with_temporary_policy(
+        "tests/native_json/condition_add.cc", mismatch_allow_policy,
+        "--configuration=policy-v2")
+    assert mismatch_allow_result.returncode == 0, mismatch_allow_result.stderr
+    mismatch_allow_record = by_path(records(mismatch_allow_result),
+                                    "condition_add.cc")
+    mismatch_allow_add = next(operation for operation
+                              in mismatch_allow_record["operations"]
+                              if operation["subject_action"] == "add")
+    assert mismatch_allow_add["reason_code"] == "project_policy_deny_add"
+    assert mismatch_allow_add["policy"]["value"]["rule_id"] == \
+        "later-deny-after-known-mismatches"
+
+    # A constrained allow cannot authorize an unconditional addition; the
+    # later unconditional deny still applies.
+    unconditional_order_policy = """schema_version: 2
+rules:
+  - id: conditional-allow-cannot-match-unconditional
+    action: allow_add
+    match:
+      includee: { glob: "*policy002_provider.inline.hpp" }
+      active_condition: ENABLE_NATIVE_JSON_CONDITION
+      edit_lexical_scope: file
+  - id: unconditional-later-deny
+    action: deny_add
+    match: { includee: { glob: "*policy002_provider.inline.hpp" } }
+"""
+    unconditional_order_result, _ = run_with_temporary_policy(
+        "tests/native_json/policy002_source.cc", unconditional_order_policy)
+    assert unconditional_order_result.returncode == 0, \
+        unconditional_order_result.stderr
+    unconditional_order_record = by_path(records(unconditional_order_result),
+                                         "policy002_source.cc")
+    unconditional_order_add = next(
+        operation for operation in unconditional_order_record["operations"]
+        if operation["subject_action"] == "add" and
+        "policy002_provider.inline.hpp" in operation["spelling"])
+    assert unconditional_order_add["policy"]["value"]["rule_id"] == \
+        "unconditional-later-deny"
+
+    # A known non-file scope mismatches the bounded allow and continues to the
+    # later deny. This policy fact does not change the emitted region census.
+    non_file_policy = """schema_version: 2
+rules:
+  - id: file-only-allow
+    action: allow_add
+    match:
+      includee: { glob: "*tests/cxx/indirect.h" }
+      active_condition: POLICY_NON_FILE_CONDITION
+      edit_lexical_scope: file
+  - id: deny-non-file-add
+    action: deny_add
+    match: { includee: { glob: "*tests/cxx/indirect.h" } }
+"""
+    non_file_result, _ = run_with_temporary_policy(
+        "tests/native_json/policy_scope_non_file.cc", non_file_policy,
+        "--configuration=scope", "--error=8")
+    assert non_file_result.returncode == 8, non_file_result.stderr
+    non_file_record = by_path(records(non_file_result),
+                              "policy_scope_non_file.cc")
+    non_file_add = next(operation for operation in non_file_record["operations"]
+                        if operation["subject_action"] == "add" and
+                        operation["item_kind"] == "include")
+    assert non_file_add["policy"]["value"]["rule_id"] == "deny-non-file-add"
+    non_file_ids = non_file_add["edit_condition"]["value"][
+        "source_region_path"]
+    non_file_regions = {region["source_region_id"]: region
+                        for region in non_file_record["conditional_regions"]}
+    assert [non_file_regions[region]["lexical_scope"]
+            for region in non_file_ids] == ["non_file"]
+
+    # Unknown scope at the first otherwise matching addition-family rule is a
+    # fail-closed suppression with unavailable policy provenance.
+    scope_unknown_policy = """schema_version: 2
+rules:
+  - id: first-scope-is-indeterminate
+    action: deny_add
+    match:
+      includee: { glob: "*tests/cxx/indirect.h" }
+      edit_lexical_scope: file
+  - id: later-deny-must-not-win
+    action: deny_add
+    match: { includee: { glob: "*tests/cxx/indirect.h" } }
+"""
+    scope_unknown_result, _ = run_with_temporary_policy(
+        "tests/native_json/repeated_condition_driver.cc",
+        scope_unknown_policy,
+        "--check_also=tests/native_json/repeated_condition.hpp")
+    assert scope_unknown_result.returncode == 0, scope_unknown_result.stderr
+    scope_unknown_record = by_path(records(scope_unknown_result),
+                                   "repeated_condition.hpp")
+    scope_unknown_add = next(operation for operation
+                             in scope_unknown_record["operations"]
+                             if operation["subject_action"] == "add")
+    assert (scope_unknown_add["disposition"],
+            scope_unknown_add["reason_code"]) == (
+                "suppress", "project_policy_edit_lexical_scope_unknown")
+    assert scope_unknown_add["policy"]["status"] == "unavailable"
+    scope_diagnostics = [diagnostic for diagnostic
+                         in scope_unknown_record["diagnostics"]
+                         if diagnostic["code"] ==
+                         "project_policy_edit_lexical_scope_unknown"]
+    assert len(scope_diagnostics) == 1
+    assert "edit_lexical_scope" in scope_diagnostics[0]["message"]
+    assert "first-scope-is-indeterminate" in scope_diagnostics[0]["message"]
+    assert "later-deny-must-not-win" not in scope_diagnostics[0]["message"]
+
+    # no_include remains stronger than an otherwise exact allow.
+    pragma_allow_policy = """schema_version: 2
+rules:
+  - id: pragma-must-remain-stronger
+    action: allow_add
+    match:
+      includee: { glob: "*tests/cxx/indirect.h" }
+      active_condition: POLICY_PRAGMA_CONDITION
+      edit_lexical_scope: file
+"""
+    pragma_allow_result, _ = run_with_temporary_policy(
+        "tests/native_json/policy_scope_pragma.cc", pragma_allow_policy)
+    assert pragma_allow_result.returncode == 0, pragma_allow_result.stderr
+    pragma_allow_record = by_path(records(pragma_allow_result),
+                                  "policy_scope_pragma.cc")
+    pragma_allow_add = next(operation for operation
+                            in pragma_allow_record["operations"]
+                            if operation["subject_action"] == "add" and
+                            operation["item_kind"] == "include")
+    assert pragma_allow_add["reason_code"] == "pragma_no_include"
+    assert pragma_allow_add["policy"]["status"] == "unavailable"
+
+    # Prefix-header decisions likewise remain stronger than allow_add.
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", dir=ROOT,
+                                     delete=False) as stream:
+        stream.write(exact_allow_policy.replace(
+            "      configuration: policy-v2\n", ""))
+        prefix_allow_path = Path(stream.name).resolve()
+    try:
+        prefix_allow_result = subprocess.run(
+            [str(IWYU), "-Xiwyu", "--output_format=json", "-Xiwyu",
+             "--output_schema=2", "-Xiwyu",
+             "--project_policy=" + str(prefix_allow_path), "-Xiwyu",
+             "--prefix_header_includes=remove", "-include",
+             "tests/cxx/indirect.h", "-I", ".", "-std=c++17",
+             "tests/native_json/condition_add.cc"],
+            cwd=ROOT, text=True, capture_output=True)
+    finally:
+        prefix_allow_path.unlink()
+    assert prefix_allow_result.returncode == 0, prefix_allow_result.stderr
+    prefix_allow_record = by_path(records(prefix_allow_result),
+                                  "condition_add.cc")
+    prefix_allow_add = next(
+        operation for operation in prefix_allow_record["operations"]
+        if operation["subject_action"] == "add" and
+        operation["item_kind"] == "include" and
+        "tests/cxx/indirect.h" in operation["spelling"])
+    assert prefix_allow_add["reason_code"] == "prefix_header_add_suppressed"
+    assert prefix_allow_add["policy"]["status"] == "unavailable"
     assert first.stderr == ""
 
     # Policy decisions survive final desired-state calculation.

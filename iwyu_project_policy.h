@@ -20,6 +20,7 @@ using std::string;
 using std::vector;
 
 enum class ProjectPolicyAction {
+  AllowAdd,
   DenyAdd,
   DenyRemove,
   Keep,
@@ -53,6 +54,19 @@ struct ProjectPolicyActiveCondition {
   string expression;
 };
 
+enum class ProjectPolicyLexicalScopeAvailability {
+  NotApplicable,
+  Known,
+  Unknown,
+};
+
+// Scope is populated only when availability is Known.
+struct ProjectPolicyEditLexicalScope {
+  ProjectPolicyLexicalScopeAvailability availability =
+      ProjectPolicyLexicalScopeAvailability::Unknown;
+  string scope;
+};
+
 // Decision is populated only for Match. The indeterminate fields identify the
 // rule where ordered lookup stopped, but do not represent a matched decision.
 struct ProjectPolicyMatchResult {
@@ -66,6 +80,7 @@ struct ProjectPolicyMatchResult {
   std::optional<ProjectPolicyDecision> decision;
   string indeterminate_policy_file;
   string indeterminate_rule_id;
+  string indeterminate_fact;
 };
 
 // Runtime facts supplied by the analyzer. Paths use '/' separators. Includee
@@ -75,6 +90,7 @@ struct ProjectPolicyMatchContext {
   string includee;
   string file_kind;
   ProjectPolicyActiveCondition active_condition;
+  ProjectPolicyEditLexicalScope edit_lexical_scope;
   vector<string> symbols;
   string configuration;
 };
@@ -91,6 +107,7 @@ class ProjectPolicy {
 
   // Rejects recognized rules that this migration phase cannot safely apply.
   bool ValidateRuntimeCapabilities(bool has_configuration,
+                                   bool has_structured_schema_v2,
                                    string* error) const;
 
   ProjectPolicyMatchResult FirstMatchingRule(

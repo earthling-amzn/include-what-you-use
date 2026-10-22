@@ -102,7 +102,7 @@ static void PrintHelp(const char* extra_msg) {
          "        project policy file.\n"
          "   --configuration=<name>: labels this analysis invocation for\n"
          "        project-policy matching and structured output.\n"
-         "   project-policy-enabled-actions: deny_add,deny_remove,keep\n"
+         "   project-policy-enabled-actions: allow_add,deny_add,deny_remove,keep\n"
          "   --no_default_mappings: do not add iwyu's default mappings.\n"
          "   --pch_in_code: mark the first include in a translation unit as a\n"
          "        precompiled header.  Use --pch_in_code to prevent IWYU from\n"
@@ -386,8 +386,12 @@ static void LoadProjectPolicy() {
       commandline_flags->project_policy_file, &error);
   if (!loaded)
     StructuredOutputError(error.c_str());
+  const bool has_structured_schema_v2 =
+      commandline_flags->output_format == CommandlineFlags::kJsonOutput &&
+      commandline_flags->output_schema_version == 2;
   if (!loaded->ValidateRuntimeCapabilities(
-          commandline_flags->has_configuration, &error)) {
+          commandline_flags->has_configuration, has_structured_schema_v2,
+          &error)) {
     StructuredOutputError(error.c_str());
   }
   project_policy = std::move(loaded);

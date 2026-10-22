@@ -1,4 +1,4 @@
-"""Opaque contracts for strict version-1 project-policy parsing."""
+"""Opaque contracts for strict versioned project-policy parsing."""
 
 import json
 from pathlib import Path
@@ -41,7 +41,9 @@ def expect_ok(data, *args):
     assert result.returncode == 0, result.stderr
     assert result.stderr == "", result.stderr
     records = [json.loads(line) for line in result.stdout.splitlines()]
-    assert records and all(record["schema_version"] == 1 for record in records)
+    expected_schema = 2 if "--output_schema=2" in args else 1
+    assert records and all(record["schema_version"] == expected_schema
+                           for record in records)
     return records
 
 
@@ -72,8 +74,8 @@ def expect_error(data, fragment, *args):
 
 
 def policy(match="includer: { glob: never-match }", action="deny_add",
-           rule_id="parser-rule"):
-    return f"""schema_version: 1
+           rule_id="parser-rule", schema_version=1):
+    return f"""schema_version: {schema_version}
 rules:
   - id: {rule_id}
     action: {action}
@@ -83,8 +85,48 @@ rules:
 
 
 def main():
+
+    help_result = subprocess.run([str(IWYU), "--help"], cwd=ROOT, text=True,
+                                 capture_output=True)
+    assert help_result.returncode == 0, help_result.stderr
+    assert "project-policy-enabled-actions: " \
+           "allow_add,deny_add,deny_remove,keep" in help_result.stdout
     # Empty YAML and JSON-compatible policies are valid no-ops.
     expect_ok("schema_version: 1\nrules: []\n")
+
+    # Version 2 adds one exact scope fact and bounded allow_add. Version 1
+    # remains closed and rejects both additions to its grammar.
+    expect_ok("schema_version: 2\nrules: []\n")
+    expect_ok(policy("edit_lexical_scope: non_file", schema_version=2))
+    bounded_allow = policy(
+        "active_condition: 'defined(FEATURE)'\n"
+        "      edit_lexical_scope: file",
+        action="allow_add", schema_version=2)
+    expect_ok(bounded_allow, "--output_schema=2")
+    expect_error(policy(action="allow_add"), "unknown action 'allow_add'")
+    expect_error(policy("edit_lexical_scope: file"),
+                 "unknown match key 'edit_lexical_scope'")
+    expect_error(policy("edit_lexical_scope: translation_unit",
+                        schema_version=2),
+                 "unknown edit_lexical_scope 'translation_unit'")
+    expect_error(policy("edit_lexical_scope: true", schema_version=2),
+                 "'edit_lexical_scope' must be a string scalar")
+    for broad_match in (
+            "edit_lexical_scope: file",
+            "active_condition: 'defined(FEATURE)'",
+            "active_condition: 'defined(FEATURE)'\n"
+            "      edit_lexical_scope: non_file"):
+        expect_error(policy(broad_match, action="allow_add", schema_version=2),
+                     "allow_add requires exact active_condition and "
+                     "edit_lexical_scope: file")
+
+    # An allow policy cannot silently degrade through text or JSON schema 1.
+    allow_text = with_policy(bounded_allow, json_output=False)
+    assert allow_text.returncode != 0 and allow_text.stdout == ""
+    assert "allow_add requires native structured output schema 2" in \
+        allow_text.stderr
+    expect_error(bounded_allow,
+                 "allow_add requires native structured output schema 2")
     expect_ok('{"schema_version":1,"rules":[]}\n')
 
     # Every currently evaluable match dimension parses transactionally.
@@ -200,7 +242,7 @@ rules:
         "'symbol' contains an embedded NUL")
 
     # Version, enums, IDs and precompiled patterns are validated before use.
-    expect_error("schema_version: 2\nrules: []\n", "unsupported schema_version '2'")
+    expect_error("schema_version: 3\nrules: []\n", "unsupported schema_version '3'")
     expect_error('schema_version: "1"\nrules: []\n',
                  "'schema_version' must be an integer")
     expect_error(policy(action="unknown"), "unknown action 'unknown'")

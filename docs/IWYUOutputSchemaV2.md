@@ -57,6 +57,15 @@ declaration-embedded, malformed, and uncertain locations are `non_file` or
 
 Every version-2 record has `source_identity`, `source_digest`,
 `declaration_facts`, and `declaration_conflicts`. `source_identity` is the
+
+Policy schema-v2 `allow_add` consumes this census as an authorization fact. An
+exact condition-bound operation is policy `file` only when every region on its
+exact FileID/path is uniquely present, active, and `lexical_scope: file`; any
+definite non-file ancestor makes it `non_file`, and missing, repeated,
+disagreeing, or unknown facts make it `unknown`. A matched allow emits
+`project_policy_allow_add`, `add/apply`, and known `allow` provenance without a
+warning or policy error count. This policy fact does not modify
+`conditional_regions`, `edit_condition`, or consumer-side insertion checks.
 normalized absolute physical path from Clang's `FileEntry` real path. It is
 separate from `file.path`, which retains the source spelling used for locations
 and edits. `source_digest` is SHA-256 over the exact bytes in Clang's analyzed

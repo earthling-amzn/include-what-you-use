@@ -2704,6 +2704,64 @@ ProjectPolicyActiveCondition PolicyActiveCondition(
   return result;
 }
 
+ProjectPolicyEditLexicalScope PolicyEditLexicalScope(
+    const IwyuPreprocessorInfo* preprocessor_info, const FileEntry* file,
+    const IwyuPreprocessorInfo::ActiveCondition& condition) {
+  using ConditionStatus = IwyuPreprocessorInfo::ActiveCondition::Status;
+  using Activity = IwyuPreprocessorInfo::BranchActivity;
+  using Scope = IwyuPreprocessorInfo::LexicalScope;
+  ProjectPolicyEditLexicalScope result;
+  if (condition.status == ConditionStatus::kNotApplicable) {
+    result.availability =
+        ProjectPolicyLexicalScopeAvailability::NotApplicable;
+    return result;
+  }
+  if (condition.status != ConditionStatus::kKnown ||
+      !condition.active_branch || condition.source_region_path.empty() ||
+      condition.source_region_id != condition.source_region_path.back()) {
+    return result;
+  }
+
+  SourceLocation directive =
+      GlobalSourceManager()->getExpansionLoc(condition.directive_location);
+  if (directive.isInvalid() || !directive.isFileID())
+    return result;
+  const clang::FileID condition_file_id =
+      GlobalSourceManager()->getFileID(directive);
+  if (condition_file_id.isInvalid())
+    return result;
+  const unsigned exact_file_id = condition_file_id.getHashValue();
+  const vector<IwyuPreprocessorInfo::ConditionalRegion> census =
+      preprocessor_info->ConditionalRegionsFor(file);
+
+  bool any_non_file = false;
+  string expected_parent;
+  for (const string& source_region_id : condition.source_region_path) {
+    const IwyuPreprocessorInfo::ConditionalRegion* exact = nullptr;
+    size_t count = 0;
+    for (const auto& region : census) {
+      if (region.file_id == exact_file_id &&
+          region.source_region_id == source_region_id) {
+        exact = &region;
+        ++count;
+      }
+    }
+    if (count != 1 || !exact ||
+        exact->parent_source_region_id != expected_parent ||
+        exact->activity != Activity::kActive ||
+        exact->lexical_scope == Scope::kUnknown) {
+      return result;
+    }
+    any_non_file = any_non_file ||
+                   exact->lexical_scope == Scope::kNonFile;
+    expected_parent = source_region_id;
+  }
+
+  result.availability = ProjectPolicyLexicalScopeAvailability::Known;
+  result.scope = any_non_file ? "non_file" : "file";
+  return result;
+}
+
 llvm::json::Object KnownString(const string& value) {
   return llvm::json::Object{{"status", "known"}, {"value", value}};
 }
@@ -3814,7 +3872,7 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
   size_t project_policy_violations = 0;
   const ProjectPolicy* project_policy = GlobalProjectPolicy();
   if (project_policy) {
-    const auto addition_active_condition =
+    const auto addition_condition =
         [&](const OneIncludeOrForwardDeclareLine& line) {
           using ActiveCondition = IwyuPreprocessorInfo::ActiveCondition;
           bool found = false;
@@ -3838,11 +3896,10 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
                 common.active_branch != condition.active_branch ||
                 common.source_region_id != condition.source_region_id ||
                 common.source_region_path != condition.source_region_path) {
-              return ProjectPolicyActiveCondition{};
+              return ActiveCondition{};
             }
           }
-          return found ? PolicyActiveCondition(common)
-                       : ProjectPolicyActiveCondition{};
+          return found ? common : ActiveCondition{};
         };
 
     for (OneIncludeOrForwardDeclareLine& line : lines_) {
@@ -3863,7 +3920,11 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
       context.includer = file_path();
       context.includee = includee;
       context.file_kind = ProjectPolicyFileKind(context.includer);
-      context.active_condition = addition_active_condition(line);
+      const IwyuPreprocessorInfo::ActiveCondition condition =
+          addition_condition(line);
+      context.active_condition = PolicyActiveCondition(condition);
+      context.edit_lexical_scope =
+          PolicyEditLexicalScope(preprocessor_info_, file_, condition);
       if (GlobalFlags().has_configuration)
         context.configuration = GlobalFlags().configuration;
 
@@ -3884,27 +3945,25 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
           context.symbols.end());
 
       const ProjectPolicyMatchResult match =
-          project_policy->FirstMatchingRule(ProjectPolicyAction::DenyAdd,
+          project_policy->FirstMatchingRule(ProjectPolicyActionFamily::Addition,
                                             context);
       if (match.kind == ProjectPolicyMatchResult::Kind::NoMatch)
         continue;
       if (match.kind == ProjectPolicyMatchResult::Kind::Indeterminate) {
+        const string reason_code = "project_policy_" +
+            match.indeterminate_fact + "_unknown";
         const string reason =
             "Project policy '" + match.indeterminate_policy_file +
             "' rule '" + match.indeterminate_rule_id +
-            "' could not determine whether active_condition matches while "
-            "evaluating addition of " + line.quoted_include() + " to " +
-            context.includer + "; the addition is suppressed.";
-        line.SetStructuredDecision(
-            "add", "suppress", "project_policy_active_condition_unknown",
-            reason);
+            "' could not determine whether " + match.indeterminate_fact +
+            " matches while evaluating addition of " +
+            line.quoted_include() + " to " + context.includer +
+            "; the addition is suppressed.";
+        line.SetStructuredDecision("add", "suppress", reason_code, reason);
         line.clear_desired();
-        AddStructuredDiagnostic(
-            diagnostic_location, "project_policy_active_condition_unknown",
-            reason);
+        AddStructuredDiagnostic(diagnostic_location, reason_code, reason);
         if (GlobalFlags().output_format == CommandlineFlags::kTextOutput) {
-          errs() << context.includer
-                 << ": warning: project_policy_active_condition_unknown: "
+          errs() << context.includer << ": warning: " << reason_code << ": "
                  << reason << '\n';
         }
         ++project_policy_violations;
@@ -3912,6 +3971,16 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
       }
 
       const ProjectPolicyDecision& decision = *match.decision;
+      if (decision.action == ProjectPolicyAction::AllowAdd) {
+        const string reason = "Project policy '" + decision.policy_file +
+            "' rule '" + decision.rule_id + "' allows adding " +
+            line.quoted_include() + " to " + context.includer + ".";
+        line.SetProjectPolicyDecision(
+            "add", "apply", "project_policy_allow_add", reason,
+            decision.policy_file, decision.rule_id, "allow");
+        continue;
+      }
+
       const string reason = "Project policy '" + decision.policy_file +
           "' rule '" + decision.rule_id + "' denies adding " +
           line.quoted_include() + " to " + context.includer + ".";
@@ -3946,9 +4015,12 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
       context.includer = file_path();
       context.includee = includee;
       context.file_kind = ProjectPolicyFileKind(context.includer);
-      context.active_condition = PolicyActiveCondition(
+      const IwyuPreprocessorInfo::ActiveCondition condition =
           preprocessor_info_->DirectIncludeConditionAt(
-              file_, line.quoted_include(), line.start_linenum()));
+              file_, line.quoted_include(), line.start_linenum());
+      context.active_condition = PolicyActiveCondition(condition);
+      context.edit_lexical_scope =
+          PolicyEditLexicalScope(preprocessor_info_, file_, condition);
       if (GlobalFlags().has_configuration)
         context.configuration = GlobalFlags().configuration;
 
@@ -3958,22 +4030,21 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
       if (match.kind == ProjectPolicyMatchResult::Kind::NoMatch)
         continue;
       if (match.kind == ProjectPolicyMatchResult::Kind::Indeterminate) {
+        const string reason_code = "project_policy_" +
+            match.indeterminate_fact + "_unknown";
         const string reason =
             "Project policy '" + match.indeterminate_policy_file +
             "' rule '" + match.indeterminate_rule_id +
-            "' could not determine whether active_condition matches while "
-            "evaluating removal of " + line.quoted_include() + " from " +
-            context.includer + "; the removal is suppressed.";
+            "' could not determine whether " + match.indeterminate_fact +
+            " matches while evaluating removal of " +
+            line.quoted_include() + " from " + context.includer +
+            "; the removal is suppressed.";
         line.SetStructuredDecision(
-            "remove", "suppress", "project_policy_active_condition_unknown",
-            reason);
+            "remove", "suppress", reason_code, reason);
         line.set_desired();
-        AddStructuredDiagnostic(
-            SourceLocation(), "project_policy_active_condition_unknown",
-            reason);
+        AddStructuredDiagnostic(SourceLocation(), reason_code, reason);
         if (GlobalFlags().output_format == CommandlineFlags::kTextOutput) {
-          errs() << context.includer
-                 << ": warning: project_policy_active_condition_unknown: "
+          errs() << context.includer << ": warning: " << reason_code << ": "
                  << reason << '\n';
         }
         ++project_policy_violations;
@@ -4033,7 +4104,14 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
   if (GlobalFlags().output_format == CommandlineFlags::kTextOutput)
     errs() << diff_output;
 
-  return num_edits + project_policy_violations;
+  const size_t allowed_additions = std::count_if(
+      lines_.begin(), lines_.end(),
+      [](const OneIncludeOrForwardDeclareLine& line) {
+        return !line.is_present() && line.is_desired() &&
+               line.decision_reason_code() == "project_policy_allow_add";
+      });
+  CHECK_(allowed_additions <= num_edits);
+  return num_edits - allowed_additions + project_policy_violations;
 }
 
 }  // namespace include_what_you_use
