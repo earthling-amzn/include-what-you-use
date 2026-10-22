@@ -4098,12 +4098,20 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
   }
 
   string diff_output;
-  size_t num_edits = internal::PrintableDiffs(
+  internal::PrintableDiffs(
       GetFilePath(file_), preprocessor_info_, printable_associated_includes,
       lines_, &diff_output);
   if (GlobalFlags().output_format == CommandlineFlags::kTextOutput)
     errs() << diff_output;
 
+  // Count semantic edits directly from the operation state. PrintableDiffs
+  // deliberately gates parts of its rendering on verbosity, but --error and
+  // project-policy accounting must not depend on which diff sections print.
+  const size_t num_edits = std::count_if(
+      lines_.begin(), lines_.end(),
+      [](const OneIncludeOrForwardDeclareLine& line) {
+        return line.is_present() != line.is_desired();
+      });
   const size_t allowed_additions = std::count_if(
       lines_.begin(), lines_.end(),
       [](const OneIncludeOrForwardDeclareLine& line) {

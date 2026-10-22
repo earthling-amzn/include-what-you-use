@@ -561,7 +561,7 @@ rules:
 """
     exact_allow_result, exact_allow_path = run_with_temporary_policy(
         "tests/native_json/condition_add.cc", exact_allow_policy,
-        "--configuration=policy-v2")
+        "--configuration=policy-v2", "--verbose=0")
     assert exact_allow_result.returncode == 0, exact_allow_result.stderr
     assert exact_allow_result.stderr == ""
     exact_allow_record = by_path(records(exact_allow_result), "condition_add.cc")
@@ -584,7 +584,7 @@ rules:
     # An allow is authorization, not a warning or an --error violation.
     exact_allow_error, _ = run_with_temporary_policy(
         "tests/native_json/condition_add.cc", exact_allow_policy,
-        "--configuration=policy-v2", "--error=9")
+        "--configuration=policy-v2", "--verbose=0", "--error=9")
     assert exact_allow_error.returncode == 0, exact_allow_error.stderr
     records(exact_allow_error)
 
