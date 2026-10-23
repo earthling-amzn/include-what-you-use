@@ -1,0 +1,8 @@
+#ifndef TESTS_OCCURRENCE_RELOCATION_PROVIDER_HPP_
+#define TESTS_OCCURRENCE_RELOCATION_PROVIDER_HPP_
+
+struct OccurrenceRelocatedInclude {
+  int value;
+};
+
+#endif  // TESTS_OCCURRENCE_RELOCATION_PROVIDER_HPP_

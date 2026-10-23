@@ -52,11 +52,32 @@ def range_key(value):
             start["column"], end["line"], end["column"])
 
 
+def condition_key(condition):
+    rank = {"known": 0, "unknown": 1, "unavailable": 2,
+            "not_applicable": 3}
+    status = condition["status"]
+    if status != "known":
+        return (rank[status], "", "", 0, 0, False, "", ())
+    value = condition["value"]
+    location = value["location"]
+    if location["status"] == "known":
+        location_value = location["value"]
+        path = location_value["path"]
+        line = location_value["line"]
+        column = location_value["column"]
+    else:
+        path, line, column = "", 0, 0
+    return (rank[status], value["expression"], path, line, column,
+            value["active_branch"], value.get("source_region_id", ""),
+            tuple(value.get("source_region_path", ())))
+
+
 def operation_key(op):
     return (SUBJECT_RANK[op["subject_action"]],
             DISPOSITION_RANK[op["disposition"]],
             KIND_RANK[op["item_kind"]], range_key(op["source_range"]),
-            op["spelling"], op["reason_code"])
+            op["spelling"], op["reason_code"],
+            condition_key(op["edit_condition"]))
 
 
 def available_name(value, fallback):
@@ -152,11 +173,34 @@ def semantic_errors(record):
         errors.append("operation IDs are not sequential in output order")
     if operations != sorted(operations, key=operation_key):
         errors.append("operations are not deterministically sorted")
-    op_identities = [(op["subject_action"], op["item_kind"], op["spelling"],
-                      canonical(op["source_range"]))
-                     for op in operations]
+    if record["schema_version"] == 2:
+        op_identities = [
+            (op["subject_action"], op["item_kind"], op["spelling"],
+             canonical(op["source_range"]), canonical(op["edit_condition"]))
+            for op in operations]
+    else:
+        op_identities = [
+            (op["subject_action"], op["item_kind"], op["spelling"],
+             canonical(op["source_range"]))
+            for op in operations]
     if len(op_identities) != len(set(op_identities)):
         errors.append("duplicate semantic operation identity")
+
+    if record["schema_version"] == 2:
+        present_occurrences = {}
+        for op in operations:
+            if op["subject_action"] not in ("remove", "keep"):
+                continue
+            occurrence = (
+                op["item_kind"], op["spelling"],
+                canonical(op["source_range"]))
+            if op["source_range"]["status"] != "known":
+                occurrence += (canonical(op["edit_condition"]),)
+            previous = present_occurrences.get(occurrence)
+            if previous is not None:
+                errors.append(
+                    f"{previous} and {op['id']}: ambiguous same present occurrence")
+            present_occurrences[occurrence] = op["id"]
 
     associations = record["associated_headers"]
     association_key = lambda a: (a["path"], a["relationship"], a["reason_code"])
@@ -320,16 +364,39 @@ def semantic_errors(record):
         if len(keys) != len(set(keys)):
             errors.append("duplicate desired-state item")
         desired_spellings = set(keys)
-        for op in operations:
-            key = (op["item_kind"], op["spelling"])
-            should_be_present = (
-                (op["subject_action"] == "add" and op["disposition"] == "apply") or
-                (op["subject_action"] == "remove" and op["disposition"] != "apply") or
-                op["subject_action"] == "keep")
-            if should_be_present and key not in desired_spellings:
-                errors.append(f"{op['id']}: no-edit/applied-add item missing from desired state")
-            if not should_be_present and key in desired_spellings:
-                errors.append(f"{op['id']}: removed/suppressed-add item remains in desired state")
+        if record["schema_version"] == 1:
+            for op in operations:
+                key = (op["item_kind"], op["spelling"])
+                should_be_present = (
+                    (op["subject_action"] == "add" and
+                     op["disposition"] == "apply") or
+                    (op["subject_action"] == "remove" and
+                     op["disposition"] != "apply") or
+                    op["subject_action"] == "keep")
+                if should_be_present and key not in desired_spellings:
+                    errors.append(
+                        f"{op['id']}: no-edit/applied-add item missing from desired state")
+                if not should_be_present and key in desired_spellings:
+                    errors.append(
+                        f"{op['id']}: removed/suppressed-add item remains in desired state")
+        else:
+            operations_by_key = {}
+            for op in operations:
+                key = (op["item_kind"], op["spelling"])
+                operations_by_key.setdefault(key, []).append(op)
+            for key, key_operations in operations_by_key.items():
+                presence_witnesses = [
+                    op for op in key_operations
+                    if ((op["subject_action"] == "add" and
+                         op["disposition"] == "apply") or
+                        (op["subject_action"] == "remove" and
+                         op["disposition"] != "apply") or
+                        op["subject_action"] == "keep")]
+                if ((key in desired_spellings) !=
+                        bool(presence_witnesses)):
+                    ids = ", ".join(op["id"] for op in key_operations)
+                    errors.append(
+                        f"{ids}: operation group contradicts desired state")
     return errors
 
 

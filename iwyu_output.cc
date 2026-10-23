@@ -2800,9 +2800,14 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
   const bool has_duplicate_occurrence = std::any_of(
       present_occurrences.begin(), present_occurrences.end(),
       [](const auto& occurrence) { return occurrence.second > 1; });
+  // Version 1 has only key-level identity and cannot distinguish duplicate
+  // physical occurrences. Version 2 identifies present operations by their
+  // exact source range and condition, so it can express occurrence relocation.
+  const bool has_unrepresentable_duplicate =
+      GlobalFlags().output_schema_version == 1 && has_duplicate_occurrence;
 
   vector<OperationRef> operations;
-  if (!has_duplicate_occurrence) {
+  if (!has_unrepresentable_duplicate) {
     for (const OneIncludeOrForwardDeclareLine& line : lines_) {
       if (line.is_elaborated_type())
         continue;
@@ -2828,6 +2833,82 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
     }
   }
 
+  if (GlobalFlags().output_schema_version >= 2 && has_duplicate_occurrence) {
+    for (const OneIncludeOrForwardDeclareLine& line : lines_) {
+      if (line.is_elaborated_type() || !line.is_present() ||
+          !line.is_desired() || line.has_structured_decision()) {
+        continue;
+      }
+      const auto found = present_occurrences.find({item_kind(line), line.line()});
+      if (found == present_occurrences.end() || found->second < 2)
+        continue;
+      operations.push_back(
+          {&line, "keep", "keep", item_kind(line), "retained_occurrence",
+           "This physical occurrence remains in the desired final state."});
+    }
+  }
+
+  const auto operation_condition = [&](const OperationRef& operation) {
+    using ActiveCondition = IwyuPreprocessorInfo::ActiveCondition;
+    if (operation.line->is_present()) {
+      if (operation.line->IsIncludeLine()) {
+        return preprocessor_info_->DirectIncludeConditionAt(
+            file_, operation.line->quoted_include(),
+            operation.line->start_linenum());
+      }
+      if (operation.line->fwd_decl())
+        return preprocessor_info_->ActiveConditionAt(
+            GetLocation(operation.line->fwd_decl()));
+      return ActiveCondition{};
+    }
+
+    bool found = false;
+    ActiveCondition common;
+    for (const OneUse& use : symbol_uses_) {
+      if (use.ignore_use() || use.symbol_name().empty())
+        continue;
+      const bool motivates = operation.line->IsIncludeLine()
+          ? use.has_suggested_header() &&
+                use.suggested_header() == operation.line->quoted_include()
+          : !use.is_full_use() && !use.has_suggested_header() &&
+                use.decl() == operation.line->fwd_decl();
+      if (!motivates)
+        continue;
+      const ActiveCondition condition =
+          preprocessor_info_->ActiveConditionAt(use.use_loc());
+      if (!found) {
+        common = condition;
+        found = true;
+        continue;
+      }
+      if (common.status != condition.status ||
+          common.expression != condition.expression ||
+          common.directive_location != condition.directive_location ||
+          common.active_branch != condition.active_branch ||
+          common.source_region_id != condition.source_region_id ||
+          common.source_region_path != condition.source_region_path) {
+        return ActiveCondition{};
+      }
+    }
+    return found ? common : ActiveCondition{};
+  };
+
+  const auto operation_condition_key = [&](const OperationRef& operation) {
+    using Status = IwyuPreprocessorInfo::ActiveCondition::Status;
+    const auto condition = operation_condition(operation);
+    const int status_rank = condition.status == Status::kKnown
+        ? 0 : (condition.status == Status::kUnknown ? 1 : 3);
+    StructuredLocationValue location;
+    if (condition.status != Status::kKnown ||
+        !StructuredLocation(condition.directive_location, false, &location)) {
+      location = StructuredLocationValue{"", 0, 0};
+    }
+    return std::make_tuple(
+        status_rank, condition.expression, location.path, location.line,
+        location.column, condition.active_branch, condition.source_region_id,
+        condition.source_region_path);
+  };
+
   const auto operation_key = [&](const OperationRef& operation) {
     const map<string, int> subject_rank = {
         {"remove", 0}, {"add", 1}, {"keep", 2}};
@@ -2843,11 +2924,15 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
                                 : operation.line->line();
     const bool semantic_range =
         operation.reason_code == "semantic_definition_provider";
-    const int range_rank = semantic_range ? 0 :
+    const bool occurrence_range = semantic_range ||
+        (GlobalFlags().output_schema_version >= 2 &&
+         operation.subject_action != "add" && operation.line->is_present() &&
+         operation.line->start_linenum() > 0);
+    const int range_rank = occurrence_range ? 0 :
         (operation.subject_action == "add" ? 3 : 2);
     const int range_line =
-        semantic_range ? operation.line->start_linenum() : 0;
-    int range_column = 0;
+        occurrence_range ? operation.line->start_linenum() : 0;
+    int range_column = occurrence_range ? 1 : 0;
     if (semantic_range) {
       const auto found = semantic_definition_provider_facts_.find(
           operation.line->start_linenum());
@@ -2870,7 +2955,8 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
                                ? range_column +
                                      operation.line->quoted_include().size()
                                : 0,
-                           spelling, operation.reason_code);
+                           spelling, operation.reason_code,
+                           operation_condition_key(operation));
   };
 
   const auto operation_spelling = [](const OperationRef& operation) {
@@ -3380,51 +3466,6 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
     return provider;
   };
 
-  const auto operation_condition = [&](const OperationRef& operation) {
-    using ActiveCondition = IwyuPreprocessorInfo::ActiveCondition;
-    if (operation.line->is_present()) {
-      if (operation.line->IsIncludeLine()) {
-        return preprocessor_info_->DirectIncludeConditionAt(
-            file_, operation.line->quoted_include(),
-            operation.line->start_linenum());
-      }
-      if (operation.line->fwd_decl())
-        return preprocessor_info_->ActiveConditionAt(
-            GetLocation(operation.line->fwd_decl()));
-      return ActiveCondition{};
-    }
-
-    bool found = false;
-    ActiveCondition common;
-    for (const OneUse& use : symbol_uses_) {
-      if (use.ignore_use() || use.symbol_name().empty())
-        continue;
-      const bool motivates = operation.line->IsIncludeLine()
-          ? use.has_suggested_header() &&
-                use.suggested_header() == operation.line->quoted_include()
-          : !use.is_full_use() && !use.has_suggested_header() &&
-                use.decl() == operation.line->fwd_decl();
-      if (!motivates)
-        continue;
-      const ActiveCondition condition =
-          preprocessor_info_->ActiveConditionAt(use.use_loc());
-      if (!found) {
-        common = condition;
-        found = true;
-        continue;
-      }
-      if (common.status != condition.status ||
-          common.expression != condition.expression ||
-          common.directive_location != condition.directive_location ||
-          common.active_branch != condition.active_branch ||
-          common.source_region_id != condition.source_region_id ||
-          common.source_region_path != condition.source_region_path) {
-        return ActiveCondition{};
-      }
-    }
-    return found ? common : ActiveCondition{};
-  };
-
   std::sort(operations.begin(), operations.end(),
             [&](const OperationRef& lhs, const OperationRef& rhs) {
               return operation_key(lhs) < operation_key(rhs);
@@ -3461,10 +3502,42 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       } else {
         value["source_range"] = UnavailableValue();
       }
+    } else if (operation.subject_action == "add") {
+      value["source_range"] = NotApplicableValue();
+    } else if (GlobalFlags().output_schema_version >= 2 &&
+               operation.line->is_present() &&
+               operation.line->start_linenum() > 0 &&
+               operation.line->end_linenum() >=
+                   operation.line->start_linenum()) {
+      const clang::SourceManager& source_manager = *GlobalSourceManager();
+      const clang::FileID file_id = source_manager.translateFile(file_);
+      const SourceLocation end_line = source_manager.translateLineCol(
+          file_id, operation.line->end_linenum(), 1);
+      bool invalid = false;
+      const llvm::StringRef end_text = end_line.isValid()
+          ? GetSourceTextUntilEndOfLine(end_line, DefaultDataGetter())
+          : llvm::StringRef();
+      if (end_line.isValid()) {
+        source_manager.getCharacterData(end_line, &invalid);
+      } else {
+        invalid = true;
+      }
+      if (!invalid) {
+        StructuredLocationValue start{
+            file_path(), operation.line->start_linenum(), 1};
+        StructuredLocationValue end{
+            file_path(), operation.line->end_linenum(),
+            static_cast<int>(end_text.size()) + 1};
+        value["source_range"] = llvm::json::Object{
+            {"status", "known"},
+            {"value", llvm::json::Object{
+                {"start", LocationObject(start)},
+                {"end", LocationObject(end)}}}};
+      } else {
+        value["source_range"] = UnavailableValue();
+      }
     } else {
-      value["source_range"] = operation.subject_action == "add"
-                                  ? NotApplicableValue()
-                                  : UnavailableValue();
+      value["source_range"] = UnavailableValue();
     }
     value["reason_code"] = operation.reason_code;
     value["reason"] = operation.reason;
@@ -3498,7 +3571,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
   }
 
   vector<const OneIncludeOrForwardDeclareLine*> desired_lines;
-  if (!has_duplicate_occurrence) {
+  if (!has_unrepresentable_duplicate) {
     for (const OneIncludeOrForwardDeclareLine& line : lines_) {
       if (line.is_desired() && !line.is_elaborated_type())
         desired_lines.push_back(&line);
@@ -3517,6 +3590,23 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
                        internal::GetSortKey(*rhs, associated, rhs_info);
               });
   }
+
+  set<pair<string, string>> desired_keys;
+  desired_lines.erase(
+      std::remove_if(
+          desired_lines.begin(), desired_lines.end(),
+          [&](const OneIncludeOrForwardDeclareLine* line) {
+            const bool retained_by_policy =
+                line->is_present() && line->has_structured_decision() &&
+                line->decision_disposition() != "apply";
+            const string spelling =
+                (!line->IsIncludeLine() && line->is_present()) ||
+                        retained_by_policy
+                    ? line->source_spelling()
+                    : line->line();
+            return !desired_keys.insert({item_kind(*line), spelling}).second;
+          }),
+      desired_lines.end());
 
   llvm::json::Array desired_items;
   for (const OneIncludeOrForwardDeclareLine* line : desired_lines) {
@@ -3636,7 +3726,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
         {"message", GetWarningDescription(use)},
         {"location", AvailableLocation(use.use_loc(), true)}});
   }
-  if (has_duplicate_occurrence) {
+  if (has_unrepresentable_duplicate) {
     diagnostics.push_back(llvm::json::Object{
         {"severity", "warning"},
         {"code", "duplicate_occurrence_unrepresentable"},
@@ -3690,7 +3780,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
   }
 
   llvm::json::Object desired_state;
-  if (has_duplicate_occurrence) {
+  if (has_unrepresentable_duplicate) {
     desired_state = UnavailableDesiredState();
   } else {
     desired_state["status"] = "known";
@@ -3752,7 +3842,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
             (operation.subject_action == "add" ||
              operation.subject_action == "remove");
       });
-  record["status"] = has_duplicate_occurrence
+  record["status"] = has_unrepresentable_duplicate
                          ? "skipped"
                          : (has_applied_edit ? "changes" : "correct");
   record["associated_headers"] = std::move(associations);

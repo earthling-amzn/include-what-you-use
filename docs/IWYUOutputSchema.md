@@ -249,17 +249,28 @@ Each association records:
 OUTPUT-002 must retain the reason at the point where `AddAssociatedHeader` is
 called; the current `set<IwyuFileInfo*>` loses it.
 
-## Duplicate occurrence fallback
+## Duplicate occurrence fallback and version-2 relocation
 
 Schema version 1 identifies an operation by item kind and spelling, not by a
 specific source occurrence. Its desired-state invariant also forbids an applied
 remove operation for an item key that remains desired. When a file contains
 duplicate occurrences and IWYU would remove only the surplus occurrence,
 emitting `remove/apply` would therefore describe a false whole-item removal.
-The native producer emits that file as `status: "skipped"`, with no operations,
-an unavailable desired state, and a `duplicate_occurrence_unrepresentable`
-diagnostic. A later schema may add occurrence identity; version 1 deliberately
-keeps this explicit whole-file fallback.
+The native version-1 producer emits that file as `status: "skipped"`, with no
+operations, an unavailable desired state, and a
+`duplicate_occurrence_unrepresentable` diagnostic.
+
+Schema version 2 identifies an operation by `(subject_action, item_kind,
+spelling, source_range, edit_condition)`. Present source occurrences have exact
+physical line ranges, and conditional occurrences retain their exact region
+identity in `edit_condition`. It can therefore remove one or more conditional
+or duplicate occurrences while retaining another occurrence or adding the same
+key at a new condition. Two otherwise identical operations are rejected. Two
+remove/keep decisions with the same known physical range are ambiguous even if
+their claimed conditions differ. When a range is unavailable, the exact
+`(source_range, edit_condition)` pair is the fallback occurrence identity and
+may not receive two decisions. Version 1 deliberately keeps its whole-file
+fallback because these shapes remain unrepresentable there.
 
 ## Multi-config provenance
 
@@ -292,14 +303,15 @@ configuration-specific additions.
 Locations are one-based. Columns are one-based UTF-8 byte columns, matching
 Clang's presumed source-location column convention. Range end is exclusive.
 
-An added item with no selected insertion point uses `not_applicable`; version 1
-requires add subjects to use that status. Remove and keep subjects refer to
-present items and therefore may be known, unknown, or unavailable, but never
-not-applicable. Known endpoints use the same path and end must not precede start.
-A present item whose line is known but exact columns are not retained uses
-`unavailable`; it must not fabricate column 1. Current
-`OneIncludeOrForwardDeclareLine` keeps only line numbers, so OUTPUT-002 must
-retain richer locations or explicitly emit unavailable ranges.
+An added item with no selected insertion point uses `not_applicable`. Remove and
+keep subjects refer to present items and therefore may be known, unknown, or
+unavailable, but never not-applicable. Known endpoints use the same path and end
+must not precede start. Version 1 keeps ordinary present-item ranges unavailable.
+Version 2 emits an exact physical line span for ordinary present includes and
+forward declarations whenever the analyzed buffer supplies it. The span begins
+at byte column 1 of the first physical line and ends after the final byte of the
+last physical line. Together with `edit_condition`, this distinguishes repeated
+conditional occurrences without discarding either identity.
 
 ## Desired state
 
@@ -314,13 +326,25 @@ For `correct` and `changes`, version 1 requires known, complete desired state.
 For `skipped` and `error`, unavailable state is valid. Desired items must be
 unique by `(item_kind, spelling)`.
 
-When desired state is known:
+For version 1, each operation independently determines key membership:
 
 - `add/apply` appears;
 - `add/suppress` and `add/report` remain absent;
 - `remove/apply` remains absent;
 - `remove/keep`, `remove/suppress`, and `remove/report` remain present;
 - `keep/keep` and `keep/report` remain present.
+
+Version 2 evaluates all operations with the same `(item_kind, spelling)` as one
+final-state group. Desired presence requires at least one applied add, one
+present remove operation whose disposition retains it, or one keep operation.
+For duplicate physical items, the schema-v2 producer emits
+`keep/keep` with reason code `retained_occurrence` for an unchanged occurrence
+that supplies final presence. An applied remove removes only its identified
+occurrence and does not require the key to be absent when another occurrence or
+applied add supplies it. Desired absence
+requires no such presence witness. This accepts occurrence relocation while
+rejecting a lone whole-item removal that falsely remains desired, a retained
+occurrence omitted from desired state, and other genuinely contradictory groups.
 
 These rules make desired state the accepted post-disposition source state, not
 the analyzer's pre-policy ideal.
@@ -344,9 +368,12 @@ Within a record:
 2. operations sort by subject rank (`remove`, `add`, `keep`), disposition rank
    (`apply`, `keep`, `suppress`, `report`), item-kind rank (`include`,
    `forward_declaration`), full range key (availability rank, path, start
-   line/column, end line/column), spelling, then reason code;
-3. duplicate underlying operations are forbidden by `(subject_action,
-   item_kind, spelling, source_range)`, so the key above has no unresolved tie;
+   line/column, end line/column), spelling, reason code, then the complete typed
+   edit-condition key;
+3. duplicate version-1 operations are forbidden by `(subject_action, item_kind,
+   spelling, source_range)`. Duplicate version-2 operations are forbidden by
+   `(subject_action, item_kind, spelling, source_range, edit_condition)`, and
+   two present-item decisions cannot name the same version-2 occurrence;
 4. operation IDs are assigned `op-1`, `op-2`, ... only after sorting and are not
    themselves sort keys;
 5. desired items retain final source order and are unique by kind/spelling;

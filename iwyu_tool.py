@@ -2149,13 +2149,42 @@ def _validate_declaration_facts(record, source_bytes, native_conflicts=True,
         raise ProtocolError('operation IDs are not sequential in output order')
     if operations != sorted(operations, key=_operation_sort_key):
         raise ProtocolError('operations are not deterministically sorted')
-    identities = [
-        (operation['subject_action'], operation['item_kind'],
-         operation['spelling'],
-         _json_dumps_canonical(operation['source_range']))
-        for operation in operations]
+    if record['schema_version'] == 2:
+        identities = [
+            (operation['subject_action'], operation['item_kind'],
+             operation['spelling'],
+             _json_dumps_canonical(operation['source_range']),
+             _json_dumps_canonical(operation['edit_condition']))
+            for operation in operations]
+    else:
+        # Version 1 cannot use condition provenance as occurrence identity.
+        identities = [
+            (operation['subject_action'], operation['item_kind'],
+             operation['spelling'],
+             _json_dumps_canonical(operation['source_range']))
+            for operation in operations]
     if len(identities) != len(set(identities)):
         raise ProtocolError('duplicate semantic operation identity')
+
+    if record['schema_version'] == 2:
+        present_occurrences = {}
+        for operation in operations:
+            if operation['subject_action'] not in ('remove', 'keep'):
+                continue
+            source_range_identity = _json_dumps_canonical(
+                operation['source_range'])
+            occurrence = (
+                operation['item_kind'], operation['spelling'],
+                source_range_identity)
+            if operation['source_range']['status'] != 'known':
+                occurrence += (_json_dumps_canonical(
+                    operation['edit_condition']),)
+            previous = present_occurrences.get(occurrence)
+            if previous is not None:
+                raise ProtocolError(
+                    '%s and %s ambiguously identify the same present occurrence' %
+                    (previous, operation['id']))
+            present_occurrences[occurrence] = operation['id']
 
     associations = record['associated_headers']
     association_keys = [(association['path'], association['relationship'],
@@ -2377,16 +2406,42 @@ def _validate_declaration_facts(record, source_bytes, native_conflicts=True,
                 raise ProtocolError(
                     'desired-state symbols are duplicate or unsorted')
         desired_set = set(desired_keys)
-        for operation in operations:
-            key = (operation['item_kind'], operation['spelling'])
-            present = ((operation['subject_action'] == 'add' and
-                        operation['disposition'] == 'apply') or
-                       (operation['subject_action'] == 'remove' and
-                        operation['disposition'] != 'apply') or
-                       operation['subject_action'] == 'keep')
-            if present != (key in desired_set):
-                raise ProtocolError('%s contradicts desired state' %
-                                    operation['id'])
+        if record['schema_version'] == 1:
+            # Version 1 has no occurrence identity. Mixed removal/retention or
+            # remove/add relocation for one key remains unrepresentable.
+            for operation in operations:
+                key = (operation['item_kind'], operation['spelling'])
+                present = ((operation['subject_action'] == 'add' and
+                            operation['disposition'] == 'apply') or
+                           (operation['subject_action'] == 'remove' and
+                            operation['disposition'] != 'apply') or
+                           operation['subject_action'] == 'keep')
+                if present != (key in desired_set):
+                    raise ProtocolError('%s contradicts desired state' %
+                                        operation['id'])
+        else:
+            operations_by_key = {}
+            for operation in operations:
+                key = (operation['item_kind'], operation['spelling'])
+                operations_by_key.setdefault(key, []).append(operation)
+            for key, key_operations in operations_by_key.items():
+                # Presence after all dispositions is established by an applied
+                # addition or a present occurrence that is retained. An
+                # applied removal affects only its identified occurrence.
+                presence_witnesses = [
+                    operation for operation in key_operations
+                    if ((operation['subject_action'] == 'add' and
+                         operation['disposition'] == 'apply') or
+                        (operation['subject_action'] == 'remove' and
+                         operation['disposition'] != 'apply') or
+                        operation['subject_action'] == 'keep')]
+                desired_present = key in desired_set
+                if desired_present != bool(presence_witnesses):
+                    operation_ids = ', '.join(
+                        operation['id'] for operation in key_operations)
+                    raise ProtocolError(
+                        '%s group contradicts desired state for %s' %
+                        (operation_ids, key[1]))
 
 
 def _reject_nonfinite(value):
@@ -2584,6 +2639,26 @@ def _operation_range_key(source_range):
             end['line'], end['column'])
 
 
+def _operation_condition_key(condition):
+    rank = {'known': 0, 'unknown': 1, 'unavailable': 2,
+            'not_applicable': 3}
+    status = condition['status']
+    if status != 'known':
+        return (rank[status], '', '', 0, 0, False, '', ())
+    value = condition['value']
+    location = value['location']
+    if location['status'] == 'known':
+        location_value = location['value']
+        path = location_value['path']
+        line = location_value['line']
+        column = location_value['column']
+    else:
+        path, line, column = '', 0, 0
+    return (rank[status], value['expression'], path, line, column,
+            value['active_branch'], value.get('source_region_id', ''),
+            tuple(value.get('source_region_path', ())))
+
+
 def _operation_sort_key(operation):
     subject_rank = {'remove': 0, 'add': 1, 'keep': 2}
     disposition_rank = {'apply': 0, 'keep': 1, 'suppress': 2, 'report': 3}
@@ -2592,7 +2667,8 @@ def _operation_sort_key(operation):
             disposition_rank[operation['disposition']],
             item_rank[operation['item_kind']],
             _operation_range_key(operation['source_range']),
-            operation['spelling'], operation['reason_code'])
+            operation['spelling'], operation['reason_code'],
+            _operation_condition_key(operation['edit_condition']))
 
 def _aggregate_declaration_conflicts(groups, invocations, source_contents):
     """Aggregate incompatible declarations and suppress only unsafe pairs."""

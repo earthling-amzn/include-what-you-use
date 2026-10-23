@@ -71,6 +71,7 @@
       }
     },
     "desired_state": {
+      "description": "Accepted final key state. Semantic validation groups operations by (item_kind, spelling); applied adds and retained-occurrence operations establish presence despite other occurrence removals.",
       "$ref": "#/$defs/desired_state"
     },
     "diagnostics": {
@@ -817,6 +818,7 @@
           "$ref": "#/$defs/nonempty_string"
         },
         "source_range": {
+          "description": "Physical occurrence identity for present operations. Schema-v2 producers emit exact line spans when available; additions are not_applicable.",
           "$ref": "#/$defs/available_range"
         },
         "reason_code": {
@@ -836,6 +838,7 @@
           "$ref": "#/$defs/provider"
         },
         "edit_condition": {
+          "description": "Exact conditional identity for the operation. Together with source_range it distinguishes same-spelling occurrences.",
           "$ref": "#/$defs/condition"
         },
         "policy": {

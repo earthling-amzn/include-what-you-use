@@ -1302,11 +1302,14 @@ rules:
         assert "should remove these lines:" in duplicate_text.stderr
         assert "lines 2-2" in duplicate_text.stderr
 
-    # Duplicate occurrence edits are explicitly skipped in schema v1.
+    # Duplicate occurrence edits remain explicitly skipped in schema v1.
     duplicate_result = run("tests/cxx/double_include.cc",
-                           "--output_format=json")
+                           "--output_format=json", "--output_schema=1")
     assert duplicate_result.returncode == 0, duplicate_result.stderr
-    duplicate = by_path(records(duplicate_result), "double_include.cc")
+    duplicate = by_path(
+        [json.loads(line) for line in duplicate_result.stdout.splitlines()],
+        "double_include.cc")
+    assert duplicate["schema_version"] == 1
     assert duplicate["status"] == "skipped"
     assert duplicate["operations"] == []
     assert duplicate["desired_state"]["status"] == "unavailable"

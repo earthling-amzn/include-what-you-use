@@ -115,6 +115,31 @@ required by native full-list and `fix_includes.py` ordering. Class-template
 primaries and specializations use one canonical primary-template name, kind,
 and declaration location.
 
+## Occurrence relocation and final state
+
+Version 2 can represent several physical occurrences of one `(item_kind,
+spelling)` key. A present operation is identified by its exact `source_range`
+and `edit_condition`; conditional copies therefore remain separate even when
+their spelling is identical. Operation ordering uses both facts. The driver
+rejects duplicate indistinguishable operations, two decisions with one known
+physical range, or two unavailable-range decisions with the same condition
+identity.
+
+Desired-state consistency is checked once per key, after all occurrence
+operations. An applied add establishes final presence. A remove operation with a
+non-apply disposition or a keep operation retains a present occurrence. For
+unchanged duplicate items, the producer emits `keep/keep` with reason code
+`retained_occurrence` to make that witness explicit. Applied removal of one
+occurrence is compatible with desired presence supplied by any of those
+witnesses. Without a presence
+witness the key must be absent. This permits conditional-to-unconditional and
+conditional-to-conditional relocation while rejecting genuinely contradictory
+operation sets.
+
+Schema version 1 retains its key-only invariant and
+`duplicate_occurrence_unrepresentable` fallback. It must not reinterpret
+`edit_condition` as occurrence identity.
+
 ## Compatibility and protocol
 
 Schema version 1 cannot carry declaration kinds: its top-level and symbol
