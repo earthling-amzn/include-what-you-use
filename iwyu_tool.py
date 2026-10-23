@@ -2100,6 +2100,11 @@ def _logical_include_token(spelling):
     return token
 
 
+def _logical_include_spelling(item):
+    """Return canonical desired spelling, independent of physical trivia."""
+    return '#include ' + _logical_include_token(item['spelling'])
+
+
 _CPP_MULTI_TOKENS = tuple(sorted((
     '>>=', '<<=', '<=>', '...', '::', '->*', '.*', '->', '++', '--',
     '<<', '>>', '<=', '>=', '==', '!=', '&&', '||', '+=', '-=', '*=',
@@ -3004,18 +3009,20 @@ def _aggregate_declaration_conflicts(groups, invocations, source_contents):
             desired['items'] = [
                 item for item in desired['items']
                 if (item['item_kind'], item['spelling']) not in blocked_add_keys]
-            desired_keys = set((item['item_kind'], item['spelling'])
-                               for item in desired['items'])
+            desired_include_tokens = set(
+                _logical_include_token(item['spelling'])
+                for item in desired['items']
+                if item['item_kind'] == 'include')
             restored_includes = []
             for operation in paired_removals:
-                key = (operation['item_kind'], operation['spelling'])
-                if key not in desired_keys:
+                include_token = _logical_include_token(operation['spelling'])
+                if include_token not in desired_include_tokens:
                     restored_includes.append({
-                        'item_kind': operation['item_kind'],
-                        'spelling': operation['spelling'],
+                        'item_kind': 'include',
+                        'spelling': _logical_include_spelling(operation),
                         'symbols': sorted(symbol_names(operation)),
                     })
-                    desired_keys.add(key)
+                    desired_include_tokens.add(include_token)
             if restored_includes:
                 first_forward = next(
                     (index for index, item in enumerate(desired['items'])

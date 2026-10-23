@@ -438,17 +438,30 @@ def main():
         assert any(operation["subject_action"] == "remove" and
                    operation["item_kind"] == "include"
                    for operation in blocked)
+        provider_physical = (
+            '  # include "tests/sem005/variant_provider.hpp" '
+            '// retained physical')
+        provider_canonical = '#include "tests/sem005/variant_provider.hpp"'
+        provider_removals = [
+            operation for operation in blocked
+            if operation["subject_action"] == "remove" and
+               operation["item_kind"] == "include"]
+        assert len(provider_removals) == 1
+        assert provider_removals[0]["spelling"] == provider_physical
         desired_spellings = {
             (item["item_kind"], item["spelling"])
             for item in debug["desired_state"]["items"]}
         assert ("include", "#include <vector>") in desired_spellings
-        assert ("include", '#include "tests/sem005/variant_provider.hpp"') \
-            in desired_spellings
+        assert ("include", provider_canonical) in desired_spellings
+        assert ("include", provider_physical) not in desired_spellings
         desired_items = debug["desired_state"]["items"]
-        provider_index = next(
-            index for index, item in enumerate(desired_items)
-            if item["spelling"] ==
-               '#include "tests/sem005/variant_provider.hpp"')
+        provider_items = [
+            item for item in desired_items
+            if item["item_kind"] == "include" and
+               "variant_provider.hpp" in item["spelling"]]
+        assert len(provider_items) == 1
+        assert provider_items[0]["spelling"] == provider_canonical
+        provider_index = desired_items.index(provider_items[0])
         first_forward_index = next(
             index for index, item in enumerate(desired_items)
             if item["item_kind"] == "forward_declaration")
@@ -538,10 +551,11 @@ def main():
             cwd=fixer_root, input=fixer_report(debug, fixed_source))
         assert fixed.returncode == 0, (fixed.stdout, fixed.stderr)
         fixed_text = fixed_source.read_text()
+        assert fixed_text.count(provider_physical) == 1
+        assert provider_canonical not in fixed_text.splitlines()
         assert fixed_text.index("#include <vector>") < fixed_text.index(
-            '#include "tests/sem005/variant_provider.hpp"')
-        assert fixed_text.index(
-            '#include "tests/sem005/variant_provider.hpp"') < \
+            provider_physical)
+        assert fixed_text.index(provider_physical) < \
             fixed_text.index("class CompatibleRecord;")
         for define in ([], ["-DSEM005_DEBUG_CONFIGURATION=1"]):
             result = run([
