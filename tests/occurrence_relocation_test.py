@@ -132,6 +132,40 @@ def assert_logical_item_keys():
         else:
             raise AssertionError('malicious include text acquired a logical key')
 
+    computed_variants = [
+        {'item_kind': 'include',
+         'spelling': '#include CPU_HEADER(gc/shenandoah/provider)'},
+        {'item_kind': 'include',
+         'spelling': ('  # include /* before */ CPU_HEADER ( gc / shenandoah / '
+                      'provider ) // retained physical')},
+        {'item_kind': 'include',
+         'spelling': '#inc\\\nlude CPU_HEA\\\nDER(gc/shenandoah/provider)'},
+    ]
+    computed_keys = [iwyu_tool._logical_item_key(item)
+                     for item in computed_variants]
+    assert computed_keys[0] == computed_keys[1] == computed_keys[2]
+    assert computed_keys[0][1][0] == 'computed'
+    assert computed_keys[0] != iwyu_tool._logical_item_key({
+        'item_kind': 'include',
+        'spelling': '#include CPU_HEADER(gc/shenandoah/other)'})
+    assert computed_keys[0] != iwyu_tool._logical_item_key({
+        'item_kind': 'include', 'spelling': '#include "provider"'})
+    for malformed in (
+            '#include', '#include /* comment only */',
+            '#include CPU_HEADER(gc/provider',
+            '#include CPU_HEADER(gc/provider)]',
+            '#include CPU_HEADER(gc/provider); injected()',
+            '#include 42', '#include CPU_HEADER(gc/provider) \\'):
+        try:
+            iwyu_tool._logical_item_key(
+                {'item_kind': 'include', 'spelling': malformed})
+        except iwyu_tool.ProtocolError:
+            pass
+        else:
+            raise AssertionError(
+                'malformed computed include acquired a logical key: %r' %
+                malformed)
+
     forward_variants = [
         {'item_kind': 'forward_declaration',
          'spelling': 'class OccurrenceRelocatedDeclaration; // retained'},
@@ -186,6 +220,41 @@ def main():
     assert direct_one.stdout == direct_two.stdout
     record = fixture_record(parse(direct_one.stdout))
     validate_record(record)
+
+    computed_add_record = copy.deepcopy(record)
+    computed_add = copy.deepcopy(record["operations"][0])
+    computed_add.update({
+        "subject_action": "add",
+        "disposition": "apply",
+        "spelling": "#include CPU_HEADER(gc/shenandoah/provider)",
+        "source_range": {"status": "not_applicable", "value": None},
+        "reason_code": "desired_item_missing",
+        "reason": "Add the canonical computed include.",
+        "symbols": [],
+        "provider": {
+            "selected": {"status": "unavailable", "value": None},
+            "candidates": {"status": "unavailable", "value": None},
+            "chain": {"status": "unavailable", "value": None},
+        },
+        "edit_condition": {"status": "not_applicable", "value": None},
+        "policy": {"status": "unavailable", "value": None},
+        "multi_config": {"status": "not_applicable", "value": None},
+    })
+    computed_add_record["operations"] = [computed_add]
+    computed_add_record["desired_state"]["items"] = [{
+        "item_kind": "include",
+        "spelling": computed_add["spelling"],
+        "symbols": [],
+    }]
+    computed_add_record["status"] = "changes"
+    renumber(computed_add_record)
+    validate_record(computed_add_record)
+    mismatched_computed_add = copy.deepcopy(computed_add_record)
+    mismatched_computed_add["desired_state"]["items"][0]["spelling"] = (
+        "# include CPU_HEADER(gc/shenandoah/provider)")
+    expect_protocol_error(
+        mismatched_computed_add,
+        "computed add does not match analyzer canonical desired line")
 
     operations = record["operations"]
     assert [(operation["subject_action"], operation["disposition"],

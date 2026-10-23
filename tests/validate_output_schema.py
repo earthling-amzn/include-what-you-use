@@ -129,6 +129,93 @@ def skip_include_trivia(spelling, index):
     return index
 
 
+INCLUDE_PP_PUNCTUATORS = tuple(sorted((
+    "%:%:", ">>=", "<<=", "<=>", "...", "::", "->*", ".*", "->", "++",
+    "--", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "+=", "-=",
+    "*=", "/=", "%=", "^=", "&=", "|=", "##", "<:", ":>", "<%", "%>", "%:",
+    "(", ")", "[", "]", "{", "}", "<", ">", ".", ",", ";", "?", ":", "~",
+    "!", "+", "-", "*", "/", "%", "^", "&", "|", "=", "#"),
+    key=len, reverse=True))
+INCLUDE_UNSAFE_PUNCTUATORS = frozenset(
+    ("{", "}", ";", "#", "##", "<%", "%>", "%:", "%:%:"))
+
+
+def computed_include_tokens(spelling, index):
+    tokens = []
+    delimiters = []
+    while index < len(spelling):
+        char = spelling[index]
+        if char in " \t\v\f\r":
+            index += 1
+        elif spelling.startswith("//", index):
+            index = len(spelling)
+            break
+        elif spelling.startswith("/*", index):
+            end = spelling.find("*/", index + 2)
+            if end < 0 or "\n" in spelling[index:end + 2]:
+                raise ValueError("unterminated include comment")
+            index = end + 2
+        elif char.isalpha() or char == "_" or ord(char) >= 128:
+            end = index + 1
+            while end < len(spelling) and (
+                    spelling[end].isalnum() or spelling[end] == "_" or
+                    ord(spelling[end]) >= 128):
+                end += 1
+            tokens.append(spelling[index:end])
+            index = end
+        elif char.isdigit() or (char == "." and index + 1 < len(spelling) and
+                                spelling[index + 1].isdigit()):
+            end = index + 1
+            while end < len(spelling):
+                candidate = spelling[end]
+                previous = spelling[end - 1]
+                if (candidate.isalnum() or candidate in "._'" or
+                        (candidate in "+-" and previous in "eEpP")):
+                    end += 1
+                else:
+                    break
+            tokens.append(spelling[index:end])
+            index = end
+        elif char in "'\"":
+            quote = char
+            end = index + 1
+            escaped = False
+            while end < len(spelling):
+                candidate = spelling[end]
+                end += 1
+                if escaped:
+                    escaped = False
+                elif candidate == "\\":
+                    escaped = True
+                elif candidate == quote:
+                    break
+            else:
+                raise ValueError("unterminated include literal")
+            tokens.append(spelling[index:end])
+            index = end
+        else:
+            token = next((candidate for candidate in INCLUDE_PP_PUNCTUATORS
+                          if spelling.startswith(candidate, index)), None)
+            if token is None or token in INCLUDE_UNSAFE_PUNCTUATORS:
+                raise ValueError("unsafe include preprocessing token")
+            if token in ("(", "[", "<:"):
+                delimiters.append(")" if token == "(" else "]")
+            elif token in (")", "]", ":>"):
+                closing = "]" if token == ":>" else token
+                if not delimiters or delimiters.pop() != closing:
+                    raise ValueError("unbalanced include delimiters")
+            tokens.append(token)
+            index += len(token)
+    if not tokens:
+        raise ValueError("empty computed include operand")
+    first = tokens[0]
+    if not (first[0].isalpha() or first[0] == "_" or ord(first[0]) >= 128):
+        raise ValueError("computed include operand does not begin with macro")
+    if delimiters:
+        raise ValueError("unbalanced include delimiters")
+    return tuple(tokens)
+
+
 def logical_include_token(spelling):
     spelling = re.sub(r"\\\r?\n", "", spelling)
     if "\n" in spelling:
@@ -143,19 +230,21 @@ def logical_include_token(spelling):
     if index < len(spelling) and (spelling[index].isalnum() or spelling[index] == "_"):
         raise ValueError("longer include directive")
     index = skip_include_trivia(spelling, index)
-    if index >= len(spelling) or spelling[index] not in '<"':
-        raise ValueError("missing include token")
-    closing = ">" if spelling[index] == "<" else '"'
-    end = spelling.find(closing, index + 1)
-    if end < 0 or end == index + 1:
-        raise ValueError("invalid include token")
-    token = spelling[index:end + 1]
-    index = skip_include_trivia(spelling, end + 1)
-    if spelling.startswith("//", index):
-        index = len(spelling)
-    if index != len(spelling):
-        raise ValueError("trailing include text")
-    return token
+    if index >= len(spelling):
+        raise ValueError("missing include operand")
+    if spelling[index] in '<"':
+        closing = ">" if spelling[index] == "<" else '"'
+        end = spelling.find(closing, index + 1)
+        if end < 0 or end == index + 1:
+            raise ValueError("invalid include token")
+        token = spelling[index:end + 1]
+        index = skip_include_trivia(spelling, end + 1)
+        if spelling.startswith("//", index):
+            index = len(spelling)
+        if index != len(spelling):
+            raise ValueError("trailing include text")
+        return ("literal", token)
+    return ("computed", computed_include_tokens(spelling, index))
 
 
 CPP_MULTI_TOKENS = tuple(sorted((
@@ -513,8 +602,9 @@ def semantic_errors(record):
             if selected["status"] == "known" and selected["value"] not in values:
                 errors.append(f"{op['id']}: selected provider is absent from candidates")
         if selected["status"] == "known" and op["item_kind"] == "include":
-            match = INCLUDE_RE.match(op["spelling"])
-            if not match or match.group("token") != selected["value"]["spelling"]:
+            include_identity = logical_include_token(op["spelling"])
+            if (include_identity[0] == "literal" and
+                    include_identity[1] != selected["value"]["spelling"]):
                 errors.append(f"{op['id']}: selected provider spelling contradicts include operation")
         if chain["status"] == "known":
             if selected["status"] != "known":
@@ -609,8 +699,29 @@ def semantic_errors(record):
                         (op["subject_action"] == "remove" and
                          op["disposition"] != "apply") or
                         op["subject_action"] == "keep")]
-                if ((key in desired_spellings) !=
-                        bool(presence_witnesses)):
+                desired_present = key in desired_spellings
+                computed_include = (
+                    key[0] == "include" and key[1][0] == "computed")
+                if computed_include:
+                    applied_adds = [
+                        op for op in key_operations
+                        if op["subject_action"] == "add" and
+                        op["disposition"] == "apply"]
+                    desired_include_spellings = {
+                        item["spelling"] for item in desired["items"]
+                        if item["item_kind"] == "include"}
+                    if applied_adds and any(
+                            op["spelling"] not in desired_include_spellings
+                            for op in applied_adds):
+                        ids = ", ".join(op["id"] for op in applied_adds)
+                        errors.append(
+                            f"{ids}: computed add differs from canonical desired line")
+                    if desired_present and not presence_witnesses:
+                        ids = ", ".join(op["id"] for op in key_operations)
+                        errors.append(
+                            f"{ids}: operation group contradicts desired state")
+                    continue
+                if desired_present != bool(presence_witnesses):
                     ids = ", ".join(op["id"] for op in key_operations)
                     errors.append(
                         f"{ids}: operation group contradicts desired state")

@@ -2069,8 +2069,106 @@ def _skip_include_trivia(spelling, index):
     return index
 
 
+_INCLUDE_PP_PUNCTUATORS = tuple(sorted((
+    '%:%:', '>>=', '<<=', '<=>', '...', '::', '->*', '.*', '->', '++',
+    '--', '<<', '>>', '<=', '>=', '==', '!=', '&&', '||', '+=', '-=',
+    '*=', '/=', '%=', '^=', '&=', '|=', '##', '<:', ':>', '<%', '%>', '%:',
+    '(', ')', '[', ']', '{', '}', '<', '>', '.', ',', ';', '?', ':', '~',
+    '!', '+', '-', '*', '/', '%', '^', '&', '|', '=', '#'),
+    key=len, reverse=True))
+_INCLUDE_UNSAFE_PUNCTUATORS = frozenset(
+    ('{', '}', ';', '#', '##', '<%', '%>', '%:', '%:%:'))
+
+
+def _computed_include_tokens(spelling, index):
+    """Return a safe, comment/whitespace-independent pp-token sequence."""
+    tokens = []
+    delimiters = []
+    while index < len(spelling):
+        char = spelling[index]
+        if char in ' \t\v\f\r':
+            index += 1
+            continue
+        if spelling.startswith('//', index):
+            index = len(spelling)
+            break
+        if spelling.startswith('/*', index):
+            end = spelling.find('*/', index + 2)
+            if end < 0 or '\n' in spelling[index:end + 2]:
+                raise ProtocolError(
+                    'include spelling has an unterminated comment')
+            index = end + 2
+            continue
+        if char.isalpha() or char == '_' or ord(char) >= 128:
+            end = index + 1
+            while end < len(spelling):
+                candidate = spelling[end]
+                if not (candidate.isalnum() or candidate == '_' or
+                        ord(candidate) >= 128):
+                    break
+                end += 1
+            tokens.append(spelling[index:end])
+            index = end
+            continue
+        if char.isdigit() or (char == '.' and index + 1 < len(spelling) and
+                              spelling[index + 1].isdigit()):
+            end = index + 1
+            while end < len(spelling):
+                candidate = spelling[end]
+                previous = spelling[end - 1]
+                if (candidate.isalnum() or candidate in "._'" or
+                        (candidate in '+-' and previous in 'eEpP')):
+                    end += 1
+                    continue
+                break
+            tokens.append(spelling[index:end])
+            index = end
+            continue
+        if char in "'\"":
+            quote = char
+            end = index + 1
+            escaped = False
+            while end < len(spelling):
+                candidate = spelling[end]
+                end += 1
+                if escaped:
+                    escaped = False
+                elif candidate == '\\':
+                    escaped = True
+                elif candidate == quote:
+                    break
+            else:
+                raise ProtocolError(
+                    'include spelling has an unterminated literal')
+            tokens.append(spelling[index:end])
+            index = end
+            continue
+        token = next((candidate for candidate in _INCLUDE_PP_PUNCTUATORS
+                      if spelling.startswith(candidate, index)), None)
+        if token is None or token in _INCLUDE_UNSAFE_PUNCTUATORS:
+            raise ProtocolError(
+                'include spelling has an unsafe preprocessing token')
+        if token in ('(', '[', '<:'):
+            delimiters.append(')' if token == '(' else ']')
+        elif token in (')', ']', ':>'):
+            closing = ']' if token == ':>' else token
+            if not delimiters or delimiters.pop() != closing:
+                raise ProtocolError('include spelling has unbalanced delimiters')
+        tokens.append(token)
+        index += len(token)
+    if not tokens:
+        raise ProtocolError('include spelling has an empty computed operand')
+    first = tokens[0]
+    if not (first[0].isalpha() or first[0] == '_' or ord(first[0]) >= 128):
+        raise ProtocolError(
+            'computed include operand does not begin with a macro identifier')
+    if delimiters:
+        raise ProtocolError('include spelling has unbalanced delimiters')
+    return tuple(tokens)
+
+
 def _logical_include_token(spelling):
-    """Parse exactly one phase-2 logical include and return its header token."""
+    """Return a typed literal token or opaque computed-operand identity."""
     spelling = re.sub(r'\\\r?\n', '', spelling)
     if '\n' in spelling:
         raise ProtocolError('include spelling is not one logical line')
@@ -2085,24 +2183,30 @@ def _logical_include_token(spelling):
                                  spelling[index] == '_'):
         raise ProtocolError('include spelling has a longer directive name')
     index = _skip_include_trivia(spelling, index)
-    if index >= len(spelling) or spelling[index] not in '<"':
-        raise ProtocolError('include spelling has no literal header token')
-    closing = '>' if spelling[index] == '<' else '"'
-    end = spelling.find(closing, index + 1)
-    if end < 0 or end == index + 1:
-        raise ProtocolError('include spelling has an invalid header token')
-    token = spelling[index:end + 1]
-    index = _skip_include_trivia(spelling, end + 1)
-    if spelling.startswith('//', index):
-        index = len(spelling)
-    if index != len(spelling):
-        raise ProtocolError('include spelling has trailing non-comment text')
-    return token
+    if index >= len(spelling):
+        raise ProtocolError('include spelling has no header operand')
+    if spelling[index] in '<"':
+        closing = '>' if spelling[index] == '<' else '"'
+        end = spelling.find(closing, index + 1)
+        if end < 0 or end == index + 1:
+            raise ProtocolError('include spelling has an invalid header token')
+        token = spelling[index:end + 1]
+        index = _skip_include_trivia(spelling, end + 1)
+        if spelling.startswith('//', index):
+            index = len(spelling)
+        if index != len(spelling):
+            raise ProtocolError('include spelling has trailing non-comment text')
+        return ('literal', token)
+    return ('computed', _computed_include_tokens(spelling, index))
 
 
 def _logical_include_spelling(item):
-    """Return canonical desired spelling, independent of physical trivia."""
-    return '#include ' + _logical_include_token(item['spelling'])
+    """Return canonical literal spelling; computed spelling needs producer evidence."""
+    identity = _logical_include_token(item['spelling'])
+    if identity[0] != 'literal':
+        raise ProtocolError(
+            'cannot derive analyzer canonical line for computed include')
+    return '#include ' + identity[1]
 
 
 _CPP_MULTI_TOKENS = tuple(sorted((
@@ -2552,8 +2656,9 @@ def _validate_declaration_facts(record, source_bytes, native_conflicts=True,
                 raise ProtocolError('%s selected provider is absent from candidates' %
                                     operation['id'])
         if selected['status'] == 'known' and operation['item_kind'] == 'include':
-            include_token = _logical_include_token(operation['spelling'])
-            if include_token != selected['value']['spelling']:
+            include_identity = _logical_include_token(operation['spelling'])
+            if (include_identity[0] == 'literal' and
+                    include_identity[1] != selected['value']['spelling']):
                 raise ProtocolError('%s selected provider contradicts include' %
                                     operation['id'])
         if chain['status'] == 'known':
@@ -2675,6 +2780,36 @@ def _validate_declaration_facts(record, source_bytes, native_conflicts=True,
                          operation['disposition'] != 'apply') or
                         operation['subject_action'] == 'keep')]
                 desired_present = key in desired_set
+                computed_include = (
+                    key[0] == 'include' and key[1][0] == 'computed')
+                if computed_include:
+                    applied_adds = [
+                        operation for operation in key_operations
+                        if operation['subject_action'] == 'add' and
+                        operation['disposition'] == 'apply']
+                    if applied_adds and any(
+                            operation['spelling'] not in {
+                                item['spelling'] for item in desired['items']
+                                if item['item_kind'] == 'include'}
+                            for operation in applied_adds):
+                        operation_ids = ', '.join(
+                            operation['id'] for operation in applied_adds)
+                        raise ProtocolError(
+                            '%s computed add does not match analyzer canonical '
+                            'desired line' % operation_ids)
+                    # A present computed directive is serialized physically in
+                    # the operation, while the analyzer's desired state names
+                    # its expanded canonical literal. Without a producer field
+                    # linking those spellings, absence of the opaque key is not
+                    # evidence of absence. A computed desired key still cannot
+                    # survive a group with no presence witness.
+                    if desired_present and not presence_witnesses:
+                        operation_ids = ', '.join(
+                            operation['id'] for operation in key_operations)
+                        raise ProtocolError(
+                            '%s group contradicts desired state for %s' %
+                            (operation_ids, key[1]))
+                    continue
                 if desired_present != bool(presence_witnesses):
                     operation_ids = ', '.join(
                         operation['id'] for operation in key_operations)

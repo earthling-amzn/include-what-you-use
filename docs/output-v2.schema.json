@@ -71,7 +71,7 @@
       }
     },
     "desired_state": {
-      "description": "Accepted final key state. Semantic validation groups operations by (item_kind, spelling); applied adds and retained-occurrence operations establish presence despite other occurrence removals.",
+      "description": "Accepted final logical-item state. Literal include operations group by their parsed quoted or angled header token. Computed include operations use a separate opaque, lexically validated preprocessing-token sequence and never group with expanded literal desired items unless the producer emits the same computed canonical line. Applied adds and retained-occurrence operations establish presence despite other occurrence removals.",
       "$ref": "#/$defs/desired_state"
     },
     "diagnostics": {

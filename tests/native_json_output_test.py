@@ -918,6 +918,52 @@ rules:
         '// exact removal spelling')
     assert exact["desired_state"]["items"] == []
 
+    # Computed includes retain physical operation spelling while desired state
+    # remains the analyzer's expanded canonical line. Distinct macro arguments
+    # remain distinct occurrences even when they expand to the same provider.
+    computed_result = run("tests/native_json/computed_include.cc",
+                          "--output_format=json")
+    assert computed_result.returncode == 0, computed_result.stderr
+    computed = by_path(records(computed_result), "computed_include.cc")
+    assert [(op["subject_action"], op["disposition"], op["spelling"])
+            for op in computed["operations"]] == [
+        ("remove", "apply",
+         "#include CPU_HEADER(gc/shenandoah/computedTwo) /* physical two */"),
+        ("keep", "keep",
+         "  # include /* operand */ CPU_HEADER( gc/shenandoah/computedOne ) "
+         "// physical one"),
+    ]
+    assert computed["desired_state"]["items"] == [{
+        "item_kind": "include",
+        "spelling": '#include "tests/native_json/computed_provider.h"',
+        "symbols": ["NativeJsonComputedProvider"],
+    }]
+
+    computed_deny_policy = """schema_version: 1
+rules:
+  - id: deny-computed-removal
+    action: deny_remove
+    match:
+      includee: { glob: "*tests/native_json/computed_provider.h" }
+"""
+    computed_denied_result, computed_policy_path = run_with_temporary_policy(
+        "tests/native_json/computed_include.cc", computed_deny_policy)
+    assert computed_denied_result.returncode == 0, computed_denied_result.stderr
+    computed_denied = by_path(
+        records(computed_denied_result), "computed_include.cc")
+    denied_operation = next(
+        op for op in computed_denied["operations"]
+        if op["subject_action"] == "remove")
+    assert (denied_operation["disposition"],
+            denied_operation["reason_code"]) == (
+                "suppress", "project_policy_deny_remove")
+    assert denied_operation["policy"] == {
+        "status": "known",
+        "value": {"policy_file": computed_policy_path,
+                  "rule_id": "deny-computed-removal", "decision": "deny"},
+    }
+    assert computed_denied["desired_state"] == computed["desired_state"]
+
     forward_result = run("tests/native_json/forward_declarations.cc",
                          "--output_format=json")
     assert forward_result.returncode == 0, forward_result.stderr
