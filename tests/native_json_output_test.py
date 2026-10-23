@@ -845,7 +845,7 @@ rules:
     keep_op = keep["operations"][0]
     assert (keep_op["subject_action"], keep_op["disposition"],
             keep_op["reason_code"]) == ("remove", "keep", "pragma_keep")
-    assert keep_op["spelling"] in {
+    assert '#include "tests/native_json/unused.h"' in {
         item["spelling"] for item in keep["desired_state"]["items"]}
     assert keep_op["spelling"] == (
         '#include "tests/native_json/unused.h"  // IWYU pragma: keep')
@@ -956,19 +956,30 @@ rules:
         ("nested_declaration", "NestedKept"):
             "  class   NestedKept  ;",
     }
+    expected_desired_spellings = {
+        ("pragma_keep", "KeepMe"):
+            "namespace physical { struct KeepMe; }",
+        ("pragma_keep", "MultiKeep"):
+            "namespace physical { template <typename T> struct MultiKeep; }",
+        ("pragma_export", "ExportMe"):
+            "namespace physical { class ExportMe; }",
+        ("linkage_specification", "LinkageKept"): "class LinkageKept;",
+        ("explicit_attribute", "AttributeKept"): "struct AttributeKept;",
+        ("nested_declaration", "NestedKept"): "class Outer::NestedKept;",
+    }
     desired_forward_spellings = {
         item["spelling"] for item in forward["desired_state"]["items"]
         if item["item_kind"] == "forward_declaration"}
-    for (reason_code, fragment), spelling in expected_keep_spellings.items():
+    for key, spelling in expected_keep_spellings.items():
+        reason_code, fragment = key
         operation = forward_op(reason_code, fragment)
         assert (operation["subject_action"], operation["disposition"],
                 operation["spelling"]) == ("remove", "keep", spelling)
-        assert spelling in desired_forward_spellings
+        assert expected_desired_spellings[key] in desired_forward_spellings
     assert not any(op["reason_code"] == "pragma_keep" and
                    "Needed" in op["spelling"]
                    for op in forward_ops)
-    assert "  class   Needed  ;  // IWYU pragma: keep" in (
-        desired_forward_spellings)
+    assert "namespace physical { class Needed; }" in desired_forward_spellings
 
     generated_result = run("tests/native_json/generated_forward.cc",
                            "--output_format=json")
@@ -1708,7 +1719,7 @@ rules:
             "rule_id": "deny-plain-header-removal", "decision": "deny"}}
     assert all(value["status"] == "not_applicable"
                for value in denied_remove["provider"].values())
-    assert denied_remove["spelling"] in {
+    assert '#include "tests/native_json/policy007_unused.hpp"' in {
         item["spelling"] for item in denied_record["desired_state"]["items"]}
     assert denied_record["status"] == "correct"
     assert len([diagnostic for diagnostic in denied_record["diagnostics"]

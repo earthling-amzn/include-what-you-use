@@ -117,13 +117,15 @@ and declaration location.
 
 ## Occurrence relocation and final state
 
-Version 2 can represent several physical occurrences of one `(item_kind,
-spelling)` key. A present operation is identified by its exact `source_range`
-and `edit_condition`; conditional copies therefore remain separate even when
-their spelling is identical. Operation ordering uses both facts. The driver
-rejects duplicate indistinguishable operations, two decisions with one known
-physical range, or two unavailable-range decisions with the same condition
-identity.
+Version 2 can represent several physical occurrences of one logical item. The
+logical key is the exact quoted or angled include token, or the canonical C++
+token sequence of a forward declaration after comments and whitespace are
+removed. Operation `spelling` remains exact physical source text. A present
+operation is identified by its exact `source_range` and `edit_condition`;
+conditional copies therefore remain separate even when their logical key is
+identical. Operation ordering uses both facts. The driver rejects duplicate
+indistinguishable operations, two decisions with one known physical range, or
+two unavailable-range decisions with the same condition identity.
 
 Desired-state consistency is checked once per key, after all occurrence
 operations. An applied add establishes final presence. A remove operation with a

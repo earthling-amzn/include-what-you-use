@@ -98,7 +98,7 @@ def assert_non_file_keep(record, source):
         "disposition": "keep",
         "subject_action": "remove",
     }]
-    assert operation["spelling"] in {
+    assert '#include "tests/conditional_regions/empty.hpp"' in {
         item["spelling"] for item in record["desired_state"]["items"]}
     return operation
 

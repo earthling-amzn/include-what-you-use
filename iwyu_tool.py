@@ -2052,6 +2052,239 @@ def _declaration_kinds_incompatible(kinds):
     return len(kinds) > 1 and not kinds <= set(['class', 'struct'])
 
 
+
+def _skip_include_trivia(spelling, index):
+    """Skip horizontal whitespace and complete block comments."""
+    while index < len(spelling):
+        if spelling[index] in ' \t\v\f\r':
+            index += 1
+            continue
+        if spelling.startswith('/*', index):
+            end = spelling.find('*/', index + 2)
+            if end < 0 or '\n' in spelling[index:end + 2]:
+                raise ProtocolError('include spelling has an unterminated comment')
+            index = end + 2
+            continue
+        break
+    return index
+
+
+def _logical_include_token(spelling):
+    """Parse exactly one phase-2 logical include and return its header token."""
+    spelling = re.sub(r'\\\r?\n', '', spelling)
+    if '\n' in spelling:
+        raise ProtocolError('include spelling is not one logical line')
+    index = _skip_include_trivia(spelling, 0)
+    if index >= len(spelling) or spelling[index] != '#':
+        raise ProtocolError('include spelling does not begin with a directive')
+    index = _skip_include_trivia(spelling, index + 1)
+    if not spelling.startswith('include', index):
+        raise ProtocolError('include spelling does not name include')
+    index += len('include')
+    if index < len(spelling) and (spelling[index].isalnum() or
+                                 spelling[index] == '_'):
+        raise ProtocolError('include spelling has a longer directive name')
+    index = _skip_include_trivia(spelling, index)
+    if index >= len(spelling) or spelling[index] not in '<"':
+        raise ProtocolError('include spelling has no literal header token')
+    closing = '>' if spelling[index] == '<' else '"'
+    end = spelling.find(closing, index + 1)
+    if end < 0 or end == index + 1:
+        raise ProtocolError('include spelling has an invalid header token')
+    token = spelling[index:end + 1]
+    index = _skip_include_trivia(spelling, end + 1)
+    if spelling.startswith('//', index):
+        index = len(spelling)
+    if index != len(spelling):
+        raise ProtocolError('include spelling has trailing non-comment text')
+    return token
+
+
+_CPP_MULTI_TOKENS = tuple(sorted((
+    '>>=', '<<=', '<=>', '...', '::', '->*', '.*', '->', '++', '--',
+    '<<', '>>', '<=', '>=', '==', '!=', '&&', '||', '+=', '-=', '*=',
+    '/=', '%=', '^=', '&=', '|=', '##'), key=len, reverse=True))
+
+
+def _forward_declaration_tokens(spelling):
+    """Return a comment/whitespace-independent physical C++ token identity."""
+    tokens = []
+    index = 0
+    while index < len(spelling):
+        char = spelling[index]
+        if char.isspace():
+            index += 1
+            continue
+        if spelling.startswith('//', index):
+            newline = spelling.find('\n', index + 2)
+            index = len(spelling) if newline < 0 else newline + 1
+            continue
+        if spelling.startswith('/*', index):
+            end = spelling.find('*/', index + 2)
+            if end < 0:
+                raise ProtocolError(
+                    'forward-declaration spelling has an unterminated comment')
+            index = end + 2
+            continue
+        if char.isalpha() or char == '_' or ord(char) >= 128:
+            end = index + 1
+            while end < len(spelling):
+                candidate = spelling[end]
+                if not (candidate.isalnum() or candidate == '_' or
+                        ord(candidate) >= 128):
+                    break
+                end += 1
+            tokens.append(spelling[index:end])
+            index = end
+            continue
+        if char.isdigit():
+            end = index + 1
+            while end < len(spelling) and (
+                    spelling[end].isalnum() or spelling[end] in "._'"):
+                end += 1
+            tokens.append(spelling[index:end])
+            index = end
+            continue
+        if char in "'\"":
+            quote = char
+            end = index + 1
+            escaped = False
+            while end < len(spelling):
+                current = spelling[end]
+                end += 1
+                if escaped:
+                    escaped = False
+                elif current == '\\':
+                    escaped = True
+                elif current == quote:
+                    break
+                elif current == '\n':
+                    raise ProtocolError(
+                        'forward-declaration spelling has an unterminated literal')
+            else:
+                raise ProtocolError(
+                    'forward-declaration spelling has an unterminated literal')
+            tokens.append(spelling[index:end])
+            index = end
+            continue
+        token = next((candidate for candidate in _CPP_MULTI_TOKENS
+                      if spelling.startswith(candidate, index)), char)
+        tokens.append(token)
+        index += len(token)
+    if not tokens:
+        raise ProtocolError('forward-declaration spelling has no C++ tokens')
+    return tuple(tokens)
+
+
+def _forward_declaration_core(tokens):
+    """Remove context/attributes but preserve the complete declaration shape."""
+    try:
+        semicolon = tokens.index(';')
+    except ValueError:
+        return None
+    if any(token != '}' for token in tokens[semicolon + 1:]):
+        return None
+    body = list(tokens[:semicolon + 1])
+    stripped = []
+    index = 0
+    while index < len(body):
+        token = body[index]
+        if token in ('__attribute__', '__declspec', 'alignas') and (
+                index + 1 < len(body) and body[index + 1] == '('):
+            depth = 0
+            index += 1
+            while index < len(body):
+                if body[index] == '(':
+                    depth += 1
+                elif body[index] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        index += 1
+                        break
+                index += 1
+            if depth != 0:
+                return None
+            continue
+        if token == '[' and index + 1 < len(body) and body[index + 1] == '[':
+            index += 2
+            depth = 1
+            while index < len(body):
+                if body[index:index + 2] == ['[', '[']:
+                    depth += 1
+                    index += 2
+                elif body[index:index + 2] == [']', ']']:
+                    depth -= 1
+                    index += 2
+                    if depth == 0:
+                        break
+                else:
+                    index += 1
+            if depth != 0:
+                return None
+            continue
+        stripped.append(token)
+        index += 1
+    semicolon = stripped.index(';')
+    kind_indices = [index for index, token in enumerate(stripped[:semicolon])
+                    if token in ('class', 'struct', 'union', 'enum')]
+    if not kind_indices:
+        return None
+    kind_index = kind_indices[-1]
+    if (stripped[kind_index] in ('class', 'struct') and kind_index > 0 and
+            stripped[kind_index - 1] == 'enum'):
+        kind_index -= 1
+    name_index = kind_index + 1
+    if (stripped[kind_index] == 'enum' and name_index < semicolon and
+            stripped[name_index] in ('class', 'struct')):
+        name_index += 1
+    if name_index >= semicolon:
+        return None
+    while name_index + 2 < semicolon and stripped[name_index + 1] == '::':
+        name_index += 2
+    name = stripped[name_index]
+    if not (name[0].isalpha() or name[0] == '_' or ord(name[0]) >= 128):
+        return None
+    template_indices = [index for index, token in enumerate(stripped[:kind_index])
+                        if token == 'template']
+    prefix = stripped[template_indices[-1]:kind_index] if template_indices else []
+    kind_tokens = stripped[kind_index:name_index]
+    while len(kind_tokens) >= 2 and kind_tokens[-1] == '::':
+        kind_tokens = kind_tokens[:-2]
+    return tuple(prefix + kind_tokens + [name] +
+                 stripped[name_index + 1:semicolon + 1])
+
+
+def _forward_desired_index(items):
+    index = {}
+    for item in items:
+        if item['item_kind'] != 'forward_declaration':
+            continue
+        tokens = _forward_declaration_tokens(item['spelling'])
+        core = _forward_declaration_core(tokens)
+        if core is None:
+            raise ProtocolError(
+                'canonical forward declaration has no stable core')
+        index[core] = tokens if core not in index else None
+    return index
+
+
+def _logical_item_key(item, forward_desired=None):
+    """Derive schema-v2 final-state identity without changing wire shape."""
+    kind = item['item_kind']
+    spelling = item['spelling']
+    if kind == 'include':
+        return (kind, _logical_include_token(spelling))
+    tokens = _forward_declaration_tokens(spelling)
+    if forward_desired is not None:
+        core = _forward_declaration_core(tokens)
+        canonical = forward_desired.get(core) if core is not None else None
+        if canonical is not None:
+            tokens = canonical
+        elif 'source_range' in item:
+            tokens = ('<unmatched>',) + tokens + (
+                _json_dumps_canonical(item['source_range']),)
+    return (kind, tokens)
+
 def _validate_declaration_facts(record, source_bytes, native_conflicts=True,
                                 schema_validated=False):
     if not schema_validated:
@@ -2314,12 +2547,8 @@ def _validate_declaration_facts(record, source_bytes, native_conflicts=True,
                 raise ProtocolError('%s selected provider is absent from candidates' %
                                     operation['id'])
         if selected['status'] == 'known' and operation['item_kind'] == 'include':
-            include = re.match(
-                r'^\s*#\s*include\s+(<[^>]+>|"[^"]+")'
-                r'(?:\s*(?://.*|/\*.*\*/\s*))?$',
-                operation['spelling'])
-            if (not include or
-                    include.group(1) != selected['value']['spelling']):
+            include_token = _logical_include_token(operation['spelling'])
+            if include_token != selected['value']['spelling']:
                 raise ProtocolError('%s selected provider contradicts include' %
                                     operation['id'])
         if chain['status'] == 'known':
@@ -2390,8 +2619,13 @@ def _validate_declaration_facts(record, source_bytes, native_conflicts=True,
                                     operation['id'])
 
     if desired['status'] == 'known':
-        desired_keys = [(item['item_kind'], item['spelling'])
-                        for item in desired['items']]
+        if record['schema_version'] == 1:
+            desired_keys = [(item['item_kind'], item['spelling'])
+                            for item in desired['items']]
+        else:
+            forward_desired = _forward_desired_index(desired['items'])
+            desired_keys = [_logical_item_key(item, forward_desired)
+                            for item in desired['items']]
         if len(desired_keys) != len(set(desired_keys)):
             raise ProtocolError('duplicate desired-state item')
         seen_forward_declaration = False
@@ -2422,7 +2656,7 @@ def _validate_declaration_facts(record, source_bytes, native_conflicts=True,
         else:
             operations_by_key = {}
             for operation in operations:
-                key = (operation['item_kind'], operation['spelling'])
+                key = _logical_item_key(operation, forward_desired)
                 operations_by_key.setdefault(key, []).append(operation)
             for key, key_operations in operations_by_key.items():
                 # Presence after all dispositions is established by an applied

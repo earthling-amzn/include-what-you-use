@@ -323,8 +323,11 @@ conditional occurrences without discarding either identity.
 ```
 
 For `correct` and `changes`, version 1 requires known, complete desired state.
-For `skipped` and `error`, unavailable state is valid. Desired items must be
-unique by `(item_kind, spelling)`.
+For `skipped` and `error`, unavailable state is valid. Version 1 desired items
+retain exact spelling identity. Version 2 desired items use the producer's
+canonical logical line and are unique by logical item key: the exact quoted or
+angled token for includes, and the comment/whitespace-independent C++ token
+sequence for forward declarations.
 
 For version 1, each operation independently determines key membership:
 
@@ -334,9 +337,13 @@ For version 1, each operation independently determines key membership:
 - `remove/keep`, `remove/suppress`, and `remove/report` remain present;
 - `keep/keep` and `keep/report` remain present.
 
-Version 2 evaluates all operations with the same `(item_kind, spelling)` as one
-final-state group. Desired presence requires at least one applied add, one
-present remove operation whose disposition retains it, or one keep operation.
+Version 2 evaluates all operations with the same logical item key as one
+final-state group, even when indentation or comments make their exact physical
+`spelling` values differ. Consumers derive the key only from an exactly parsed
+include token or a comment/whitespace-independent forward-declaration token
+sequence; different include tokens or declarations never merge. Desired presence
+requires at least one applied add, one present remove operation whose disposition
+retains it, or one keep operation.
 For duplicate physical items, the schema-v2 producer emits
 `keep/keep` with reason code `retained_occurrence` for an unchanged occurrence
 that supplies final presence. An applied remove removes only its identified
@@ -376,7 +383,8 @@ Within a record:
    two present-item decisions cannot name the same version-2 occurrence;
 4. operation IDs are assigned `op-1`, `op-2`, ... only after sorting and are not
    themselves sort keys;
-5. desired items retain final source order and are unique by kind/spelling;
+5. desired items retain final source order; schema v1 is unique by exact
+   kind/spelling and schema v2 by logical item key;
 6. symbols sort by available qualified name (or name fallback), then name, and
    are unique by that identity;
 7. uses sort by path, line, column, origin rank (`ast`, `macro`, `heuristic`,

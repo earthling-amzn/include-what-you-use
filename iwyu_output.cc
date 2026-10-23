@@ -3591,20 +3591,25 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
               });
   }
 
+  const auto desired_item_spelling = [](const OneIncludeOrForwardDeclareLine& line) {
+    if (GlobalFlags().output_schema_version >= 2)
+      return line.line();
+    const bool retained_by_policy =
+        line.is_present() && line.has_structured_decision() &&
+        line.decision_disposition() != "apply";
+    return (!line.IsIncludeLine() && line.is_present()) || retained_by_policy
+        ? line.source_spelling() : line.line();
+  };
+
+  // Schema v2 desired state identifies logical items, not physical occurrences.
+  // Schema v1 retains its historical exact-spelling identity.
   set<pair<string, string>> desired_keys;
   desired_lines.erase(
       std::remove_if(
           desired_lines.begin(), desired_lines.end(),
           [&](const OneIncludeOrForwardDeclareLine* line) {
-            const bool retained_by_policy =
-                line->is_present() && line->has_structured_decision() &&
-                line->decision_disposition() != "apply";
-            const string spelling =
-                (!line->IsIncludeLine() && line->is_present()) ||
-                        retained_by_policy
-                    ? line->source_spelling()
-                    : line->line();
-            return !desired_keys.insert({item_kind(*line), spelling}).second;
+            return !desired_keys.insert(
+                {item_kind(*line), desired_item_spelling(*line)}).second;
           }),
       desired_lines.end());
 
@@ -3617,13 +3622,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
     }
     llvm::json::Object item;
     item["item_kind"] = item_kind(*line);
-    const bool retained_by_policy =
-        line->is_present() && line->has_structured_decision() &&
-        line->decision_disposition() != "apply";
-    item["spelling"] = (!line->IsIncludeLine() && line->is_present()) ||
-                               retained_by_policy
-                           ? line->source_spelling()
-                           : line->line();
+    item["spelling"] = desired_item_spelling(*line);
     item["symbols"] = std::move(symbols);
     desired_items.push_back(std::move(item));
   }

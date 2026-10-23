@@ -114,6 +114,219 @@ def is_normalized_path(path):
         return False
     return posixpath.normpath(path) == path
 
+
+def skip_include_trivia(spelling, index):
+    while index < len(spelling):
+        if spelling[index] in " \t\v\f\r":
+            index += 1
+        elif spelling.startswith("/*", index):
+            end = spelling.find("*/", index + 2)
+            if end < 0 or "\n" in spelling[index:end + 2]:
+                raise ValueError("unterminated include comment")
+            index = end + 2
+        else:
+            break
+    return index
+
+
+def logical_include_token(spelling):
+    spelling = re.sub(r"\\\r?\n", "", spelling)
+    if "\n" in spelling:
+        raise ValueError("multiline logical include spelling")
+    index = skip_include_trivia(spelling, 0)
+    if index >= len(spelling) or spelling[index] != "#":
+        raise ValueError("missing include directive")
+    index = skip_include_trivia(spelling, index + 1)
+    if not spelling.startswith("include", index):
+        raise ValueError("wrong include directive")
+    index += len("include")
+    if index < len(spelling) and (spelling[index].isalnum() or spelling[index] == "_"):
+        raise ValueError("longer include directive")
+    index = skip_include_trivia(spelling, index)
+    if index >= len(spelling) or spelling[index] not in '<"':
+        raise ValueError("missing include token")
+    closing = ">" if spelling[index] == "<" else '"'
+    end = spelling.find(closing, index + 1)
+    if end < 0 or end == index + 1:
+        raise ValueError("invalid include token")
+    token = spelling[index:end + 1]
+    index = skip_include_trivia(spelling, end + 1)
+    if spelling.startswith("//", index):
+        index = len(spelling)
+    if index != len(spelling):
+        raise ValueError("trailing include text")
+    return token
+
+
+CPP_MULTI_TOKENS = tuple(sorted((
+    ">>=", "<<=", "<=>", "...", "::", "->*", ".*", "->", "++", "--",
+    "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "+=", "-=", "*=",
+    "/=", "%=", "^=", "&=", "|=", "##"), key=len, reverse=True))
+
+
+def forward_declaration_tokens(spelling):
+    tokens = []
+    index = 0
+    while index < len(spelling):
+        char = spelling[index]
+        if char.isspace():
+            index += 1
+        elif spelling.startswith("//", index):
+            newline = spelling.find("\n", index + 2)
+            index = len(spelling) if newline < 0 else newline + 1
+        elif spelling.startswith("/*", index):
+            end = spelling.find("*/", index + 2)
+            if end < 0:
+                raise ValueError("unterminated forward comment")
+            index = end + 2
+        elif char.isalpha() or char == "_" or ord(char) >= 128:
+            end = index + 1
+            while end < len(spelling) and (
+                    spelling[end].isalnum() or spelling[end] == "_" or
+                    ord(spelling[end]) >= 128):
+                end += 1
+            tokens.append(spelling[index:end])
+            index = end
+        elif char.isdigit():
+            end = index + 1
+            while end < len(spelling) and (
+                    spelling[end].isalnum() or spelling[end] in "._'"):
+                end += 1
+            tokens.append(spelling[index:end])
+            index = end
+        elif char in "'\"":
+            quote = char
+            end = index + 1
+            escaped = False
+            while end < len(spelling):
+                current = spelling[end]
+                end += 1
+                if escaped:
+                    escaped = False
+                elif current == "\\":
+                    escaped = True
+                elif current == quote:
+                    break
+                elif current == "\n":
+                    raise ValueError("unterminated forward literal")
+            else:
+                raise ValueError("unterminated forward literal")
+            tokens.append(spelling[index:end])
+            index = end
+        else:
+            token = next((candidate for candidate in CPP_MULTI_TOKENS
+                          if spelling.startswith(candidate, index)), char)
+            tokens.append(token)
+            index += len(token)
+    if not tokens:
+        raise ValueError("empty forward declaration")
+    return tuple(tokens)
+
+
+def forward_declaration_core(tokens):
+    try:
+        semicolon = tokens.index(";")
+    except ValueError:
+        return None
+    if any(token != "}" for token in tokens[semicolon + 1:]):
+        return None
+    body = list(tokens[:semicolon + 1])
+    stripped = []
+    index = 0
+    while index < len(body):
+        token = body[index]
+        if token in ("__attribute__", "__declspec", "alignas") and (
+                index + 1 < len(body) and body[index + 1] == "("):
+            depth = 0
+            index += 1
+            while index < len(body):
+                if body[index] == "(":
+                    depth += 1
+                elif body[index] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        index += 1
+                        break
+                index += 1
+            if depth != 0:
+                return None
+            continue
+        if token == "[" and index + 1 < len(body) and body[index + 1] == "[":
+            index += 2
+            depth = 1
+            while index < len(body):
+                if body[index:index + 2] == ["[", "["]:
+                    depth += 1
+                    index += 2
+                elif body[index:index + 2] == ["]", "]"]:
+                    depth -= 1
+                    index += 2
+                    if depth == 0:
+                        break
+                else:
+                    index += 1
+            if depth != 0:
+                return None
+            continue
+        stripped.append(token)
+        index += 1
+    semicolon = stripped.index(";")
+    kind_indices = [index for index, token in enumerate(stripped[:semicolon])
+                    if token in ("class", "struct", "union", "enum")]
+    if not kind_indices:
+        return None
+    kind_index = kind_indices[-1]
+    if (stripped[kind_index] in ("class", "struct") and kind_index > 0 and
+            stripped[kind_index - 1] == "enum"):
+        kind_index -= 1
+    name_index = kind_index + 1
+    if (stripped[kind_index] == "enum" and name_index < semicolon and
+            stripped[name_index] in ("class", "struct")):
+        name_index += 1
+    if name_index >= semicolon:
+        return None
+    while name_index + 2 < semicolon and stripped[name_index + 1] == "::":
+        name_index += 2
+    name = stripped[name_index]
+    if not (name[0].isalpha() or name[0] == "_" or ord(name[0]) >= 128):
+        return None
+    template_indices = [index for index, token in enumerate(stripped[:kind_index])
+                        if token == "template"]
+    prefix = stripped[template_indices[-1]:kind_index] if template_indices else []
+    kind_tokens = stripped[kind_index:name_index]
+    while len(kind_tokens) >= 2 and kind_tokens[-1] == "::":
+        kind_tokens = kind_tokens[:-2]
+    return tuple([*prefix, *kind_tokens, name,
+                  *stripped[name_index + 1:semicolon + 1]])
+
+
+def forward_desired_index(items):
+    index = {}
+    for item in items:
+        if item["item_kind"] != "forward_declaration":
+            continue
+        tokens = forward_declaration_tokens(item["spelling"])
+        core = forward_declaration_core(tokens)
+        if core is None:
+            raise ValueError("canonical forward declaration has no stable core")
+        index[core] = tokens if core not in index else None
+    return index
+
+
+def logical_item_key(item, desired_forward=None):
+    if item["item_kind"] == "include":
+        return ("include", logical_include_token(item["spelling"]))
+    tokens = forward_declaration_tokens(item["spelling"])
+    if desired_forward is not None:
+        core = forward_declaration_core(tokens)
+        matched = desired_forward.get(core) if core is not None else None
+        if matched is not None:
+            tokens = matched
+        elif "source_range" in item:
+            tokens = ("<unmatched>", *tokens, canonical(item["source_range"]))
+    return ("forward_declaration", tokens)
+
+
 def provider_key(provider):
     return (provider["path"], provider["spelling"])
 
@@ -360,7 +573,11 @@ def semantic_errors(record):
 
     if desired["status"] == "known":
         items = desired["items"]
-        keys = [(item["item_kind"], item["spelling"]) for item in items]
+        if record["schema_version"] == 1:
+            keys = [(item["item_kind"], item["spelling"]) for item in items]
+        else:
+            desired_forward = forward_desired_index(items)
+            keys = [logical_item_key(item, desired_forward) for item in items]
         if len(keys) != len(set(keys)):
             errors.append("duplicate desired-state item")
         desired_spellings = set(keys)
@@ -382,7 +599,7 @@ def semantic_errors(record):
         else:
             operations_by_key = {}
             for op in operations:
-                key = (op["item_kind"], op["spelling"])
+                key = logical_item_key(op, desired_forward)
                 operations_by_key.setdefault(key, []).append(op)
             for key, key_operations in operations_by_key.items():
                 presence_witnesses = [

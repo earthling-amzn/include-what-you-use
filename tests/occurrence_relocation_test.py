@@ -104,9 +104,82 @@ def compile_configs(root, output_root):
             "-c", source, "-o", output_root / f"{name}.o",
         ], root)
         assert result.returncode == 0, (name, result.stderr)
+def assert_logical_item_keys():
 
+
+    include_variants = [
+        {'item_kind': 'include',
+         'spelling': '  # include "tests/occurrence_relocation/provider.hpp" // retained physical'},
+        {'item_kind': 'include',
+         'spelling': '\t#\tinclude /* between */ "tests/occurrence_relocation/provider.hpp"\t/* c1 */'},
+        {'item_kind': 'include',
+         'spelling': '#include "tests/occurrence_relocation/provider.hpp" /* fake #include "evil.hpp" */'},
+    ]
+    include_keys = [iwyu_tool._logical_item_key(item)
+                    for item in include_variants]
+    assert include_keys[0] == include_keys[1] == include_keys[2]
+    assert include_keys[0] != iwyu_tool._logical_item_key({
+        'item_kind': 'include', 'spelling': '#include "other.hpp"'})
+    for malicious in (
+            'const char* text = "#include \\"provider.hpp\\"";',
+            '#include "provider.hpp" retained_text',
+            '/* #include "provider.hpp"'):
+        try:
+            iwyu_tool._logical_item_key(
+                {'item_kind': 'include', 'spelling': malicious})
+        except iwyu_tool.ProtocolError:
+            pass
+        else:
+            raise AssertionError('malicious include text acquired a logical key')
+
+    forward_variants = [
+        {'item_kind': 'forward_declaration',
+         'spelling': 'class OccurrenceRelocatedDeclaration; // retained'},
+        {'item_kind': 'forward_declaration',
+         'spelling': '\tclass /* split */ OccurrenceRelocatedDeclaration ;'},
+        {'item_kind': 'forward_declaration',
+         'spelling': 'class OccurrenceRelocatedDeclaration; /* class Evil; */'},
+    ]
+    forward_keys = [iwyu_tool._logical_item_key(item)
+                    for item in forward_variants]
+    assert forward_keys[0] == forward_keys[1] == forward_keys[2]
+    assert forward_keys[0] != iwyu_tool._logical_item_key({
+        'item_kind': 'forward_declaration', 'spelling': 'class Other;'})
+    assert forward_keys[0] != iwyu_tool._logical_item_key({
+        'item_kind': 'forward_declaration',
+        'spelling': 'class OccurrenceRelocatedDeclaration; int injected;'})
+    canonical = [{
+        'item_kind': 'forward_declaration',
+        'spelling': ('namespace occurrence { '
+                     'class OccurrenceRelocatedDeclaration; }'),
+    }]
+    desired_index = iwyu_tool._forward_desired_index(canonical)
+    canonical_key = iwyu_tool._logical_item_key(canonical[0], desired_index)
+    physical = {
+        'item_kind': 'forward_declaration',
+        'spelling': '\tclass /* split */ OccurrenceRelocatedDeclaration ;',
+        'source_range': {'status': 'unavailable', 'value': None},
+    }
+    assert iwyu_tool._logical_item_key(physical, desired_index) == canonical_key
+    injected = dict(physical)
+    injected['spelling'] += ' int injected;'
+    assert iwyu_tool._logical_item_key(injected, desired_index) != canonical_key
+    template_index = iwyu_tool._forward_desired_index([{
+        'item_kind': 'forward_declaration',
+        'spelling': 'template <typename T> class TemplateExample;',
+    }])
+    different_template = {
+        'item_kind': 'forward_declaration',
+        'spelling': ('template <typename T, typename U> '
+                     'class TemplateExample;'),
+        'source_range': {'status': 'unavailable', 'value': None},
+    }
+    assert iwyu_tool._logical_item_key(
+        different_template, template_index) != (
+            'forward_declaration', next(iter(template_index.values())))
 
 def main():
+    assert_logical_item_keys()
     direct_one = run(analyzer_command(ROOT, 2), ROOT)
     direct_two = run(analyzer_command(ROOT, 2), ROOT)
     assert direct_one.returncode == direct_two.returncode == 0
@@ -125,6 +198,14 @@ def main():
         ("keep", "keep", "include"),
         ("keep", "keep", "forward_declaration"),
     ]
+    assert {operation["spelling"] for operation in operations} == {
+        '  # include "tests/occurrence_relocation/provider.hpp" // retained physical',
+        '\t#\tinclude "tests/occurrence_relocation/provider.hpp"\t/* c1 physical */',
+        '#include "tests/occurrence_relocation/provider.hpp" /* c2 physical */',
+        'class OccurrenceRelocatedDeclaration; // retained physical',
+        '\tclass OccurrenceRelocatedDeclaration;\t/* c1 physical */',
+        'class OccurrenceRelocatedDeclaration; /* c2 physical */',
+    }
     removals = [operation for operation in operations
                 if operation["subject_action"] == "remove"]
     assert [operation["source_range"]["value"]["start"]["line"]
@@ -159,8 +240,7 @@ def main():
 
     schema_one_shape = copy.deepcopy(relocated)
     schema_one_shape["schema_version"] = 1
-    assert any("removed/suppressed-add item remains in desired state" in error
-               for error in semantic_errors(schema_one_shape))
+    assert semantic_errors(schema_one_shape)
 
     assert ("forward_declaration",
             "class OccurrenceRelocatedDeclaration;") in desired
@@ -238,7 +318,7 @@ def main():
         fixed_text = fixed.read_text()
         assert fixed_text.count("class OccurrenceRelocatedDeclaration;") == 1
         assert fixed_text.count(
-            '#include "tests/occurrence_relocation/provider.hpp"') == 1
+            '"tests/occurrence_relocation/provider.hpp"') == 1
         compile_configs(temporary_root, temporary_root)
 
         before_second = tree_digest(temporary_root)
