@@ -129,6 +129,7 @@
 #include "clang/AST/ExprConcepts.h"
 #include "clang/AST/NestedNameSpecifier.h"
 #include "clang/AST/OperationKinds.h"
+#include "clang/AST/ParentMapContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/TemplateBase.h"
 #include "clang/AST/Type.h"
@@ -1093,6 +1094,10 @@ struct VisitorState {
   // A defaulted special member can invoke another defaulted special member.
   // Keep that generated call graph cycle-safe at each concrete use site.
   set<std::pair<const FunctionDecl*, unsigned>> lifecycle_obligations;
+
+  set<std::pair<const Expr*, unsigned>> default_argument_obligations;
+
+  set<std::pair<const FunctionDecl*, unsigned>> definition_body_propagations;
 };
 
 // ----------------------------------------------------------------------
@@ -2696,6 +2701,274 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     return false;
   }
 
+  class DefinitionBodyUseCollector
+      : public clang::ConstEvaluatedExprVisitor<DefinitionBodyUseCollector> {
+    using EvalBase =
+        clang::ConstEvaluatedExprVisitor<DefinitionBodyUseCollector>;
+
+   public:
+    DefinitionBodyUseCollector(
+        ASTContext& context,
+        std::function<void(const FunctionDecl*, const Expr*)> callback)
+        : EvalBase(context), context_(context), callback_(std::move(callback)) {}
+
+    bool shouldVisitDiscardedStmt() const { return false; }
+
+    void VisitCallExpr(const CallExpr* expr) {
+      callback_(expr->getDirectCallee(), expr);
+      EvalBase::VisitCallExpr(expr);
+    }
+
+    void VisitDeclRefExpr(const DeclRefExpr* expr) {
+      if (expr->isNonOdrUse() == clang::NOUR_None)
+        callback_(dyn_cast<FunctionDecl>(expr->getDecl()), expr);
+      EvalBase::VisitDeclRefExpr(expr);
+    }
+
+    void VisitMemberExpr(const MemberExpr* expr) {
+      if (expr->isNonOdrUse() == clang::NOUR_None)
+        callback_(dyn_cast<FunctionDecl>(expr->getMemberDecl()), expr);
+      EvalBase::VisitMemberExpr(expr);
+    }
+
+    void VisitCXXConstructExpr(const CXXConstructExpr* expr) {
+      callback_(expr->getConstructor(), expr);
+      const bool constructed_by_new = IsNewAllocatedObject(expr);
+      if (!constructed_by_new)
+        callback_(GetSiblingDestructorFor(expr), expr);
+      EvalBase::VisitCXXConstructExpr(expr);
+    }
+
+    void VisitCXXDefaultInitExpr(const clang::CXXDefaultInitExpr* expr) {
+      if (expr->getExpr())
+        EvalBase::Visit(expr->getExpr());
+    }
+
+    void VisitDeclStmt(const clang::DeclStmt* statement) {
+      for (const Decl* declaration : statement->decls()) {
+        const auto* variable = dyn_cast<clang::VarDecl>(declaration);
+        if (!variable || !variable->hasLocalStorage())
+          continue;
+        if (variable->getInit()) {
+          EvalBase::Visit(variable->getInit());
+        }
+        QualType type = context_.getBaseElementType(variable->getType());
+        const auto* record = dyn_cast_or_null<CXXRecordDecl>(
+            TypeToDeclAsWritten(type.getTypePtrOrNull()));
+        if (record)
+          callback_(record->getDestructor(), nullptr);
+      }
+      EvalBase::VisitDeclStmt(statement);
+    }
+
+    void VisitCXXNewExpr(const CXXNewExpr* expr) {
+      callback_(expr->getOperatorNew(), expr);
+      callback_(expr->getOperatorDelete(), expr);
+      EvalBase::VisitCXXNewExpr(expr);
+    }
+
+    void VisitCXXDeleteExpr(const CXXDeleteExpr* expr) {
+      callback_(expr->getOperatorDelete(), expr);
+      callback_(GetDestructorForDeleteExpr(expr), expr);
+      EvalBase::VisitCXXDeleteExpr(expr);
+    }
+
+   private:
+    bool IsNewAllocatedObject(const CXXConstructExpr* expression) {
+      std::function<bool(clang::DynTypedNode)> find_new =
+          [&](clang::DynTypedNode node) {
+            for (const clang::DynTypedNode& parent : context_.getParents(node)) {
+              if (parent.get<CXXNewExpr>())
+                return true;
+              if (parent.get<CXXConstructExpr>())
+                return false;
+              if (parent.get<Expr>() && find_new(parent))
+                return true;
+            }
+            return false;
+          };
+      return find_new(clang::DynTypedNode::create(*expression));
+    }
+
+    ASTContext& context_;
+    std::function<void(const FunctionDecl*, const Expr*)> callback_;
+  };
+
+  const FunctionDecl* LambdaCallOperatorForInvoker(
+      const CXXMethodDecl* invoker) {
+    if (!invoker || !invoker->getParent()->isLambda() ||
+        (!invoker->isLambdaStaticInvoker() &&
+         invoker->getName() != "__invoke")) {
+      return invoker;
+    }
+    CXXRecordDecl* lambda =
+        const_cast<CXXRecordDecl*>(invoker->getParent());
+    CXXMethodDecl* call_operator = lambda->getLambdaCallOperator();
+    for (CXXMethodDecl* method : lambda->methods()) {
+      if (method->getOverloadedOperator() != clang::OO_Call ||
+          method->getNumParams() != invoker->getNumParams() ||
+          !method->getBody()) {
+        continue;
+      }
+      bool same_parameters = true;
+      for (unsigned index = 0; index < method->getNumParams(); ++index) {
+        if (!compiler()->getASTContext().hasSameType(
+                method->getParamDecl(index)->getType(),
+                invoker->getParamDecl(index)->getType())) {
+          same_parameters = false;
+          break;
+        }
+      }
+      if (same_parameters)
+        return method;
+    }
+    const TemplateArgumentList* arguments =
+        invoker->getTemplateSpecializationArgs();
+    FunctionTemplateDecl* call_template =
+        call_operator ? call_operator->getDescribedFunctionTemplate() : nullptr;
+    if (arguments && call_template) {
+      void* insertion = nullptr;
+      if (FunctionDecl* specialization = call_template->findSpecialization(
+              arguments->asArray(), insertion)) {
+        return specialization;
+      }
+    }
+    return call_operator;
+  }
+
+  bool DefinitionAvailableAt(const FunctionDecl* dependency,
+                             SourceLocation use_loc) {
+    const DefinitionObligationKind kind =
+        ClassifyDefinitionObligation(dependency);
+    if (kind == DefinitionObligationKind::kNone)
+      return true;
+    const FunctionDecl* nested_definition =
+        DefinitionForObligation(dependency, kind);
+    if (!nested_definition || use_loc.isInvalid())
+      return false;
+    use_loc = compiler()->getSourceManager().getExpansionLoc(use_loc);
+    const FileEntry* use_file = GetFileEntry(use_loc);
+    const FileEntry* definition_file = GetFileEntry(nested_definition);
+    if (!use_file || !definition_file)
+      return false;
+    if (use_file == definition_file)
+      return true;
+    const bool allow_later =
+        kind == DefinitionObligationKind::kOrdinaryInline ||
+        CanUseLaterTemplateDefinition(dependency, kind);
+    vector<CandidateHeader> candidates =
+        GlobalIncludePicker().GetCandidateHeaderRefsForFilepathIncludedFrom(
+            GetFilePath(nested_definition), GetFilePath(use_loc));
+    const CandidateHeader physical{
+        ConvertToQuotedInclude(GetFilePath(definition_file)),
+        GetFilePath(definition_file)};
+    if (std::none_of(candidates.begin(), candidates.end(),
+                     [&](const CandidateHeader& candidate) {
+                       return candidate.spelling == physical.spelling &&
+                              candidate.path == physical.path;
+                     })) {
+      candidates.push_back(physical);
+    }
+    for (const CandidateHeader& candidate : candidates) {
+      if (preprocessor_info()
+              .DefinitionProviderCoverageAt(
+                  use_file, candidate.spelling, candidate.path,
+                  GetLocation(nested_definition), use_loc, allow_later)
+              .status ==
+          IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool DefinitionAvailableWithinBody(const FunctionDecl* dependency,
+                                     const Expr* expr,
+                                     const FunctionDecl* outer_definition) {
+    SourceLocation use_loc = expr ? expr->getExprLoc()
+                                  : GetLocation(outer_definition);
+    return DefinitionAvailableAt(dependency, use_loc);
+  }
+
+  void PropagateDefinitionBodyUses(const FunctionDecl* definition,
+                                   SourceLocation report_loc) {
+    if (!definition || !definition->getBody() || report_loc.isInvalid())
+      return;
+    const FileEntry* definition_file = GetFileEntry(definition);
+    const FileEntry* report_file = GetFileEntry(report_loc);
+    if (definition_file && report_file && definition_file == report_file)
+      return;
+    const auto propagation_key = std::make_pair(
+        definition->getCanonicalDecl(), report_loc.getRawEncoding());
+    if (!visitor_state_->definition_body_propagations.insert(
+            propagation_key).second) {
+      return;
+    }
+    auto require = [&](const FunctionDecl* dependency, const Expr* expr) {
+      if (const auto* method = dyn_cast_or_null<CXXMethodDecl>(dependency)) {
+        if (method->isLambdaStaticInvoker())
+          dependency = LambdaCallOperatorForInvoker(method);
+      }
+      if (!dependency || dependency->getCanonicalDecl() ==
+                             definition->getCanonicalDecl()) {
+        return;
+      }
+      HandleDefaultArgumentDefinitionUses(expr, report_loc, true);
+      if (IsGeneratedDefaultedSpecialMember(dependency)) {
+        HandleDefaultedSpecialMemberLifecycle(
+            const_cast<FunctionDecl*>(dependency), report_loc);
+        return;
+      }
+      const DefinitionObligationKind nested_kind =
+          ClassifyDefinitionObligation(dependency);
+      const FunctionDecl* nested_definition =
+          DefinitionForObligation(dependency, nested_kind);
+      if (DefinitionAvailableWithinBody(dependency, expr, definition)) {
+        PropagateDefinitionBodyUses(nested_definition, report_loc);
+        return;
+      }
+      if (nested_definition && !DefinitionAvailableAt(dependency, report_loc))
+        return;
+      FunctionDecl* mutable_dependency =
+          const_cast<FunctionDecl*>(dependency);
+      HandleConcreteDefinitionUse(mutable_dependency, expr, report_loc);
+    };
+    DefinitionBodyUseCollector collector(compiler()->getASTContext(), require);
+    if (const auto* constructor = dyn_cast<CXXConstructorDecl>(definition)) {
+      for (const clang::CXXCtorInitializer* initializer : constructor->inits()) {
+        if (initializer && initializer->getInit()) {
+          const Expr* init = initializer->getInit();
+          if (const auto* default_init =
+                  dyn_cast<clang::CXXDefaultInitExpr>(init)) {
+            init = default_init->getExpr();
+          }
+          if (init)
+            collector.Visit(init);
+        }
+      }
+    }
+    collector.Visit(definition->getBody());
+    if (const auto* destructor = dyn_cast<CXXDestructorDecl>(definition)) {
+      CXXRecordDecl* record = destructor->getParent()->getDefinition();
+      if (record) {
+        for (const CXXBaseSpecifier& base : record->bases()) {
+          if (const CXXRecordDecl* subobject =
+                  LifecycleSubobjectRecord(base.getType())) {
+            require(subobject->getDestructor(), nullptr);
+          }
+        }
+        if (!record->isUnion()) {
+          for (const clang::FieldDecl* field : record->fields()) {
+            if (const CXXRecordDecl* subobject =
+                    LifecycleSubobjectRecord(field->getType())) {
+              require(subobject->getDestructor(), nullptr);
+            }
+          }
+        }
+      }
+    }
+  }
+
   bool CanUseLaterTemplateDefinition(
       const FunctionDecl* callee, DefinitionObligationKind kind) const {
     return callee && kind == DefinitionObligationKind::kTemplateInstantiation &&
@@ -2732,6 +3005,8 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
                 "before linking.");
       return true;
     }
+
+    PropagateDefinitionBodyUses(definition, report_loc);
 
     const FileEntry* use_file = GetFileEntry(report_loc);
     const FileEntry* definition_file = GetFileEntry(definition);
@@ -2852,27 +3127,6 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     return SatisfyDefinitionObligation(callee, report_loc, kind);
   }
 
-  class GeneratedLifecycleCallCollector
-      : public RecursiveASTVisitor<GeneratedLifecycleCallCollector> {
-   public:
-    explicit GeneratedLifecycleCallCollector(
-        std::function<void(const FunctionDecl*, const Expr*)> callback)
-        : callback_(std::move(callback)) {}
-
-    bool VisitCallExpr(CallExpr* expr) {
-      callback_(expr->getDirectCallee(), expr);
-      return true;
-    }
-
-    bool VisitCXXConstructExpr(CXXConstructExpr* expr) {
-      callback_(expr->getConstructor(), expr);
-      return true;
-    }
-
-   private:
-    std::function<void(const FunctionDecl*, const Expr*)> callback_;
-  };
-
   const CXXRecordDecl* LifecycleSubobjectRecord(QualType type) {
     type = compiler()->getASTContext().getBaseElementType(type);
     return dyn_cast_or_null<CXXRecordDecl>(
@@ -2897,10 +3151,21 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
                              method->getCanonicalDecl()) {
         return;
       }
+      HandleDefaultArgumentDefinitionUses(expr, report_loc, true);
+      const DefinitionObligationKind nested_kind =
+          ClassifyDefinitionObligation(dependency);
+      const FunctionDecl* nested_definition =
+          DefinitionForObligation(dependency, nested_kind);
+      if (DefinitionAvailableWithinBody(dependency, expr, method)) {
+        PropagateDefinitionBodyUses(nested_definition, report_loc);
+        return;
+      }
+      if (nested_definition && !DefinitionAvailableAt(dependency, report_loc))
+        return;
       HandleConcreteDefinitionUse(const_cast<FunctionDecl*>(dependency), expr,
                                   report_loc);
     };
-    GeneratedLifecycleCallCollector collector(require);
+    DefinitionBodyUseCollector collector(compiler()->getASTContext(), require);
 
     // Clang materializes exact constructor initializers and copy/move
     // assignment bodies when those defaulted members are concretely used.
@@ -2908,12 +3173,19 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     // initializers, and selected copy-vs-move operations without guessing.
     if (auto* constructor = dyn_cast<CXXConstructorDecl>(method)) {
       for (clang::CXXCtorInitializer* initializer : constructor->inits()) {
-        if (initializer && initializer->getInit())
-          collector.TraverseStmt(initializer->getInit());
+        if (initializer && initializer->getInit()) {
+          const Expr* init = initializer->getInit();
+          if (const auto* default_init =
+                  dyn_cast<clang::CXXDefaultInitExpr>(init)) {
+            init = default_init->getExpr();
+          }
+          if (init)
+            collector.Visit(init);
+        }
       }
     }
     if (Stmt* body = method->getBody())
-      collector.TraverseStmt(body);
+      collector.Visit(body);
 
     // A generated destructor has no explicit call expressions in Clang's AST.
     // Resolve each direct base/member (peeling arrays) and recurse through its
@@ -2929,11 +3201,13 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
                     nullptr);
           }
         }
-        for (const clang::FieldDecl* field : record->fields()) {
-          if (const CXXRecordDecl* subobject =
-                  LifecycleSubobjectRecord(field->getType())) {
-            require(const_cast<CXXDestructorDecl*>(subobject->getDestructor()),
-                    nullptr);
+        if (!record->isUnion()) {
+          for (const clang::FieldDecl* field : record->fields()) {
+            if (const CXXRecordDecl* subobject =
+                    LifecycleSubobjectRecord(field->getType())) {
+              require(const_cast<CXXDestructorDecl*>(subobject->getDestructor()),
+                      nullptr);
+            }
           }
         }
       }
@@ -2979,14 +3253,19 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
   };
 
   void HandleDefaultArgumentDefinitionUses(const Expr* calling_expr,
-                                           SourceLocation report_loc) {
+                                           SourceLocation report_loc,
+                                           bool already_evaluated = false) {
     if (!calling_expr || report_loc.isInvalid() ||
-        !IsPotentiallyEvaluated(calling_expr)) {
+        (!already_evaluated && !IsPotentiallyEvaluated(calling_expr))) {
       return;
     }
+    const auto key = std::make_pair(calling_expr, report_loc.getRawEncoding());
+    if (!visitor_state_->default_argument_obligations.insert(key).second)
+      return;
     auto require = [&](const FunctionDecl* dependency, const Expr* expr) {
       HandleConcreteDefinitionUse(const_cast<FunctionDecl*>(dependency), expr,
                                   report_loc);
+      HandleDefaultArgumentDefinitionUses(expr, report_loc, true);
     };
     DefaultArgumentUseCollector collector(compiler()->getASTContext(),
                                           require);
@@ -3015,7 +3294,8 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     if (!IsPotentiallyEvaluatedOdrUse(callee, expr))
       return false;
     const SourceLocation report_loc =
-        static_cast<Derived*>(this)->DefinitionObligationReportLocation(expr);
+        static_cast<Derived*>(this)->DefinitionObligationReportLocation(
+            callee, expr);
     return HandleConcreteDefinitionUse(callee, expr, report_loc);
   }
 
@@ -3099,7 +3379,7 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
       odr_expr = current_ast_node()->template GetAs<Expr>();
     const SourceLocation report_loc =
         static_cast<Derived*>(this)->DefinitionObligationReportLocation(
-            odr_expr);
+            callee, odr_expr);
     HandleDefaultArgumentDefinitionUses(odr_expr, report_loc);
     HandleInlineDefinitionOdrUse(callee, odr_expr);
 
@@ -3714,7 +3994,8 @@ class InstantiatedTemplateVisitor
     return " in tpl";
   }
 
-  SourceLocation DefinitionObligationReportLocation(const Expr*) const {
+  SourceLocation DefinitionObligationReportLocation(
+      const FunctionDecl*, const Expr*) const {
     return caller_loc();
   }
 
@@ -4618,8 +4899,22 @@ class IwyuAstConsumer
     return "";
   }
 
-  SourceLocation DefinitionObligationReportLocation(const Expr* expr) const {
-    return expr ? expr->getExprLoc() : SourceLocation();
+  SourceLocation DefinitionObligationReportLocation(
+      const FunctionDecl* callee, const Expr* expr) {
+    if (!expr)
+      return SourceLocation();
+    SourceLocation location = expr->getExprLoc();
+    if (!location.isMacroID())
+      return location;
+    clang::SourceManager& source_manager = compiler()->getSourceManager();
+    SourceLocation expansion = source_manager.getExpansionLoc(location);
+    const DefinitionObligationKind kind = ClassifyDefinitionObligation(callee);
+    if (kind != DefinitionObligationKind::kNone &&
+        (!DefinitionForObligation(callee, kind) ||
+         DefinitionAvailableAt(callee, expansion))) {
+      return expansion;
+    }
+    return source_manager.getSpellingLoc(location);
   }
 
   bool IsConcreteTemplateTraversal() const { return false; }

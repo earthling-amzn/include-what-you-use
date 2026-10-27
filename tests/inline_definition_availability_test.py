@@ -136,6 +136,61 @@ def assert_analyzer_contracts():
 
     contexts, _ = analyze("contexts.cc")
     assert definition_diagnostics(contexts) == []
+
+    nested_available, _ = analyze("nested_available.cc", schema=2)
+    assert definition_diagnostics(nested_available) == []
+    nested_leaf = next(
+        operation for operation in semantic_keeps(nested_available)
+        if operation["spelling"] == '#include "nested_leaf.inline.hpp"')
+    assert_provider_keep(nested_leaf, '#include "nested_leaf.inline.hpp"', [
+        "nested_available.cc", "nested_leaf.inline.hpp"])
+    assert [symbol["qualified_name"]["value"]
+            for symbol in nested_leaf["symbols"]] == ["NestedLeaf"]
+    assert {use["location"]["line"]
+            for symbol in nested_leaf["symbols"]
+            for use in symbol["uses"]} == {6}
+
+    nested_missing, _ = analyze("nested_missing.cc", schema=2)
+    nested_failures = definition_diagnostics(nested_missing)
+    assert [(fact["code"], fact["location"]["value"]["line"])
+            for fact in nested_failures] == [("missing_inline_definition", 5)]
+    assert "NestedLeaf" in nested_failures[0]["message"]
+
+    nested_edges, _ = analyze("nested_edges_available.cc", schema=2)
+    assert definition_diagnostics(nested_edges) == []
+    edge_keep = next(
+        operation for operation in semantic_keeps(nested_edges)
+        if operation["spelling"] ==
+        '#include "nested_edges_leaf.inline.hpp"')
+    assert_provider_keep(edge_keep,
+                         '#include "nested_edges_leaf.inline.hpp"', [
+                             "nested_edges_available.cc",
+                             "nested_edges_leaf.inline.hpp"])
+    edge_names = {symbol["qualified_name"]["value"]
+                  for symbol in edge_keep["symbols"]}
+    assert {"NestedEdgeLeaf", "NestedEdgeItem::NestedEdgeItem",
+            "NestedEdgeItem::~NestedEdgeItem"} <= edge_names
+    assert {use["location"]["line"]
+            for symbol in edge_keep["symbols"]
+            for use in symbol["uses"]} <= {5, 6, 7, 8}
+
+    nested_edges_missing, _ = analyze("nested_edges_missing.cc", schema=2)
+    missing_edge_names = {fact["message"].split("'")[1]
+                          for fact in definition_diagnostics(
+                              nested_edges_missing)}
+    assert {"NestedEdgeLeaf", "NestedEdgeItem::NestedEdgeItem",
+            "NestedEdgeItem::~NestedEdgeItem"} <= missing_edge_names
+    assert {fact["location"]["value"]["line"]
+            for fact in definition_diagnostics(nested_edges_missing)} <= {
+                4, 5, 6, 7}
+
+    nested_controls, _ = analyze("nested_controls.cc", schema=2)
+    assert definition_diagnostics(nested_controls) == []
+    assert [(operation["subject_action"], operation["disposition"])
+            for operation in nested_controls["operations"]
+            if operation["spelling"] ==
+               '#include "nested_edges_leaf.inline.hpp"'] == [
+        ("remove", "apply")]
     pure_pointer, _ = analyze("pure_virtual_pointer.cc")
     assert definition_diagnostics(pure_pointer) == []
     pure_qualified, _ = analyze("pure_virtual_qualified.cc")
@@ -585,6 +640,11 @@ def assert_driver_contracts():
         ("ambiguity_class.cc", ["-DFEATURE=0", "-Xiwyu",
                                 "--mapping_file=ambiguity_class.imp"]),
         ("explicit_same_file.cc", []),
+        ("nested_available.cc", []),
+        ("nested_missing.cc", []),
+        ("nested_edges_available.cc", []),
+        ("nested_edges_missing.cc", []),
+        ("nested_controls.cc", []),
     ]
     records = analyze_with_driver(entries)
 
@@ -710,6 +770,38 @@ def assert_driver_contracts():
     assert semantic_keeps(source_records[23]) == []
     assert definition_diagnostics(source_records[23]) == []
 
+    nested_driver = source_records[24]
+    nested_keeps = [operation for operation in semantic_keeps(nested_driver)
+                    if operation["spelling"] ==
+                    '#include "nested_leaf.inline.hpp"']
+    assert len(nested_keeps) == 1
+    assert_provider_keep(nested_keeps[0], '#include "nested_leaf.inline.hpp"', [
+        nested_driver["file"]["path"],
+        nested_keeps[0]["provider"]["selected"]["value"]["path"],
+    ])
+    assert {use["location"]["line"]
+            for symbol in nested_keeps[0]["symbols"]
+            for use in symbol["uses"]} == {6}
+    assert [(fact["code"], fact["location"]["value"]["line"])
+            for fact in definition_diagnostics(source_records[25])] == [
+        ("missing_inline_definition", 5)]
+
+    edge_driver = source_records[26]
+    edge_keeps = [operation for operation in semantic_keeps(edge_driver)
+                  if operation["spelling"] ==
+                  '#include "nested_edges_leaf.inline.hpp"']
+    assert len(edge_keeps) == 1
+    assert {symbol["qualified_name"]["value"]
+            for symbol in edge_keeps[0]["symbols"]} >= {
+        "NestedEdgeLeaf", "NestedEdgeItem::NestedEdgeItem",
+        "NestedEdgeItem::~NestedEdgeItem"}
+    assert {fact["code"] for fact in
+            definition_diagnostics(source_records[27])} == {
+        "missing_inline_definition"}
+    assert not [operation for operation in semantic_keeps(source_records[28])
+                if operation["spelling"] ==
+                '#include "nested_edges_leaf.inline.hpp"']
+
     owner = next(record for record in records
                  if record["invocation"]["index"] == 5 and
                  record["file"]["path"].endswith("associated_owner.hpp"))
@@ -732,7 +824,8 @@ def assert_gcc_backstop(corpus=CORPUS):
                        "explicit_instantiations.cc",
                        "explicit_body_first.cc", "explicit_export.cc",
                        "explicit_mapped.cc", "explicit_declaration_only.cc",
-                       "explicit_same_file.cc"):
+                       "explicit_same_file.cc", "nested_available.cc",
+                       "nested_edges_available.cc", "nested_controls.cc"):
             executable = out / source.removesuffix(".cc")
             run([CXX, "-std=c++17", "-fno-inline", "-I", ".", source,
                  "-o", executable], cwd=corpus)
@@ -818,6 +911,10 @@ def assert_gcc_backstop(corpus=CORPUS):
                 "PureDestructorBase::~PureDestructorBase()"],
             "deep_parent.cc": ["MissingDeepParent()"],
             "instantiated_nondependent.cc": ["MissingInstantiated()"],
+            "nested_missing.cc": ["NestedLeaf()"],
+            "nested_edges_missing.cc": [
+                "NestedEdgeLeaf()", "NestedEdgeItem::NestedEdgeItem()",
+                "NestedEdgeItem::~NestedEdgeItem()"],
         }.items():
             object_file = out / f"{source}.o"
             run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "-c",
