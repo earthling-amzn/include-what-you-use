@@ -2747,7 +2747,8 @@ class IwyuBaseAstVisitor : public BaseAstVisitor<Derived> {
     void VisitDeclStmt(const clang::DeclStmt* statement) {
       for (const Decl* declaration : statement->decls()) {
         const auto* variable = dyn_cast<clang::VarDecl>(declaration);
-        if (!variable || !variable->hasLocalStorage())
+        if (!variable ||
+            (!variable->hasLocalStorage() && !variable->isStaticLocal()))
           continue;
         if (variable->getInit()) {
           EvalBase::Visit(variable->getInit());

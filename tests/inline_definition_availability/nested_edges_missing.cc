@@ -4,5 +4,5 @@ int main() {
   NestedEdgeBox box;
   return box.value + NestedDefaultOuter() + NestedLifecycleOuter() +
                  NestedLambdaPointerOuter() + NestedDmiOuter() +
-                 NestedGenericLambdaOuter() == 42 ? 0 : 1;
+                 NestedGenericLambdaOuter() + NestedStaticAggregateOuter() == 42 ? 0 : 1;
 }

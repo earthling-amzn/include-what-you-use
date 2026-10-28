@@ -29,3 +29,9 @@ struct NestedExplicitDmi {
 
 inline int NestedDmiOuter();
 inline int NestedGenericLambdaOuter();
+
+struct NestedStaticAggregate {
+  inline ~NestedStaticAggregate();
+};
+
+inline int NestedStaticAggregateOuter();

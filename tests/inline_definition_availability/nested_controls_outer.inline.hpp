@@ -11,3 +11,9 @@ inline int NestedControlOuter() {
   (void)dormant;
   return 0;
 }
+
+inline int NestedExternControl() {
+  extern NestedStaticAggregate external;
+  (void)sizeof(external);
+  return 0;
+}

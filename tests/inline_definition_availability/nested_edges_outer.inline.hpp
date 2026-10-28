@@ -36,3 +36,9 @@ inline int NestedGenericLambdaOuter() {
   };
   return function(0);
 }
+
+inline int NestedStaticAggregateOuter() {
+  static NestedStaticAggregate value{};
+  (void)value;
+  return 0;
+}

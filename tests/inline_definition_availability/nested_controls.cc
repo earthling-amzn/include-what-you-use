@@ -2,5 +2,5 @@
 #include "nested_edges_leaf.inline.hpp"
 
 int main() {
-  return NestedControlOuter();
+  return NestedControlOuter() + NestedExternControl();
 }

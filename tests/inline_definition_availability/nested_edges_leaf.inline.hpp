@@ -8,3 +8,5 @@ inline int NestedEdgeLeaf() {
 
 inline NestedEdgeItem::NestedEdgeItem() {}
 inline NestedEdgeItem::~NestedEdgeItem() {}
+
+inline NestedStaticAggregate::~NestedStaticAggregate() {}

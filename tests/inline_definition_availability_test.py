@@ -169,7 +169,8 @@ def assert_analyzer_contracts():
     edge_names = {symbol["qualified_name"]["value"]
                   for symbol in edge_keep["symbols"]}
     assert {"NestedEdgeLeaf", "NestedEdgeItem::NestedEdgeItem",
-            "NestedEdgeItem::~NestedEdgeItem"} <= edge_names
+            "NestedEdgeItem::~NestedEdgeItem",
+            "NestedStaticAggregate::~NestedStaticAggregate"} <= edge_names
     assert {use["location"]["line"]
             for symbol in edge_keep["symbols"]
             for use in symbol["uses"]} <= {5, 6, 7, 8}
@@ -179,7 +180,8 @@ def assert_analyzer_contracts():
                           for fact in definition_diagnostics(
                               nested_edges_missing)}
     assert {"NestedEdgeLeaf", "NestedEdgeItem::NestedEdgeItem",
-            "NestedEdgeItem::~NestedEdgeItem"} <= missing_edge_names
+            "NestedEdgeItem::~NestedEdgeItem",
+            "NestedStaticAggregate::~NestedStaticAggregate"} <= missing_edge_names
     assert {fact["location"]["value"]["line"]
             for fact in definition_diagnostics(nested_edges_missing)} <= {
                 4, 5, 6, 7}
@@ -794,7 +796,8 @@ def assert_driver_contracts():
     assert {symbol["qualified_name"]["value"]
             for symbol in edge_keeps[0]["symbols"]} >= {
         "NestedEdgeLeaf", "NestedEdgeItem::NestedEdgeItem",
-        "NestedEdgeItem::~NestedEdgeItem"}
+        "NestedEdgeItem::~NestedEdgeItem",
+        "NestedStaticAggregate::~NestedStaticAggregate"}
     assert {fact["code"] for fact in
             definition_diagnostics(source_records[27])} == {
         "missing_inline_definition"}
@@ -914,7 +917,8 @@ def assert_gcc_backstop(corpus=CORPUS):
             "nested_missing.cc": ["NestedLeaf()"],
             "nested_edges_missing.cc": [
                 "NestedEdgeLeaf()", "NestedEdgeItem::NestedEdgeItem()",
-                "NestedEdgeItem::~NestedEdgeItem()"],
+                "NestedEdgeItem::~NestedEdgeItem()",
+                "NestedStaticAggregate::~NestedStaticAggregate()"],
         }.items():
             object_file = out / f"{source}.o"
             run([CXX, "-std=c++17", "-fno-inline", "-I", ".", "-c",
