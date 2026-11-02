@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Opaque contracts for native schema-v2 JSON Lines output."""
 
+import copy
 import hashlib
 import json
 import os
@@ -15,10 +16,13 @@ except ImportError:
     print("SKIP: python jsonschema package is unavailable")
     sys.exit(77)
 
-from validate_output_schema import semantic_errors
+from validate_output_schema import allow_remove_errors, semantic_errors
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+import iwyu_tool
+
 SCHEMA = json.loads((ROOT / "docs/output-v2.schema.json").read_text())
 VALIDATOR = jsonschema.Draft202012Validator(SCHEMA)
 IWYU = Path(sys.argv[1]).resolve()
@@ -1728,6 +1732,52 @@ rules:
     assert not any(diagnostic["code"] == "project_policy_allow_remove"
                    for diagnostic in allow_remove_record["diagnostics"])
 
+    def mutate_allow_remove(record, mutation):
+        operation = next(op for op in record["operations"]
+                         if op["reason_code"] == "project_policy_allow_remove")
+        if mutation == "empty-symbols":
+            operation["symbols"] = []
+        elif mutation == "full-use":
+            operation["symbols"][0]["uses"][0]["requirement"] = "full"
+        elif mutation == "provider-applicable":
+            operation["provider"]["selected"] = {
+                "status": "unavailable", "value": None}
+        elif mutation == "condition-mismatch":
+            operation["symbols"][0]["uses"][0]["condition"] = {
+                "status": "not_applicable", "value": None}
+        elif mutation == "missing-desired-symbol":
+            forward = next(item for item in record["desired_state"]["items"]
+                           if item["item_kind"] == "forward_declaration")
+            forward["symbols"] = []
+        elif mutation == "include-restored":
+            record["desired_state"]["items"].insert(0, {
+                "item_kind": "include",
+                "spelling": operation["spelling"],
+                "symbols": [],
+            })
+        elif mutation == "missing-policy":
+            operation["policy"] = {"status": "unavailable", "value": None}
+        else:
+            raise AssertionError(mutation)
+
+    allow_remove_source = Path(
+        "tests/native_json/policy_allow_remove_consumer.hpp").read_bytes()
+    iwyu_tool._validate_declaration_facts(
+        copy.deepcopy(allow_remove_record), allow_remove_source)
+    for mutation in (
+            "empty-symbols", "full-use", "provider-applicable",
+            "condition-mismatch", "missing-desired-symbol",
+            "include-restored", "missing-policy"):
+        forged = copy.deepcopy(allow_remove_record)
+        mutate_allow_remove(forged, mutation)
+        assert semantic_errors(forged), mutation
+        try:
+            iwyu_tool._validate_declaration_facts(forged, allow_remove_source)
+        except iwyu_tool.ProtocolError:
+            pass
+        else:
+            raise AssertionError("driver accepted forged allow_remove " + mutation)
+
     generic_allow_remove_policy = """schema_version: 3
 rules:
   - id: allow-exact-forward-replacement
@@ -1779,6 +1829,34 @@ rules:
             ]
     assert any("policy_allow_remove_provider.inline.hpp" in item["spelling"]
                for item in duplicate_record["desired_state"]["items"])
+
+    for mutation in ("unavailable-range", "same-range-other-spelling"):
+        forged_duplicate = copy.deepcopy(duplicate_record)
+        forged_allow = next(
+            operation for operation in forged_duplicate["operations"]
+            if operation["reason_code"] == "project_policy_allow_remove")
+        retained = next(
+            operation for operation in forged_duplicate["operations"]
+            if operation["reason_code"] == "project_policy_deny_remove")
+        if mutation == "unavailable-range":
+            retained["source_range"] = {"status": "unavailable", "value": None}
+        else:
+            retained["source_range"] = copy.deepcopy(
+                forged_allow["source_range"])
+            retained["spelling"] = retained["spelling"].replace(
+                "#include", "# include")
+        assert allow_remove_errors(
+            forged_allow, forged_duplicate["desired_state"],
+            forged_duplicate["operations"]), mutation
+        try:
+            iwyu_tool._validate_allow_remove_operation(
+                forged_allow, forged_duplicate["desired_state"],
+                forged_duplicate["operations"])
+        except iwyu_tool.ProtocolError:
+            pass
+        else:
+            raise AssertionError(
+                "driver accepted invalid retained occurrence " + mutation)
 
     full_use_result, _ = run_with_temporary_policy(
         "tests/native_json/policy_allow_remove_full.hpp", allow_remove_policy)

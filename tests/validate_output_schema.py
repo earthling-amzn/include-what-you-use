@@ -426,6 +426,67 @@ def record_identity(record):
             invocation["translation_unit"], record["file"]["path"])
 
 
+def allow_remove_errors(op, desired, operations):
+    if op["reason_code"] != "project_policy_allow_remove":
+        return []
+    errors = []
+    prefix = f"{op['id']}: project_policy_allow_remove"
+    if (op["subject_action"] != "remove" or op["item_kind"] != "include" or
+            op["disposition"] != "apply" or
+            op["source_range"]["status"] != "known"):
+        errors.append(prefix + " is not an applied physical include removal")
+    policy = op["policy"]
+    if (policy["status"] != "known" or
+            policy["value"]["decision"] != "allow"):
+        errors.append(prefix + " lacks known allow provenance")
+    if any(value["status"] != "not_applicable"
+           for value in op["provider"].values()):
+        errors.append(prefix + " has applicable provider evidence")
+    if logical_include_token(op["spelling"])[0] != "literal":
+        errors.append(prefix + " does not name a literal include")
+    replacement_names = set()
+    if not op["symbols"]:
+        errors.append(prefix + " lacks replacement symbols")
+    for symbol in op["symbols"]:
+        if (symbol["qualified_name"]["status"] != "known" or
+                symbol["declaration"]["status"] != "known" or
+                symbol["declaration_kind"]["status"] != "known" or
+                not symbol["uses"] or
+                any(use["requirement"] != "forward_declaration"
+                    for use in symbol["uses"]) or
+                any(use["condition"] != op["edit_condition"]
+                    for use in symbol["uses"])):
+            errors.append(prefix + " has invalid forward replacement symbol")
+        if symbol["qualified_name"]["status"] == "known":
+            replacement_names.add(symbol["qualified_name"]["value"])
+    if desired["status"] != "known" or not desired["complete"]:
+        errors.append(prefix + " lacks complete desired state")
+        return errors
+    desired_include_tokens = {
+        logical_include_token(item["spelling"])
+        for item in desired["items"] if item["item_kind"] == "include"}
+    include_token = logical_include_token(op["spelling"])
+    if include_token in desired_include_tokens:
+        retained_occurrence = any(
+            other is not op and other["item_kind"] == "include" and
+            logical_include_token(other["spelling"]) == include_token and
+            other["source_range"]["status"] == "known" and
+            canonical(other["source_range"]) != canonical(op["source_range"]) and
+            ((other["subject_action"] == "remove" and
+              other["disposition"] != "apply") or
+             other["subject_action"] == "keep")
+            for other in operations)
+        if not retained_occurrence:
+            errors.append(prefix + " include remains in desired state")
+    desired_forward_names = {
+        name for item in desired["items"]
+        if item["item_kind"] == "forward_declaration"
+        for name in item["symbols"]}
+    if not replacement_names <= desired_forward_names:
+        errors.append(prefix + " replacement is absent from desired forwards")
+    return errors
+
+
 def semantic_errors(record):
     file_path = record["file"]["path"]
     status = record["status"]
@@ -624,6 +685,7 @@ def semantic_errors(record):
             decision = policy["value"]["decision"]
             if policy_disposition[decision] != disposition:
                 errors.append(f"{op['id']}: policy decision contradicts disposition")
+        errors.extend(allow_remove_errors(op, desired, operations))
 
         multi = op["multi_config"]
         if (analyzed["status"] == "known" and len(analyzed["value"]) > 1 and

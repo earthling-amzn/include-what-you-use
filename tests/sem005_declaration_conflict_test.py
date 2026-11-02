@@ -482,6 +482,55 @@ def main():
                    operation["disposition"] == "apply"
                    for operation in single_record["operations"])
 
+        # A schema-3 replacement allow survives one compatible named
+        # configuration, but an incompatible second configuration reports both
+        # the forward additions and the exact symbol-linked provider removal.
+        allow_remove_policy = temporary / "allow-remove-policy.yaml"
+        allow_remove_policy.write_text("""schema_version: 3
+rules:
+  - id: allow-provider-to-forward
+    action: allow_remove
+    match:
+      includee: { glob: tests/sem005/variant_provider.hpp }
+      replacement: forward_declaration
+""")
+        policy_product_db = temporary / "policy-product"
+        policy_debug_db = temporary / "policy-debug"
+        policy_args = [
+            "-Xiwyu", "--project_policy=" + str(allow_remove_policy)]
+        write_database(
+            policy_product_db,
+            include_args + policy_args + ["-c", str(SOURCE)])
+        write_database(
+            policy_debug_db,
+            include_args + ["-DSEM005_DEBUG_CONFIGURATION=1"] +
+            policy_args + ["-c", str(SOURCE)])
+        policy_single = parse_records(run([
+            sys.executable, str(DRIVER), "-o", "json", "--output-schema", "2",
+            "--database", "debug=" + str(policy_debug_db)],
+            env=analyzer_env))[0]
+        native_allow = next(
+            operation for operation in policy_single["operations"]
+            if operation["reason_code"] == "project_policy_allow_remove")
+        assert native_allow["disposition"] == "apply"
+        assert native_allow["policy"]["value"]["decision"] == "allow"
+        policy_merged = parse_records(run(
+            driver_command(policy_product_db, policy_debug_db),
+            env=analyzer_env))
+        policy_debug = next(record for record in policy_merged
+                            if configuration(record) == "debug")
+        conflict_removal = next(
+            operation for operation in policy_debug["operations"]
+            if operation["subject_action"] == "remove" and
+            "variant_provider.hpp" in operation["spelling"])
+        assert conflict_removal["reason_code"] == "declaration_kind_conflict"
+        assert conflict_removal["disposition"] == "report"
+        assert conflict_removal["policy"] == {
+            "status": "unavailable", "value": None}
+        assert any(item["item_kind"] == "include" and
+                   "variant_provider.hpp" in item["spelling"]
+                   for item in policy_debug["desired_state"]["items"])
+
         # Two source spellings that are symlinks to one physical file must
         # aggregate by Clang FileEntry identity and expose the same conflicts.
         product_alias = temporary / "product-alias.cc"

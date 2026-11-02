@@ -103,6 +103,16 @@ union/record, scoped/unscoped enum, enum/record, template/non-template, and all
 alias conflicts. Each reported conflict carries the record's `source_digest`;
 entries and their `(configuration, kind)` declarations are sorted and exact.
 
+Policy schema 3 can authorize an include removal with reason
+`project_policy_allow_remove` without adding a wire field. The derived contract
+requires an applied physical literal include removal with known `allow`
+provenance, non-applicable provider fields, and non-empty typed symbols whose
+uses are all `forward_declaration` requirements under the exact edit condition.
+The complete desired state omits that physical include unless another exact
+occurrence is retained, and its desired forward-declaration items name every
+replacement symbol. Direct validation and the named driver reject missing,
+full-use, provider-bearing, condition-mismatched, or unlinked evidence.
+
 When a configuration proposes a forward declaration for an incompatible entity,
 the driver changes only that addition and the matching provider removal to
 `report`. Schema-v2 producers attach the same Clang entity identity to both

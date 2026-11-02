@@ -2394,6 +2394,73 @@ def _logical_item_key(item, forward_desired=None):
                 _json_dumps_canonical(item['source_range']),)
     return (kind, tokens)
 
+def _validate_allow_remove_operation(operation, desired, operations):
+    if operation['reason_code'] != 'project_policy_allow_remove':
+        return
+    if (operation['subject_action'] != 'remove' or
+            operation['item_kind'] != 'include' or
+            operation['disposition'] != 'apply' or
+            operation['source_range']['status'] != 'known'):
+        raise ProtocolError(
+            'project_policy_allow_remove is not an applied physical include removal')
+    policy = operation['policy']
+    if (policy['status'] != 'known' or
+            policy['value']['decision'] != 'allow'):
+        raise ProtocolError(
+            'project_policy_allow_remove lacks known allow provenance')
+    if any(value['status'] != 'not_applicable'
+           for value in operation['provider'].values()):
+        raise ProtocolError(
+            'project_policy_allow_remove has applicable provider evidence')
+    if _logical_include_token(operation['spelling'])[0] != 'literal':
+        raise ProtocolError(
+            'project_policy_allow_remove does not name a literal include')
+    symbols = operation['symbols']
+    if not symbols:
+        raise ProtocolError(
+            'project_policy_allow_remove lacks replacement symbols')
+    replacement_names = set()
+    for symbol in symbols:
+        if (symbol['qualified_name']['status'] != 'known' or
+                symbol['declaration']['status'] != 'known' or
+                symbol['declaration_kind']['status'] != 'known' or
+                not symbol['uses'] or
+                any(use['requirement'] != 'forward_declaration'
+                    for use in symbol['uses']) or
+                any(use['condition'] != operation['edit_condition']
+                    for use in symbol['uses'])):
+            raise ProtocolError(
+                'project_policy_allow_remove has invalid forward replacement symbol')
+        replacement_names.add(symbol['qualified_name']['value'])
+    if (desired['status'] != 'known' or not desired['complete']):
+        raise ProtocolError(
+            'project_policy_allow_remove lacks complete desired state')
+    desired_include_tokens = {
+        _logical_include_token(item['spelling'])
+        for item in desired['items'] if item['item_kind'] == 'include'}
+    include_token = _logical_include_token(operation['spelling'])
+    if include_token in desired_include_tokens:
+        retained_occurrence = any(
+            other is not operation and other['item_kind'] == 'include' and
+            _logical_include_token(other['spelling']) == include_token and
+            other['source_range']['status'] == 'known' and
+            _json_dumps_canonical(other['source_range']) !=
+                _json_dumps_canonical(operation['source_range']) and
+            ((other['subject_action'] == 'remove' and
+              other['disposition'] != 'apply') or
+             other['subject_action'] == 'keep')
+            for other in operations)
+        if not retained_occurrence:
+            raise ProtocolError(
+                'project_policy_allow_remove include remains in desired state')
+    desired_forward_names = {
+        name for item in desired['items']
+        if item['item_kind'] == 'forward_declaration'
+        for name in item['symbols']}
+    if not replacement_names <= desired_forward_names:
+        raise ProtocolError(
+            'project_policy_allow_remove replacement is absent from desired forwards')
+
 def _validate_declaration_facts(record, source_bytes, native_conflicts=True,
                                 schema_validated=False):
     if not schema_validated:
@@ -2679,6 +2746,7 @@ def _validate_declaration_facts(record, source_bytes, native_conflicts=True,
                 policy_disposition[policy['value']['decision']] != disposition):
             raise ProtocolError('%s policy contradicts disposition' %
                                 operation['id'])
+        _validate_allow_remove_operation(operation, desired, operations)
         multi = operation['multi_config']
         if (analyzed['status'] == 'known' and
                 len(analyzed['value']) > 1 and multi['status'] != 'known'):
