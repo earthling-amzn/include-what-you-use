@@ -3,7 +3,22 @@
 IWYU accepts one project policy with `-Xiwyu --project_policy=<path>`. The file
 uses the YAML 1.2/JSON data model and a closed versioned grammar. Schema version
 1 remains unchanged. Schema version 2 adds `allow_add` and the
-`edit_lexical_scope` match fact:
+`edit_lexical_scope` match fact. Schema version 3 adds `allow_remove` and the
+`replacement` match fact:
+
+```yaml
+schema_version: 3
+rules:
+  - id: stable-rule-id
+    action: allow_remove
+    match:
+      includer: { glob: "src/*.hpp" }
+      includee: { regex: ".*[.]inline[.]hpp" }
+      file_kind: header
+      replacement: forward_declaration
+```
+
+The schema-2 form remains:
 
 ```yaml
 schema_version: 2
@@ -34,8 +49,10 @@ Actions are a closed enum. Schema version 1 accepts:
 - `prefer_provider`
 - `report_only`
 
-Schema version 2 accepts all version-1 actions plus `allow_add`. Version 1
-rejects `allow_add` and `edit_lexical_scope` as unknown grammar entries.
+Schema version 2 accepts all version-1 actions plus `allow_add`. Schema version 3
+accepts all version-2 actions plus `allow_remove`. Versions 1 and 2 reject
+`allow_remove` and `replacement`; version 1 continues to reject `allow_add` and
+`edit_lexical_scope` as unknown grammar entries.
 
 The `includer` and `includee` matchers each contain exactly one `glob` or
 `regex`. Matching is case-sensitive against the whole slash-normalized path or
@@ -65,13 +82,21 @@ Missing, repeated, disagreeing, inactive, or unknown census facts produce
 authorization fact only; it neither changes the schema-v2 census nor bypasses
 application safety checks.
 
+Schema version 3's `replacement` value is exactly `forward_declaration`. Its
+runtime fact is typed as `known`, `not_applicable`, or `unknown`. A known fact
+means native semantic analysis has linked the exact physical include occurrence
+to one or more typed desired forward declarations. A definite absence does not
+match and allows a later broad removal rule to run. Ambiguous occurrence,
+declaration, condition, or desired-state evidence is unknown and stops ordered
+lookup without claiming policy provenance.
+
 A rule matches only when every supplied dimension matches. Rules retain file
 order. The addition family is `{allow_add, deny_add}` and the removal family is
-`{deny_remove, keep}`. Lookup scans once in file order while ignoring actions
+`{allow_remove, deny_remove, keep}`. Lookup scans once in file order while ignoring actions
 outside the requested family. A known condition or scope mismatch continues the
 scan. The first definite match supplies its actual action and provenance. If
-every other dimension matches a constrained rule but the required condition or
-scope fact is `unknown`, lookup returns `indeterminate` at that rule and does
+every other dimension matches a constrained rule but a required condition,
+scope, or replacement fact is `unknown`, lookup returns `indeterminate` at that rule and does
 not consider a later rule. Diagnostics identify the indeterminate fact. A rule
 without the corresponding constraint does not need that fact unless an earlier
 constrained rule already made lookup indeterminate. Thus deny-before-allow wins,
@@ -92,8 +117,11 @@ silently ignores a safety rule. POLICY-002 enables `deny_add`; POLICY-007 enable
 `deny_remove` and `keep`. Schema-v2 `allow_add` is enabled only for native JSON
 output schema 2. Every `allow_add` rule must contain an exact non-empty
 `active_condition` and exactly `edit_lexical_scope: file`; broad, unconditional,
-or non-file allows are rejected before analysis. Text output and JSON schema 1
-reject a policy containing `allow_add` before analysis. A configuration match
+or non-file allows are rejected before analysis. Schema-v3 `allow_remove` is also
+enabled only for native JSON output schema 2, and every rule must contain exactly
+`replacement: forward_declaration`; unrestricted removal allows are rejected.
+Text output and JSON schema 1 reject a policy containing either allow action
+before analysis. A configuration match
 still requires the exact invocation configuration supplied by
 `-Xiwyu --configuration=<name>`.
 
@@ -164,7 +192,7 @@ line, including whitespace, a macro include operand, or a trailing comment.
 `file_kind: header` excludes dotted inline headers, which have kind
 `inline_header`.
 
-Only bounded schema-v2 `allow_add`, `deny_add`, `deny_remove`, and `keep` are
-currently enabled. Other declared actions fail capability validation rather
+Only bounded schema-v2 `allow_add`, schema-v3 replacement-backed
+`allow_remove`, `deny_add`, `deny_remove`, and `keep` are currently enabled. Other declared actions fail capability validation rather
 than being ignored. Existing source pragmas and project-side application
 guardrails remain in force.

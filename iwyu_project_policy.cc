@@ -51,6 +51,7 @@ struct RawMatch {
   std::optional<string> file_kind;
   std::optional<string> active_condition;
   std::optional<string> edit_lexical_scope;
+  std::optional<string> replacement;
   std::optional<string> symbol;
   std::optional<string> configuration;
 };
@@ -234,9 +235,12 @@ bool ParseMatch(Node* node, int schema_version, const string& path,
       else
         result->includee = std::move(pattern);
     } else if (key == "file_kind" || key == "active_condition" ||
-               key == "edit_lexical_scope" || key == "symbol" ||
-               key == "configuration") {
-      if (key == "edit_lexical_scope" && schema_version != 2) {
+               key == "edit_lexical_scope" || key == "replacement" ||
+               key == "symbol" || key == "configuration") {
+      if (key == "edit_lexical_scope" && schema_version < 2) {
+        return Fail(path, context, "unknown match key '" + key + "'", error);
+      }
+      if (key == "replacement" && schema_version < 3) {
         return Fail(path, context, "unknown match key '" + key + "'", error);
       }
       string scalar;
@@ -248,6 +252,8 @@ bool ParseMatch(Node* node, int schema_version, const string& path,
         result->active_condition = std::move(scalar);
       else if (key == "edit_lexical_scope")
         result->edit_lexical_scope = std::move(scalar);
+      else if (key == "replacement")
+        result->replacement = std::move(scalar);
       else if (key == "symbol")
         result->symbol = std::move(scalar);
       else
@@ -334,7 +340,7 @@ bool ParsePolicy(Node* root, const string& path, RawPolicy* result,
         RawRule rule;
         // Parse the union grammar eagerly; schema-specific closure is checked
         // below after the streaming YAML mapping has been consumed.
-        if (!ParseRule(&rule_node, ++index, 2, path, &rule, error))
+        if (!ParseRule(&rule_node, ++index, 3, path, &rule, error))
           return false;
         result->rules.push_back(std::move(rule));
       }
@@ -348,17 +354,21 @@ bool ParsePolicy(Node* root, const string& path, RawPolicy* result,
                   string(required) + "'", error);
     }
   }
-  if (schema_version != "1" && schema_version != "2") {
+  if (schema_version != "1" && schema_version != "2" &&
+      schema_version != "3") {
     return Fail(path, "", "unsupported schema_version '" + schema_version +
                 "'", error);
   }
-  result->schema_version = schema_version == "1" ? 1 : 2;
-  if (result->schema_version == 1) {
-    for (size_t index = 0; index < result->rules.size(); ++index) {
-      if (result->rules[index].match.edit_lexical_scope) {
-        return Fail(path, "rule " + std::to_string(index + 1),
-                    "unknown match key 'edit_lexical_scope'", error);
-      }
+  result->schema_version = std::stoi(schema_version);
+  for (size_t index = 0; index < result->rules.size(); ++index) {
+    const RawMatch& match = result->rules[index].match;
+    if (result->schema_version == 1 && match.edit_lexical_scope) {
+      return Fail(path, "rule " + std::to_string(index + 1),
+                  "unknown match key 'edit_lexical_scope'", error);
+    }
+    if (result->schema_version < 3 && match.replacement) {
+      return Fail(path, "rule " + std::to_string(index + 1),
+                  "unknown match key 'replacement'", error);
     }
   }
   return true;
@@ -383,6 +393,7 @@ bool ValidRuleId(const string& id) {
 bool ParseAction(const string& value, ProjectPolicyAction* action) {
   static const std::map<string, ProjectPolicyAction> actions = {
       {"allow_add", ProjectPolicyAction::AllowAdd},
+      {"allow_remove", ProjectPolicyAction::AllowRemove},
       {"deny_add", ProjectPolicyAction::DenyAdd},
       {"deny_remove", ProjectPolicyAction::DenyRemove},
       {"keep", ProjectPolicyAction::Keep},
@@ -401,6 +412,7 @@ bool ParseAction(const string& value, ProjectPolicyAction* action) {
 string ActionName(ProjectPolicyAction action) {
   switch (action) {
     case ProjectPolicyAction::AllowAdd: return "allow_add";
+    case ProjectPolicyAction::AllowRemove: return "allow_remove";
     case ProjectPolicyAction::DenyAdd: return "deny_add";
     case ProjectPolicyAction::DenyRemove: return "deny_remove";
     case ProjectPolicyAction::Keep: return "keep";
@@ -417,7 +429,8 @@ bool ActionInFamily(ProjectPolicyAction action,
   if (family == ProjectPolicyActionFamily::Addition)
     return action == ProjectPolicyAction::AllowAdd ||
            action == ProjectPolicyAction::DenyAdd;
-  return action == ProjectPolicyAction::DenyRemove ||
+  return action == ProjectPolicyAction::AllowRemove ||
+         action == ProjectPolicyAction::DenyRemove ||
          action == ProjectPolicyAction::Keep;
 }
 
@@ -429,6 +442,10 @@ bool ValidFileKind(const string& kind) {
 
 bool ValidEditLexicalScope(const string& scope) {
   return scope == "file" || scope == "non_file";
+}
+
+bool ValidReplacement(const string& replacement) {
+  return replacement == "forward_declaration";
 }
 
 bool HasTrailingUnescapedBackslash(const string& pattern) {
@@ -505,6 +522,7 @@ class ProjectPolicy::Rule {
   std::optional<string> file_kind;
   std::optional<string> active_condition;
   std::optional<string> edit_lexical_scope;
+  std::optional<string> replacement;
   std::optional<string> symbol;
   std::optional<string> configuration;
 
@@ -534,8 +552,9 @@ class ProjectPolicy::Rule {
             return ProjectPolicyMatchResult::Kind::NoMatch;
           break;
         case ProjectPolicyConditionAvailability::Unknown:
-          *indeterminate_fact = "active_condition";
-          return ProjectPolicyMatchResult::Kind::Indeterminate;
+          if (indeterminate_fact->empty())
+            *indeterminate_fact = "active_condition";
+          break;
       }
     }
 
@@ -548,11 +567,28 @@ class ProjectPolicy::Rule {
             return ProjectPolicyMatchResult::Kind::NoMatch;
           break;
         case ProjectPolicyLexicalScopeAvailability::Unknown:
-          *indeterminate_fact = "edit_lexical_scope";
-          return ProjectPolicyMatchResult::Kind::Indeterminate;
+          if (indeterminate_fact->empty())
+            *indeterminate_fact = "edit_lexical_scope";
+          break;
       }
     }
-    return ProjectPolicyMatchResult::Kind::Match;
+    if (replacement) {
+      switch (context.replacement.availability) {
+        case ProjectPolicyReplacementAvailability::NotApplicable:
+          return ProjectPolicyMatchResult::Kind::NoMatch;
+        case ProjectPolicyReplacementAvailability::Known:
+          if (*replacement != context.replacement.replacement)
+            return ProjectPolicyMatchResult::Kind::NoMatch;
+          break;
+        case ProjectPolicyReplacementAvailability::Unknown:
+          if (indeterminate_fact->empty())
+            *indeterminate_fact = "replacement";
+          break;
+      }
+    }
+    return indeterminate_fact->empty()
+               ? ProjectPolicyMatchResult::Kind::Match
+               : ProjectPolicyMatchResult::Kind::Indeterminate;
   }
 };
 
@@ -628,8 +664,10 @@ std::unique_ptr<ProjectPolicy> ProjectPolicy::Load(const string& path,
     auto rule = std::make_unique<Rule>();
     rule->id = std::move(raw_rule.id);
     if (!ParseAction(raw_rule.action, &rule->action) ||
-        (raw.schema_version == 1 &&
-         rule->action == ProjectPolicyAction::AllowAdd)) {
+        (raw.schema_version < 2 &&
+         rule->action == ProjectPolicyAction::AllowAdd) ||
+        (raw.schema_version < 3 &&
+         rule->action == ProjectPolicyAction::AllowRemove)) {
       Fail(canonical_path, context, "unknown action '" + raw_rule.action + "'",
            error);
       return nullptr;
@@ -638,6 +676,12 @@ std::unique_ptr<ProjectPolicy> ProjectPolicy::Load(const string& path,
         !ValidFileKind(*raw_rule.match.file_kind)) {
       Fail(canonical_path, context,
            "unknown file_kind '" + *raw_rule.match.file_kind + "'", error);
+      return nullptr;
+    }
+    if (raw_rule.match.replacement &&
+        !ValidReplacement(*raw_rule.match.replacement)) {
+      Fail(canonical_path, context,
+           "unknown replacement '" + *raw_rule.match.replacement + "'", error);
       return nullptr;
     }
     if (raw_rule.match.edit_lexical_scope &&
@@ -666,6 +710,7 @@ std::unique_ptr<ProjectPolicy> ProjectPolicy::Load(const string& path,
     rule->active_condition = std::move(raw_rule.match.active_condition);
     rule->edit_lexical_scope =
         std::move(raw_rule.match.edit_lexical_scope);
+    rule->replacement = std::move(raw_rule.match.replacement);
     rule->symbol = std::move(raw_rule.match.symbol);
     rule->configuration = std::move(raw_rule.match.configuration);
     result->rules_.push_back(std::move(rule));
@@ -681,6 +726,7 @@ bool ProjectPolicy::ValidateRuntimeCapabilities(
     const string context = "rule " + std::to_string(index + 1) +
                            " ('" + rule.id + "')";
     if (rule.action != ProjectPolicyAction::AllowAdd &&
+        rule.action != ProjectPolicyAction::AllowRemove &&
         rule.action != ProjectPolicyAction::DenyAdd &&
         rule.action != ProjectPolicyAction::DenyRemove &&
         rule.action != ProjectPolicyAction::Keep) {
@@ -698,6 +744,18 @@ bool ProjectPolicy::ValidateRuntimeCapabilities(
       if (!has_structured_schema_v2) {
         return Fail(path_, context,
                     "allow_add requires native structured output schema 2",
+                    error);
+      }
+    }
+    if (rule.action == ProjectPolicyAction::AllowRemove) {
+      if (!rule.replacement || *rule.replacement != "forward_declaration") {
+        return Fail(path_, context,
+                    "allow_remove requires replacement: forward_declaration",
+                    error);
+      }
+      if (!has_structured_schema_v2) {
+        return Fail(path_, context,
+                    "allow_remove requires native structured output schema 2",
                     error);
       }
     }

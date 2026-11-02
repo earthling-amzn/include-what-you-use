@@ -21,6 +21,7 @@ using std::vector;
 
 enum class ProjectPolicyAction {
   AllowAdd,
+  AllowRemove,
   DenyAdd,
   DenyRemove,
   Keep,
@@ -67,6 +68,19 @@ struct ProjectPolicyEditLexicalScope {
   string scope;
 };
 
+enum class ProjectPolicyReplacementAvailability {
+  NotApplicable,
+  Known,
+  Unknown,
+};
+
+// Replacement is populated only when availability is Known.
+struct ProjectPolicyReplacement {
+  ProjectPolicyReplacementAvailability availability =
+      ProjectPolicyReplacementAvailability::Unknown;
+  string replacement;
+};
+
 // Decision is populated only for Match. The indeterminate fields identify the
 // rule where ordered lookup stopped, but do not represent a matched decision.
 struct ProjectPolicyMatchResult {
@@ -91,6 +105,7 @@ struct ProjectPolicyMatchContext {
   string file_kind;
   ProjectPolicyActiveCondition active_condition;
   ProjectPolicyEditLexicalScope edit_lexical_scope;
+  ProjectPolicyReplacement replacement;
   vector<string> symbols;
   string configuration;
 };

@@ -83,6 +83,19 @@ rules:
       {match}
 """
 
+def removal_operation(policy_text):
+    result = with_policy_for_source(
+        policy_text, "tests/native_json/policy007_source.cc",
+        "--output_schema=2")
+    assert result.returncode == 0, result.stderr
+    records = [json.loads(line) for line in result.stdout.splitlines()]
+    operations = [operation for record in records
+                  for operation in record["operations"]
+                  if operation["item_kind"] == "include" and
+                  "policy007_unused.hpp" in operation["spelling"]]
+    assert len(operations) == 1, operations
+    return operations[0]
+
 
 def main():
 
@@ -90,7 +103,7 @@ def main():
                                  capture_output=True)
     assert help_result.returncode == 0, help_result.stderr
     assert "project-policy-enabled-actions: " \
-           "allow_add,deny_add,deny_remove,keep" in help_result.stdout
+           "allow_add,allow_remove,deny_add,deny_remove,keep" in help_result.stdout
     # Empty YAML and JSON-compatible policies are valid no-ops.
     expect_ok("schema_version: 1\nrules: []\n")
 
@@ -98,6 +111,69 @@ def main():
     # remains closed and rejects both additions to its grammar.
     expect_ok("schema_version: 2\nrules: []\n")
     expect_ok(policy("edit_lexical_scope: non_file", schema_version=2))
+
+    # Version 3 adds only replacement-backed allow_remove. Older schemas remain
+    # closed, and unrestricted removal authorization is never enabled.
+    expect_ok("schema_version: 3\nrules: []\n")
+    replacement_allow = policy(
+        "replacement: forward_declaration",
+        action="allow_remove", schema_version=3)
+    expect_ok(replacement_allow, "--output_schema=2")
+    expect_error(policy(action="allow_remove", schema_version=2),
+                 "unknown action 'allow_remove'")
+    expect_error(policy("replacement: forward_declaration", schema_version=2),
+                 "unknown match key 'replacement'")
+    expect_error(policy("includer: { glob: '*.hpp' }",
+                        action="allow_remove", schema_version=3),
+                 "allow_remove requires replacement: forward_declaration")
+    expect_error(policy("replacement: include",
+                        action="allow_remove", schema_version=3),
+                 "unknown replacement 'include'")
+    expect_error(policy("replacement: true",
+                        action="allow_remove", schema_version=3),
+                 "'replacement' must be a string scalar")
+    expect_error(replacement_allow,
+                 "allow_remove requires native structured output schema 2")
+    allow_remove_text = with_policy(replacement_allow, json_output=False)
+    assert allow_remove_text.returncode != 0 and allow_remove_text.stdout == ""
+    assert "allow_remove requires native structured output schema 2" in \
+        allow_remove_text.stderr
+
+    # Until exact replacement proof is populated, an allow-first removal is
+    # indeterminate and suppresses. A definite earlier deny still wins.
+    allow_first = """schema_version: 3
+rules:
+  - id: replacement-first
+    action: allow_remove
+    match:
+      includee: { glob: tests/native_json/policy007_unused.hpp }
+      replacement: forward_declaration
+  - id: deny-fallback
+    action: deny_remove
+    match:
+      includee: { glob: tests/native_json/policy007_unused.hpp }
+"""
+    unknown_removal = removal_operation(allow_first)
+    assert unknown_removal["disposition"] == "suppress"
+    assert unknown_removal["reason_code"] == "project_policy_replacement_unknown"
+    assert unknown_removal["policy"] == {"status": "unavailable", "value": None}
+    deny_first = """schema_version: 3
+rules:
+  - id: deny-first
+    action: deny_remove
+    match:
+      includee: { glob: tests/native_json/policy007_unused.hpp }
+  - id: replacement-later
+    action: allow_remove
+    match:
+      includee: { glob: tests/native_json/policy007_unused.hpp }
+      replacement: forward_declaration
+"""
+    denied_removal = removal_operation(deny_first)
+    assert denied_removal["disposition"] == "suppress"
+    assert denied_removal["reason_code"] == "project_policy_deny_remove"
+    assert denied_removal["policy"]["value"]["decision"] == "deny"
+
     bounded_allow = policy(
         "active_condition: 'defined(FEATURE)'\n"
         "      edit_lexical_scope: file",
@@ -242,7 +318,7 @@ rules:
         "'symbol' contains an embedded NUL")
 
     # Version, enums, IDs and precompiled patterns are validated before use.
-    expect_error("schema_version: 3\nrules: []\n", "unsupported schema_version '3'")
+    expect_error("schema_version: 4\nrules: []\n", "unsupported schema_version '4'")
     expect_error('schema_version: "1"\nrules: []\n',
                  "'schema_version' must be an integer")
     expect_error(policy(action="unknown"), "unknown action 'unknown'")
