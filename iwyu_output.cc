@@ -2762,6 +2762,18 @@ ProjectPolicyEditLexicalScope PolicyEditLexicalScope(
   return result;
 }
 
+bool IsLiteralIncludeDirective(const string& source_spelling) {
+  llvm::StringRef text(source_spelling);
+  text = text.trim();
+  if (!text.consume_front("#"))
+    return false;
+  text = text.ltrim();
+  if (!text.consume_front("include"))
+    return false;
+  text = text.ltrim();
+  return !text.empty() && (text.front() == '"' || text.front() == '<');
+}
+
 llvm::json::Object KnownString(const string& value) {
   return llvm::json::Object{{"status", "known"}, {"value", value}};
 }
@@ -3154,6 +3166,12 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       if (operation.line->IsIncludeLine()) {
         motivates = use.has_suggested_header() &&
             use.suggested_header() == operation.line->quoted_include();
+        if (!motivates &&
+            operation.reason_code == "project_policy_allow_remove" &&
+            use.decl() && operation.line->HasForwardReplacement(
+                              StructuredDeclarationIdentity(use.decl()))) {
+          motivates = true;
+        }
         if (!motivates && GlobalFlags().output_schema_version >= 2 &&
             operation.subject_action == "remove" && !use.is_full_use() &&
             !use.has_suggested_header() &&
@@ -3990,6 +4008,125 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
           }
           return found ? common : ActiveCondition{};
         };
+    struct ForwardReplacementProof {
+      ProjectPolicyReplacement policy_fact;
+      vector<pair<const NamedDecl*, OneIncludeOrForwardDeclareLine*>>
+          replacements;
+    };
+
+    const auto replacement_fact = [&]
+        (OneIncludeOrForwardDeclareLine& include_line,
+         const IwyuPreprocessorInfo::ActiveCondition& include_condition) {
+      ForwardReplacementProof proof;
+      bool saw_exact_replacement = false;
+      bool saw_unknown = false;
+      if (!include_line.included_file()) {
+        proof.policy_fact.availability =
+            ProjectPolicyReplacementAvailability::Unknown;
+        return proof;
+      }
+      if (!IsLiteralIncludeDirective(include_line.source_spelling()))
+        saw_unknown = true;
+
+      for (const OneUse& use : symbol_uses_) {
+        if (use.ignore_use() || use.is_full_use() ||
+            use.has_suggested_header() || !use.decl()) {
+          continue;
+        }
+        const NamedDecl* definition = GetTagDefinition(use.decl());
+        if (!definition)
+          continue;
+
+        const auto coverage = preprocessor_info_->DefinitionProviderCoverageAt(
+            file_, include_line.quoted_include(),
+            GetFilePath(include_line.included_file()), GetLocation(definition),
+            use.use_loc(), false);
+        if (coverage.status ==
+            IwyuPreprocessorInfo::DirectIncludeCoverage::kUnknown) {
+          saw_unknown = true;
+          continue;
+        }
+        if (coverage.status !=
+                IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse ||
+            coverage.chain.empty()) {
+          continue;
+        }
+        const IwyuPreprocessorInfo::ProviderOccurrence& root =
+            coverage.chain.front();
+        if (root.includer != file_ ||
+            root.includee != include_line.included_file() ||
+            root.spelling != include_line.quoted_include() ||
+            GetLineNumber(root.location) != include_line.start_linenum()) {
+          continue;
+        }
+
+        const auto use_condition =
+            preprocessor_info_->ActiveConditionAt(use.use_loc());
+        using ConditionStatus = IwyuPreprocessorInfo::ActiveCondition::Status;
+        const bool both_unconditional =
+            include_condition.status == ConditionStatus::kNotApplicable &&
+            use_condition.status == ConditionStatus::kNotApplicable;
+        const ProjectPolicyEditLexicalScope replacement_scope =
+            PolicyEditLexicalScope(preprocessor_info_, file_,
+                                   include_condition);
+        const bool same_known_condition =
+            include_condition.status == ConditionStatus::kKnown &&
+            use_condition.status == ConditionStatus::kKnown &&
+            include_condition.active_branch && use_condition.active_branch &&
+            include_condition.expression == use_condition.expression &&
+            include_condition.directive_location ==
+                use_condition.directive_location &&
+            include_condition.source_region_id ==
+                use_condition.source_region_id &&
+            include_condition.source_region_path ==
+                use_condition.source_region_path &&
+            replacement_scope.availability ==
+                ProjectPolicyLexicalScopeAvailability::Known &&
+            replacement_scope.scope == "file";
+        if ((!both_unconditional && !same_known_condition) ||
+            !IsLiteralIncludeDirective(include_line.source_spelling())) {
+          saw_unknown = true;
+          continue;
+        }
+
+        auto forward_line = std::find_if(
+            lines_.begin(), lines_.end(), [&](const auto& line) {
+              return !line.IsIncludeLine() && line.is_desired() &&
+                     line.was_desired_by_use() && line.matches(use.decl());
+            });
+        if (forward_line == lines_.end()) {
+          saw_unknown = true;
+          continue;
+        }
+
+        const NamedDecl* identity = StructuredDeclarationIdentity(use.decl());
+        if (!identity) {
+          saw_unknown = true;
+          continue;
+        }
+        const string qualified_name =
+            internal::GetQualifiedNameAsString(identity);
+        if (qualified_name.empty()) {
+          saw_unknown = true;
+          continue;
+        }
+        proof.replacements.push_back({identity, &*forward_line});
+        saw_exact_replacement = true;
+      }
+
+      if (saw_unknown) {
+        proof.policy_fact.availability =
+            ProjectPolicyReplacementAvailability::Unknown;
+      } else if (saw_exact_replacement) {
+        proof.policy_fact.availability =
+            ProjectPolicyReplacementAvailability::Known;
+        proof.policy_fact.replacement = "forward_declaration";
+      } else {
+        proof.policy_fact.availability =
+            ProjectPolicyReplacementAvailability::NotApplicable;
+      }
+      return proof;
+    };
 
     for (OneIncludeOrForwardDeclareLine& line : lines_) {
       if (!line.IsIncludeLine() || line.is_present() || !line.is_desired() ||
@@ -4110,6 +4247,17 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
       context.active_condition = PolicyActiveCondition(condition);
       context.edit_lexical_scope =
           PolicyEditLexicalScope(preprocessor_info_, file_, condition);
+      const ForwardReplacementProof replacement =
+          replacement_fact(line, condition);
+      context.replacement = replacement.policy_fact;
+      for (const auto& replacement_entry : replacement.replacements) {
+        context.symbols.push_back(
+            internal::GetQualifiedNameAsString(replacement_entry.first));
+      }
+      std::sort(context.symbols.begin(), context.symbols.end());
+      context.symbols.erase(
+          std::unique(context.symbols.begin(), context.symbols.end()),
+          context.symbols.end());
       if (GlobalFlags().has_configuration)
         context.configuration = GlobalFlags().configuration;
 
@@ -4141,6 +4289,21 @@ size_t IwyuFileInfo::CalculateAndReportIwyuViolations() {
       }
 
       const ProjectPolicyDecision& decision = *match.decision;
+      if (decision.action == ProjectPolicyAction::AllowRemove) {
+        for (const auto& replacement_entry : replacement.replacements) {
+          line.AddForwardReplacement(replacement_entry.first);
+          replacement_entry.second->AddSymbolUse(
+              internal::GetQualifiedNameAsString(replacement_entry.first));
+        }
+        const string reason = "Project policy '" + decision.policy_file +
+            "' rule '" + decision.rule_id + "' allows removing " +
+            line.quoted_include() + " from " + context.includer +
+            " with an exact forward-declaration replacement.";
+        line.SetProjectPolicyDecision(
+            "remove", "apply", "project_policy_allow_remove", reason,
+            decision.policy_file, decision.rule_id, "allow");
+        continue;
+      }
       const bool denied =
           decision.action == ProjectPolicyAction::DenyRemove;
       const string reason = "Project policy '" + decision.policy_file +

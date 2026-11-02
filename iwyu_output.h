@@ -16,6 +16,7 @@
 #ifndef INCLUDE_WHAT_YOU_USE_IWYU_OUTPUT_H_
 #define INCLUDE_WHAT_YOU_USE_IWYU_OUTPUT_H_
 
+#include <algorithm>                    // for find
 #include <map>                          // for map
 #include <set>                          // for set
 #include <string>                       // for string, operator<
@@ -226,6 +227,19 @@ class OneIncludeOrForwardDeclareLine {
   bool was_restored_by_keep() const { return restored_by_keep_; }
   void mark_desired_by_use() { desired_by_use_ = true; }
   bool was_desired_by_use() const { return desired_by_use_; }
+  void AddForwardReplacement(const clang::NamedDecl* decl) {
+    if (std::find(forward_replacements_.begin(), forward_replacements_.end(),
+                  decl) == forward_replacements_.end()) {
+      forward_replacements_.push_back(decl);
+    }
+  }
+  bool HasForwardReplacement(const clang::NamedDecl* decl) const {
+    return std::find(forward_replacements_.begin(), forward_replacements_.end(),
+                     decl) != forward_replacements_.end();
+  }
+  const vector<const clang::NamedDecl*>& forward_replacements() const {
+    return forward_replacements_;
+  }
   void SetForwardDeclareKeepReason(const string& reason_code,
                                    const string& reason) {
     forward_declare_keep_reason_code_ = reason_code;
@@ -301,6 +315,7 @@ class OneIncludeOrForwardDeclareLine {
   map<string, int> symbol_counts_;   // how many times we referenced each symbol
   bool restored_by_keep_ = false;    // keep policy overrode a removal
   bool desired_by_use_ = false;      // a real OneUse requires this fwd-decl
+  vector<const clang::NamedDecl*> forward_replacements_;
   // Only either two following members are set for includes
   string quoted_include_;  // quoted file name we're including
   const clang::FileEntry* included_file_ = nullptr;  // the file we're including

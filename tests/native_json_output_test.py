@@ -1649,6 +1649,162 @@ rules:
     assert prefix_suppression["disposition"] == "suppress"
     assert prefix_suppression["policy"]["status"] == "unavailable"
 
+    # Schema-3 allow_remove applies only with exact native forward replacement
+    # proof and carries typed forward-only symbols into the complete desired state.
+    allow_remove_policy = """schema_version: 3
+rules:
+  - id: allow-inline-to-forward
+    action: allow_remove
+    match:
+      includer: { regex: ".*[.]hpp" }
+      includee: { regex: ".*[.]inline[.]hpp" }
+      file_kind: header
+      replacement: forward_declaration
+  - id: deny-other-header-removal
+    action: deny_remove
+    match:
+      file_kind: header
+"""
+    no_policy_record = records(run(
+        "tests/native_json/policy_allow_remove_consumer.hpp",
+        "--output_format=json"))[0]
+    empty_policy_result, _ = run_with_temporary_policy(
+        "tests/native_json/policy_allow_remove_consumer.hpp",
+        "schema_version: 3\nrules: []\n")
+    assert empty_policy_result.returncode == 0, empty_policy_result.stderr
+    empty_policy_record = records(empty_policy_result)[0]
+    for field in ("status", "operations", "desired_state", "diagnostics"):
+        assert empty_policy_record[field] == no_policy_record[field], field
+
+    deny_replacement_policy = """schema_version: 3
+rules:
+  - id: deny-replacement
+    action: deny_remove
+    match:
+      includee: { regex: ".*[.]inline[.]hpp" }
+"""
+    deny_replacement_result, _ = run_with_temporary_policy(
+        "tests/native_json/policy_allow_remove_consumer.hpp",
+        deny_replacement_policy)
+    deny_replacement_record = records(deny_replacement_result)[0]
+    denied_forward_item = next(
+        item for item in deny_replacement_record["desired_state"]["items"]
+        if item["item_kind"] == "forward_declaration")
+    assert denied_forward_item["symbols"] == []
+
+    allow_remove_result, allow_remove_path = run_with_temporary_policy(
+        "tests/native_json/policy_allow_remove_consumer.hpp",
+        allow_remove_policy)
+    assert allow_remove_result.returncode == 0, allow_remove_result.stderr
+    allow_remove_record = records(allow_remove_result)[0]
+    allowed_removal = next(
+        operation for operation in allow_remove_record["operations"]
+        if operation["reason_code"] == "project_policy_allow_remove")
+    assert (allowed_removal["subject_action"], allowed_removal["item_kind"],
+            allowed_removal["disposition"]) == ("remove", "include", "apply")
+    assert allowed_removal["policy"] == {
+        "status": "known", "value": {
+            "policy_file": allow_remove_path,
+            "rule_id": "allow-inline-to-forward", "decision": "allow"}}
+    assert all(value["status"] == "not_applicable"
+               for value in allowed_removal["provider"].values())
+    assert len(allowed_removal["symbols"]) == 1
+    replacement_symbol = allowed_removal["symbols"][0]
+    assert replacement_symbol["qualified_name"]["value"] == (
+        "PolicyAllowRemoveType")
+    assert replacement_symbol["declaration_kind"]["value"] == "class"
+    assert {use["requirement"] for use in replacement_symbol["uses"]} == {
+        "forward_declaration"}
+    desired = allow_remove_record["desired_state"]["items"]
+    assert not any("policy_allow_remove_provider.inline.hpp" in item["spelling"]
+                   for item in desired)
+    desired_forward = next(item for item in desired
+                           if item["item_kind"] == "forward_declaration")
+    assert desired_forward == {
+        "item_kind": "forward_declaration",
+        "spelling": "class PolicyAllowRemoveType;",
+        "symbols": ["PolicyAllowRemoveType"],
+    }
+    assert not any(diagnostic["code"] == "project_policy_allow_remove"
+                   for diagnostic in allow_remove_record["diagnostics"])
+
+    generic_allow_remove_policy = """schema_version: 3
+rules:
+  - id: allow-exact-forward-replacement
+    action: allow_remove
+    match:
+      includee: { regex: ".*policy_allow_remove_provider[.]inline[.]hpp" }
+      replacement: forward_declaration
+  - id: deny-removal-without-replacement
+    action: deny_remove
+    match:
+      includee: { regex: ".*policy_allow_remove_provider[.]inline[.]hpp" }
+"""
+    unconditional_result, _ = run_with_temporary_policy(
+        "tests/native_json/policy_allow_remove_unconditional.cc",
+        generic_allow_remove_policy)
+    assert unconditional_result.returncode == 0, unconditional_result.stderr
+    unconditional_record = records(unconditional_result)[0]
+    unconditional_allow = next(
+        operation for operation in unconditional_record["operations"]
+        if operation["subject_action"] == "remove")
+    assert unconditional_allow["reason_code"] == "project_policy_allow_remove"
+    assert unconditional_allow["edit_condition"]["status"] == "not_applicable"
+
+    mismatch_result, _ = run_with_temporary_policy(
+        "tests/native_json/policy_allow_remove_condition_mismatch.cc",
+        generic_allow_remove_policy)
+    assert mismatch_result.returncode == 0, mismatch_result.stderr
+    mismatch_record = records(mismatch_result)[0]
+    mismatch_removal = next(
+        operation for operation in mismatch_record["operations"]
+        if operation["subject_action"] == "remove")
+    assert mismatch_removal["reason_code"] == "project_policy_deny_remove"
+    assert mismatch_removal["policy"]["value"]["rule_id"] == (
+        "deny-removal-without-replacement")
+
+    duplicate_result, _ = run_with_temporary_policy(
+        "tests/native_json/policy_allow_remove_duplicate.hpp",
+        allow_remove_policy)
+    assert duplicate_result.returncode == 0, duplicate_result.stderr
+    duplicate_record = records(duplicate_result)[0]
+    duplicate_removals = [
+        operation for operation in duplicate_record["operations"]
+        if operation["subject_action"] == "remove"]
+    assert [(operation["source_range"]["value"]["start"]["line"],
+             operation["reason_code"], len(operation["symbols"]))
+            for operation in duplicate_removals] == [
+                (4, "project_policy_allow_remove", 1),
+                (5, "project_policy_deny_remove", 0),
+            ]
+    assert any("policy_allow_remove_provider.inline.hpp" in item["spelling"]
+               for item in duplicate_record["desired_state"]["items"])
+
+    full_use_result, _ = run_with_temporary_policy(
+        "tests/native_json/policy_allow_remove_full.hpp", allow_remove_policy)
+    assert full_use_result.returncode == 0, full_use_result.stderr
+    full_use_record = records(full_use_result)[0]
+    full_use_keep = next(
+        operation for operation in full_use_record["operations"]
+        if operation["reason_code"] == "semantic_definition_provider")
+    assert (full_use_keep["subject_action"], full_use_keep["disposition"]) == (
+        "keep", "keep")
+    assert not any(operation["reason_code"] == "project_policy_allow_remove"
+                   for operation in full_use_record["operations"])
+    assert any("policy_allow_remove_provider.inline.hpp" in item["spelling"]
+               for item in full_use_record["desired_state"]["items"])
+
+    ordinary_header_result, _ = run_with_temporary_policy(
+        "tests/native_json/policy007_header.hpp", allow_remove_policy)
+    assert ordinary_header_result.returncode == 0, ordinary_header_result.stderr
+    ordinary_header_record = records(ordinary_header_result)[0]
+    ordinary_denial = next(
+        operation for operation in ordinary_header_record["operations"]
+        if operation["reason_code"] == "project_policy_deny_remove")
+    assert ordinary_denial["disposition"] == "suppress"
+    assert ordinary_denial["policy"]["value"]["rule_id"] == (
+        "deny-other-header-removal")
+
     # POLICY-007 removal-family decisions retain residual ordinary removals.
     removal_header = "tests/native_json/policy007_header.hpp"
     removal_inline = "tests/native_json/policy007_inline.inline.hpp"

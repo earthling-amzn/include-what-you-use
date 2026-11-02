@@ -83,16 +83,17 @@ rules:
       {match}
 """
 
-def removal_operation(policy_text):
+def removal_operation(policy_text,
+                      source="tests/native_json/policy007_source.cc",
+                      spelling_suffix="policy007_unused.hpp"):
     result = with_policy_for_source(
-        policy_text, "tests/native_json/policy007_source.cc",
-        "--output_schema=2")
+        policy_text, source, "--output_schema=2")
     assert result.returncode == 0, result.stderr
     records = [json.loads(line) for line in result.stdout.splitlines()]
     operations = [operation for record in records
                   for operation in record["operations"]
                   if operation["item_kind"] == "include" and
-                  "policy007_unused.hpp" in operation["spelling"]]
+                  spelling_suffix in operation["spelling"]]
     assert len(operations) == 1, operations
     return operations[0]
 
@@ -139,8 +140,10 @@ def main():
     assert "allow_remove requires native structured output schema 2" in \
         allow_remove_text.stderr
 
-    # Until exact replacement proof is populated, an allow-first removal is
-    # indeterminate and suppresses. A definite earlier deny still wins.
+    # A definite absence of replacement falls through to a later deny. A
+    # computed physical include with a potential replacement remains unknown and
+    # suppresses without claiming policy provenance. A definite earlier deny
+    # still wins.
     allow_first = """schema_version: 3
 rules:
   - id: replacement-first
@@ -153,10 +156,26 @@ rules:
     match:
       includee: { glob: tests/native_json/policy007_unused.hpp }
 """
-    unknown_removal = removal_operation(allow_first)
+    fallback_removal = removal_operation(allow_first)
+    assert fallback_removal["disposition"] == "suppress"
+    assert fallback_removal["reason_code"] == "project_policy_deny_remove"
+    assert fallback_removal["policy"]["value"]["rule_id"] == "deny-fallback"
+    computed_allow = """schema_version: 3
+rules:
+  - id: computed-replacement
+    action: allow_remove
+    match:
+      includee: { glob: tests/native_json/policy_allow_remove_provider.inline.hpp }
+      replacement: forward_declaration
+"""
+    unknown_removal = removal_operation(
+        computed_allow,
+        "tests/native_json/policy_allow_remove_computed.hpp",
+        "POLICY_ALLOW_REMOVE_PROVIDER")
     assert unknown_removal["disposition"] == "suppress"
     assert unknown_removal["reason_code"] == "project_policy_replacement_unknown"
     assert unknown_removal["policy"] == {"status": "unavailable", "value": None}
+    assert unknown_removal["symbols"] == []
     deny_first = """schema_version: 3
 rules:
   - id: deny-first
@@ -173,6 +192,39 @@ rules:
     assert denied_removal["disposition"] == "suppress"
     assert denied_removal["reason_code"] == "project_policy_deny_remove"
     assert denied_removal["policy"]["value"]["decision"] == "deny"
+
+    unknown_condition_no_replacement = """schema_version: 3
+rules:
+  - id: unknown-condition-but-no-replacement
+    action: allow_remove
+    match:
+      includee: { glob: tests/native_json/policy_active_condition_empty.hpp }
+      active_condition: POLICY_ACTIVE_REPEATED_REMOVE
+      replacement: forward_declaration
+  - id: definite-deny-fallback
+    action: deny_remove
+    match:
+      includee: { glob: tests/native_json/policy_active_condition_empty.hpp }
+"""
+    mismatch_result = with_policy_for_source(
+        unknown_condition_no_replacement,
+        "tests/native_json/policy_active_condition_repeated_remove.cc",
+        "--output_schema=2",
+        "--check_also=tests/native_json/"
+        "policy_active_condition_repeated_remove.hpp")
+    assert mismatch_result.returncode == 0, mismatch_result.stderr
+    mismatch_records = [json.loads(line)
+                        for line in mismatch_result.stdout.splitlines()]
+    mismatch_record = next(
+        record for record in mismatch_records
+        if record["file"]["path"].endswith(
+            "policy_active_condition_repeated_remove.hpp"))
+    mismatch_removal = next(
+        operation for operation in mismatch_record["operations"]
+        if operation["subject_action"] == "remove")
+    assert mismatch_removal["reason_code"] == "project_policy_deny_remove"
+    assert mismatch_removal["policy"]["value"]["rule_id"] == (
+        "definite-deny-fallback")
 
     bounded_allow = policy(
         "active_condition: 'defined(FEATURE)'\n"
