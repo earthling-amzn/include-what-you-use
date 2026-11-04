@@ -1,0 +1,4 @@
+#ifndef IWYU_TESTS_FWD_ORDER_MIXED_CONDITIONAL_HPP_
+#define IWYU_TESTS_FWD_ORDER_MIXED_CONDITIONAL_HPP_
+class Fwd006MixedConditional {};
+#endif

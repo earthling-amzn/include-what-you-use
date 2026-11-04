@@ -401,6 +401,56 @@ CASES = [
             "Fwd006UnconditionalClass (ptr only)"])],
     },
     {
+        "name": "direct-enum-definition",
+        "source": "fwd006_direct_enum.cc",
+        "target": "fwd006_direct_enum.cc",
+        "decl": "enum class Fwd006DirectMode : int;",
+        "present": False,
+        "operations": [operation(
+            "remove", "forward_declaration",
+            "enum class Fwd006DirectMode : int;")],
+        "items": [include("fwd006_direct_enum_provider.hpp", [
+            "Fwd006DirectEnumAnchor", "Fwd006DirectMode (ptr only)"])],
+    },
+    {
+        "name": "mixed-unconditional-conditional-source",
+        "source": "fwd006_mixed_source.cc",
+        "target": "fwd006_mixed_source.cc",
+        "decl": "class Fwd006MixedConditional;",
+        "present": True,
+        "args": ["-DFWD006_ENABLE_MIXED_SOURCE=1"],
+        "compile_args_sets": [[], ["-DFWD006_ENABLE_MIXED_SOURCE=1"]],
+        "operations": [
+            operation("remove", "forward_declaration",
+                      "class Fwd006MixedUnconditional;"),
+            operation("remove", "include",
+                      '#include "tests/fwd_order/fwd006_mixed_conditional.hpp"  '
+                      "// IWYU pragma: keep", "keep", "pragma_keep"),
+        ],
+        "items": [
+            include("fwd006_mixed_conditional.hpp", keep=True),
+            include("fwd006_mixed_unconditional.hpp", [
+                "Fwd006MixedAnchor", "Fwd006MixedUnconditional (ptr only)"]),
+            declaration("class Fwd006MixedConditional;"),
+        ],
+    },
+    {
+        "name": "associated-dotted-inline-alternate-root-cycle",
+        "source": "fwd006_cycle_entry.cc",
+        "target": "fwd006_cycle_state.inline.hpp",
+        "decl": "enum class Fwd006CycleState : unsigned;",
+        "present": True,
+        "require_second_target": True,
+        "operations": [operation(
+            "remove", "include",
+            '#include "tests/fwd_order/fwd006_cycle_state.hpp"',
+            "keep", "reexported_include")],
+        "items": [
+            include("fwd006_cycle_state.hpp"),
+            declaration("enum class Fwd006CycleState : unsigned;"),
+        ],
+    },
+    {
         "name": "associated-dotted-inline-mixed-occurrences",
         "source": "fwd006_inline_mixed.cc",
         "target": "fwd006_inline_mixed.inline.hpp",
@@ -567,6 +617,12 @@ def assert_fixer_idempotence(case):
             case["name"], second_json.stderr)
         second_records = [
             json.loads(line) for line in second_json.stdout.splitlines()]
+        if case.get("require_second_target"):
+            target_path = f"tests/fwd_order/{case['target']}"
+            target_records = [record for record in second_records
+                              if record["file"]["path"] == target_path]
+            assert len(target_records) == 1, (
+                case["name"], target_path, second_records)
         assert not any(
             operation["disposition"] == "apply"
             for record in second_records
