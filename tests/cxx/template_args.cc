@@ -18,7 +18,6 @@
 
 // ---------------------------------------------------------------
 
-// IWYU: IndirectClass needs a declaration
 char Foo(IndirectClass ic);
 
 template <typename F> struct FunctionStruct;
@@ -28,12 +27,10 @@ template <typename R, typename A1> struct FunctionStruct<R(A1)> {
 };
 
 void FunctionProtoClassArguments() {
-  // IWYU: IndirectClass needs a declaration
   // IWYU: IndirectClass is...*indirect.h
   FunctionStruct<char(IndirectClass&)> f1;
   (void)f1;
 
-  // IWYU: IndirectClass needs a declaration
   // IWYU: IndirectClass is...*indirect.h
   FunctionStruct<IndirectClass(char)> f2;
   (void)f2;
@@ -58,22 +55,17 @@ template <typename T> struct DoublePointerStruct2 {
 };
 
 void PointerClassArguments() {
-  // IWYU: IndirectClass needs a declaration
   IndirectClass* ic = 0;
 
-  // IWYU: IndirectClass needs a declaration
   // IWYU: IndirectClass is...*indirect.h
   PointerStruct<IndirectClass*>::a(ic);
 
-  // IWYU: IndirectClass needs a declaration
   // IWYU: IndirectClass is...*indirect.h
   DoublePointerStruct<IndirectClass**>::a(&ic);
 
-  // IWYU: IndirectClass needs a declaration
   // IWYU: IndirectClass is...*indirect.h
   PointerStruct2<IndirectClass>::a(ic);
 
-  // IWYU: IndirectClass needs a declaration
   // IWYU: IndirectClass is...*indirect.h
   DoublePointerStruct2<IndirectClass>::a(&ic);
 }
@@ -83,23 +75,19 @@ void PointerClassArguments() {
 template<typename T> struct Outer { T t; };
 template<typename T> struct Inner { T t; };
 struct StaticTemplateFieldStruct {
-  // IWYU: IndirectClass needs a declaration
   static Inner<IndirectClass> tpl;
   static ProvidingAlias<5> aliasedProviding;
   static NonProvidingAlias<5> aliasedNonProviding;
 };
 
 void NestedTemplateArguments() {
-  // IWYU: IndirectClass needs a declaration
   // IWYU: IndirectClass is...*indirect.h
   Outer<Inner<IndirectClass> > oi;
   (void)oi;
 
-  // IWYU: IndirectClass needs a declaration
   Outer<Inner<IndirectClass>* > oip;
   (void)oip;
 
-  // IWYU: IndirectClass needs a declaration
   Outer<Inner<IndirectClass> >* opi;
   (void)opi;
 
@@ -163,22 +151,18 @@ template<typename T> struct CreateTemporary {
 };
 
 void TestCreateTemporary() {
-  // IWYU: IndirectClass needs a declaration
   CreateTemporary<IndirectClass> ct;
 
   // IWYU: IndirectClass is...*indirect.h
   ct.a();
 
   // IWYU: IndirectClass is...*indirect.h
-  // IWYU: IndirectClass needs a declaration
   ct.b<IndirectClass>();
 
   // IWYU: IndirectClass is...*indirect.h
-  // IWYU: IndirectClass needs a declaration
   CreateTemporary<IndirectClass>::statica();
 
   // IWYU: IndirectClass is...*indirect.h
-  // IWYU: IndirectClass needs a declaration
   CreateTemporary<int>::staticb<IndirectClass>();
 }
 
@@ -213,8 +197,6 @@ class TemplateWithFwdDeclUse {
 
 // IWYU should not suggest neither TplInI1 nor IndirectClass full info
 // for fwd-decl use in TemplateWithFwdDeclUse.
-// IWYU: TplInI1 needs a declaration
-// IWYU: IndirectClass needs a declaration
 TemplateWithFwdDeclUse<TplInI1<IndirectClass>> c;
 
 // ---------------------------------------------------------------

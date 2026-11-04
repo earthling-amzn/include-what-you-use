@@ -1778,11 +1778,18 @@ void CalculateIwyuForForwardDeclareUse(
   }
 
   const set<const NamedDecl*>& redecls = GetTagRedecls(tag_decl);
+  const NamedDecl* local_decl = nullptr;
+  for (const NamedDecl* redecl : redecls) {
+    if (DeclIsVisibleToUseInSameFile(redecl, *use, preprocessor_info)) {
+      local_decl = redecl;
+      break;
+    }
+  }
 
   // A source file does not need to repeat a declaration introduced by one exact
-  // direct include occurrence. Check external providers before the local
-  // declaration so the latter can be diagnosed as redundant. Published headers
-  // intentionally keep owning their local declarations.
+  // direct include occurrence. Check external providers before selecting an
+  // existing local declaration so that duplicate can be diagnosed as redundant.
+  // Do not change missing-declaration policy or published-header ownership.
   if (!IsHeaderFile(GetFilePath(use_file))) {
     for (const NamedDecl* redecl : redecls) {
       const string provider = ConvertToQuotedInclude(GetFilePath(redecl));
@@ -1813,15 +1820,9 @@ void CalculateIwyuForForwardDeclareUse(
     }
   }
 
-  // Otherwise use a declaration visible in the same file and before the use.
-  if (!same_file_decl) {
-    for (const NamedDecl* redecl : redecls) {
-      if (DeclIsVisibleToUseInSameFile(redecl, *use, preprocessor_info)) {
-        same_file_decl = redecl;
-        break;
-      }
-    }
-  }
+  // Otherwise use the declaration visible in the same file and before the use.
+  if (!same_file_decl)
+    same_file_decl = local_decl;
 
   // (D1) Mark that the fwd-declare is satisfied by dfn in desired include.
   const NamedDecl* providing_decl = nullptr;
