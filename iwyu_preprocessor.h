@@ -281,6 +281,15 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
       clang::SourceLocation declaration_loc,
       clang::SourceLocation use_loc) const;
 
+  // Proves an exact dotted-inline -> plain-counterpart -> selected-provider
+  // chain. The plain owner occurrence must remain directly desired; its exact
+  // spelling is returned for stable desired-state attribution.
+  DirectIncludeCoverage DottedInlineOwnerProviderCoverageAt(
+      const clang::FileEntry* includer, const set<string>& direct_desired,
+      const string& selected_spelling, const string& selected_path,
+      clang::SourceLocation declaration_loc, clang::SourceLocation use_loc,
+      string* owner_spelling) const;
+
   // One physically entered include edge. FileIDs distinguish repeated
   // entries of the same FileEntry; location identifies the exact directive.
   struct ProviderOccurrence {

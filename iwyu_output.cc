@@ -1744,10 +1744,17 @@ void CalculateIwyuForForwardDeclareUse(
           preprocessor_info->DirectProviderCoverageAt(
               use_file, header.spelling, header.path, GetLocation(dfn),
               use->use_loc());
+      string dotted_owner;
+      const bool dotted_owner_covers =
+          preprocessor_info->DottedInlineOwnerProviderCoverageAt(
+              use_file, direct_desired_includes, header.spelling, header.path,
+              GetLocation(dfn), use->use_loc(), &dotted_owner) ==
+          IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse;
       const bool present_provider_covers =
           direct_coverage ==
               IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse ||
-          associated_provider_covers_use(header, GetLocation(dfn));
+          associated_provider_covers_use(header, GetLocation(dfn)) ||
+          dotted_owner_covers;
       // Preserve established one-pass behavior for a newly selected spelling
       // of the definition's physical file. A mapped public provider has a
       // different path and must have an entered occurrence before it can cover
@@ -1758,13 +1765,17 @@ void CalculateIwyuForForwardDeclareUse(
                   kNoDirectOccurrence &&
           header.path == physical_header.path &&
           ContainsKey(direct_desired_includes, header.spelling);
-      if (ContainsKey(desired_includes, header.spelling) &&
+      if ((ContainsKey(desired_includes, header.spelling) ||
+           dotted_owner_covers) &&
           (present_provider_covers || new_physical_provider_covers)) {
         dfn_is_in_desired_includes = true;
         if (desired_provider.empty())
-          desired_provider = header.spelling;
+          desired_provider = dotted_owner_covers
+              ? dotted_owner
+              : header.spelling;
       }
-      if (ContainsKey(actual_includes, header.spelling) &&
+      if ((ContainsKey(actual_includes, header.spelling) ||
+           dotted_owner_covers) &&
           present_provider_covers) {
         dfn_is_in_actual_includes = true;
       }

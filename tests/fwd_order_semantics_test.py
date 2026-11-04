@@ -321,6 +321,99 @@ CASES = [
             declaration("class Fwd006HeaderAssociated;"),
         ],
     },
+    {
+        "name": "associated-dotted-inline-class-definition",
+        "source": "fwd006_inline_class.cc",
+        "target": "fwd006_inline_class.inline.hpp",
+        "decl": "class Fwd006InlineClass;",
+        "present": False,
+        "operations": [operation(
+            "remove", "forward_declaration", "class Fwd006InlineClass;")],
+        "items": [include(
+            "fwd006_inline_class.hpp",
+            ["Fwd006InlineClass (ptr only)",
+             "Fwd006InlineClassOwnerAnchor"])],
+    },
+    {
+        "name": "associated-dotted-inline-enum-definition",
+        "source": "fwd006_inline_enum.cc",
+        "target": "fwd006_inline_enum.inline.hpp",
+        "decl": "enum class Fwd006InlineMode : int;",
+        "present": False,
+        "operations": [operation(
+            "remove", "forward_declaration",
+            "enum class Fwd006InlineMode : int;")],
+        "items": [include(
+            "fwd006_inline_enum.hpp",
+            ["Fwd006InlineEnumOwnerAnchor", "Fwd006InlineMode (ptr only)"])],
+    },
+    {
+        "name": "associated-dotted-inline-provider-removed",
+        "source": "fwd006_inline_removed.cc",
+        "target": "fwd006_inline_removed.inline.hpp",
+        "decl": "class Fwd006InlineClass;",
+        "present": True,
+        "operations": [operation(
+            "remove", "include",
+            '#include "tests/fwd_order/fwd006_inline_removed.hpp"',
+            "keep", "reexported_include")],
+        "items": [
+            include("fwd006_inline_removed.hpp"),
+            declaration("class Fwd006InlineClass;"),
+        ],
+    },
+    {
+        "name": "associated-dotted-inline-conditional-off",
+        "source": "fwd006_inline_conditional.cc",
+        "target": "fwd006_inline_conditional.inline.hpp",
+        "decl": "class Fwd006ConditionalClass;",
+        "present": True,
+        "operations": [operation(
+            "remove", "forward_declaration",
+            "class Fwd006UnconditionalClass;")],
+        "items": [
+            include("fwd006_inline_conditional.hpp", [
+                "Fwd006InlineConditionalAnchor",
+                "Fwd006UnconditionalClass (ptr only)"]),
+            declaration("class Fwd006ConditionalClass;"),
+            declaration("enum class Fwd006ConditionalMode : int;"),
+        ],
+    },
+    {
+        "name": "associated-dotted-inline-conditional-on",
+        "source": "fwd006_inline_conditional.cc",
+        "target": "fwd006_inline_conditional.inline.hpp",
+        "decl": "class Fwd006ConditionalClass;",
+        "present": False,
+        "args": ["-DFWD006_ENABLE_CONDITIONAL=1"],
+        "operations": [
+            operation("remove", "forward_declaration",
+                      "class Fwd006ConditionalClass;"),
+            operation("remove", "forward_declaration",
+                      "class Fwd006UnconditionalClass;"),
+            operation("remove", "forward_declaration",
+                      "enum class Fwd006ConditionalMode : int;"),
+        ],
+        "items": [include("fwd006_inline_conditional.hpp", [
+            "Fwd006ConditionalClass (ptr only)",
+            "Fwd006ConditionalMode (ptr only)",
+            "Fwd006InlineConditionalAnchor",
+            "Fwd006UnconditionalClass (ptr only)"])],
+    },
+    {
+        "name": "associated-dotted-inline-mixed-occurrences",
+        "source": "fwd006_inline_mixed.cc",
+        "target": "fwd006_inline_mixed.inline.hpp",
+        "decl": "class Fwd006InlineClass;",
+        "present": True,
+        "args": ["-DFWD006_ENABLE_MIXED=1"],
+        "compile_args_sets": [[], ["-DFWD006_ENABLE_MIXED=1"]],
+        "operations": [],
+        "items": [
+            include("fwd006_inline_mixed.hpp", ["Fwd006InlineMixedAnchor"]),
+            declaration("class Fwd006InlineClass;"),
+        ],
+    },
 ]
 
 
@@ -371,12 +464,13 @@ def operation_tuples(record):
 
 
 def compile_case(case, root):
-    command = [str(CXX), "-std=c++17", "-fsyntax-only", "-I", "."]
-    command.extend(arg for arg in case.get("args", []) if arg.startswith("-D"))
-    command.append(f"tests/fwd_order/{case['source']}")
-    result = subprocess.run(command, cwd=root, text=True, capture_output=True)
-    assert result.returncode == 0, (
-        case["name"], result.stdout + result.stderr)
+    base = [str(CXX), "-std=c++17", "-fsyntax-only", "-I", "."]
+    default_args = [arg for arg in case.get("args", []) if arg.startswith("-D")]
+    for extra_args in case.get("compile_args_sets", [default_args]):
+        command = [*base, *extra_args, f"tests/fwd_order/{case['source']}"]
+        result = subprocess.run(command, cwd=root, text=True, capture_output=True)
+        assert result.returncode == 0, (
+            case["name"], extra_args, result.stdout + result.stderr)
 
 
 def tree_digest(root):

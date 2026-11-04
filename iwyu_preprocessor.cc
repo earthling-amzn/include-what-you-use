@@ -3000,6 +3000,91 @@ IwyuPreprocessorInfo::AssociatedProviderCoverageAt(
                  : DirectIncludeCoverage::kDoesNotCoverUse;
 }
 
+IwyuPreprocessorInfo::DirectIncludeCoverage
+IwyuPreprocessorInfo::DottedInlineOwnerProviderCoverageAt(
+    const FileEntry* includer, const set<string>& direct_desired,
+    const string& selected_spelling, const string& selected_path,
+    SourceLocation declaration_loc, SourceLocation use_loc,
+    string* owner_spelling) const {
+  if (owner_spelling)
+    owner_spelling->clear();
+  if (!includer || !IsDottedInlineHeader(GetFilePath(includer)) ||
+      declaration_loc.isInvalid()) {
+    return DirectIncludeCoverage::kNoDirectOccurrence;
+  }
+
+  const auto& source_manager = preprocessor_->getSourceManager();
+  const SourceLocation declaration =
+      source_manager.getExpansionLoc(declaration_loc);
+  if (declaration.isInvalid() || !declaration.isFileID())
+    return DirectIncludeCoverage::kUnknown;
+  const FileID declaration_file_id = source_manager.getFileID(declaration);
+  const string expected_path = selected_path.empty()
+      ? string()
+      : NormalizeFilePath(MakeAbsolutePath(selected_path));
+
+  bool found = false;
+  bool unknown = false;
+  for (const DirectIncludeCondition& owner : direct_include_conditions_) {
+    if (owner.includer != includer || !owner.includee ||
+        !IsExactPlainCounterpart(GetFilePath(includer),
+                                 GetFilePath(owner.includee))) {
+      continue;
+    }
+    found = true;
+    if (!ContainsKey(direct_desired, owner.quoted_include))
+      continue;
+    const DirectIncludeCoverage owner_coverage =
+        DirectOccurrenceCoverageAt(owner, use_loc);
+    if (owner_coverage == DirectIncludeCoverage::kUnknown) {
+      unknown = true;
+      continue;
+    }
+    if (owner_coverage != DirectIncludeCoverage::kCoversUse ||
+        owner.includee_file_id.isInvalid()) {
+      continue;
+    }
+
+    for (const DirectIncludeCondition& selected : direct_include_conditions_) {
+      const SourceLocation selected_loc =
+          source_manager.getExpansionLoc(selected.location);
+      if (selected.includer != owner.includee || !selected.includee ||
+          selected.quoted_include != selected_spelling ||
+          selected_loc.isInvalid() || !selected_loc.isFileID() ||
+          source_manager.getFileID(selected_loc) != owner.includee_file_id ||
+          (!expected_path.empty() &&
+           NormalizeFilePath(MakeAbsolutePath(GetFilePath(selected.includee))) !=
+               expected_path)) {
+        continue;
+      }
+      const bool protected_selected =
+          LineHasText(selected.location, "// IWYU pragma: keep") ||
+          LineHasText(selected.location, "/* IWYU pragma: keep") ||
+          LineHasText(selected.location, "// IWYU pragma: export") ||
+          LineHasText(selected.location, "/* IWYU pragma: export");
+      if (!protected_selected)
+        continue;
+      bool selected_unknown = false;
+      if (!DirectOccurrenceIsUnconditional(selected, &selected_unknown)) {
+        unknown = unknown || selected_unknown;
+        continue;
+      }
+      if (selected.includee_file_id != declaration_file_id &&
+          !SkippedDottedInlineOccurrenceProvides(
+              selected, declaration_loc, use_loc)) {
+        continue;
+      }
+      if (owner_spelling)
+        *owner_spelling = owner.quoted_include;
+      return DirectIncludeCoverage::kCoversUse;
+    }
+  }
+  if (!found)
+    return DirectIncludeCoverage::kNoDirectOccurrence;
+  return unknown ? DirectIncludeCoverage::kUnknown
+                 : DirectIncludeCoverage::kDoesNotCoverUse;
+}
+
 vector<IwyuPreprocessorInfo::DefinitionProviderCoverage>
 IwyuPreprocessorInfo::EnteredDefinitionProviderCoverages(
     const FileEntry* includer, SourceLocation definition_loc) const {
