@@ -11,14 +11,14 @@
 
 // If we use a class in a way that only requires a forward-declaration,
 // and the class is defined in some file we directly #include, we don't
-// need the forward-decl here.  But if it's only *declared* in a file
-// we directly #include, we *do* need the forward-decl.
+// need the forward-decl here. A declaration from one exact direct include also
+// makes a source-file-local duplicate unnecessary; published headers still own
+// their local declaration.
 
 #include "tests/cxx/re_fwd_decl.h"
 #include "tests/cxx/re_fwd_decl-d1.h"
 
 Direct* d = 0;
-// IWYU: Indirect needs a declaration
 Indirect* i = 0;
 // This is not an iwyu violation because it's declared in the .h file
 DeclaredInH* dih = 0;
@@ -29,14 +29,6 @@ FullUse fu;
 
 /**** IWYU_SUMMARY
 
-tests/cxx/re_fwd_decl.cc should add these lines:
-class Indirect;
-
-tests/cxx/re_fwd_decl.cc should remove these lines:
-
-The full include-list for tests/cxx/re_fwd_decl.cc:
-#include "tests/cxx/re_fwd_decl.h"
-#include "tests/cxx/re_fwd_decl-d1.h"  // for Direct (ptr only), FullUse
-class Indirect;
+(tests/cxx/re_fwd_decl.cc has correct #includes/fwd-decls)
 
 ***** IWYU_SUMMARY */

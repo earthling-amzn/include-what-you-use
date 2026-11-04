@@ -1,0 +1,4 @@
+#ifndef IWYU_TESTS_FWD_ORDER_DIRECT_INLINE_HPP_
+#define IWYU_TESTS_FWD_ORDER_DIRECT_INLINE_HPP_
+class Fwd006DirectInline {};
+#endif

@@ -3435,6 +3435,44 @@ IwyuPreprocessorInfo::ComputeAssociatedDefinitionProviderCoverageAt(
 }
 
 IwyuPreprocessorInfo::DirectIncludeCoverage
+IwyuPreprocessorInfo::DirectDeclarationCoverageAt(
+    const FileEntry* includer, SourceLocation declaration_loc,
+    SourceLocation use_loc) const {
+  if (!includer || declaration_loc.isInvalid() || use_loc.isInvalid())
+    return DirectIncludeCoverage::kUnknown;
+
+  const auto& source_manager = preprocessor_->getSourceManager();
+  const SourceLocation declaration =
+      source_manager.getExpansionLoc(declaration_loc);
+  if (declaration.isInvalid() || !declaration.isFileID())
+    return DirectIncludeCoverage::kUnknown;
+  const FileID declaration_file_id = source_manager.getFileID(declaration);
+  if (declaration_file_id.isInvalid())
+    return DirectIncludeCoverage::kUnknown;
+
+  bool found = false;
+  bool unknown = false;
+  for (const DirectIncludeCondition& include : direct_include_conditions_) {
+    if (include.includer != includer ||
+        include.includee_file_id != declaration_file_id) {
+      continue;
+    }
+    found = true;
+    const DirectIncludeCoverage coverage =
+        DirectOccurrenceCoverageAt(include, use_loc);
+    if (coverage == DirectIncludeCoverage::kCoversUse)
+      return coverage;
+    if (coverage == DirectIncludeCoverage::kUnknown)
+      unknown = true;
+  }
+  if (!found)
+    return DirectIncludeCoverage::kNoDirectOccurrence;
+  return unknown ? DirectIncludeCoverage::kUnknown
+                 : DirectIncludeCoverage::kDoesNotCoverUse;
+}
+
+
+IwyuPreprocessorInfo::DirectIncludeCoverage
 IwyuPreprocessorInfo::AssociatedDeclarationCoverageAt(
     const FileEntry* includer, const FileEntry* associated_header,
     SourceLocation declaration_loc, SourceLocation use_loc) const {

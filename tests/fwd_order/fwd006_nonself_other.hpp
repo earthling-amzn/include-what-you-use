@@ -1,0 +1,4 @@
+#ifndef IWYU_TESTS_FWD_ORDER_NONSELF_OTHER_HPP_
+#define IWYU_TESTS_FWD_ORDER_NONSELF_OTHER_HPP_
+struct Fwd006Unrelated {};
+#endif

@@ -1777,18 +1777,29 @@ void CalculateIwyuForForwardDeclareUse(
     }
   }
 
-  // We also want to know if *any* redecl of this type is defined
-  // in the same file as the use (and before it).
   const set<const NamedDecl*>& redecls = GetTagRedecls(tag_decl);
-  for (const NamedDecl* redecl : redecls) {
-    if (DeclIsVisibleToUseInSameFile(redecl, *use, preprocessor_info)) {
-      same_file_decl = redecl;
-      break;
+
+  // A source file does not need to repeat a declaration introduced by one exact
+  // direct include occurrence. Check external providers before the local
+  // declaration so the latter can be diagnosed as redundant. Published headers
+  // intentionally keep owning their local declarations.
+  if (!IsHeaderFile(GetFilePath(use_file))) {
+    for (const NamedDecl* redecl : redecls) {
+      const string provider = ConvertToQuotedInclude(GetFilePath(redecl));
+      if (!ContainsKey(direct_desired_includes, provider))
+        continue;
+      if (preprocessor_info->DirectDeclarationCoverageAt(
+              use_file, GetLocation(redecl), use->use_loc()) ==
+          IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse) {
+        same_file_decl = redecl;
+        break;
+      }
     }
   }
-  // If there's no redecl in the .cc file, accept one in an associated header
-  // only when the exact entered associated instance dominates this use.
-  if (!same_file_decl) {
+
+  // A source file may also inherit one declaration from its exact associated
+  // owner occurrence. No FileEntry-union or deeper declaration chain is used.
+  if (!same_file_decl && !IsHeaderFile(GetFilePath(use_file))) {
     for (const NamedDecl* redecl : redecls) {
       const FileEntry* associated = GetFileEntry(redecl);
       if (!ContainsKey(associated_includes, associated))
@@ -1796,6 +1807,16 @@ void CalculateIwyuForForwardDeclareUse(
       if (preprocessor_info->AssociatedDeclarationCoverageAt(
               use_file, associated, GetLocation(redecl), use->use_loc()) ==
           IwyuPreprocessorInfo::DirectIncludeCoverage::kCoversUse) {
+        same_file_decl = redecl;
+        break;
+      }
+    }
+  }
+
+  // Otherwise use a declaration visible in the same file and before the use.
+  if (!same_file_decl) {
+    for (const NamedDecl* redecl : redecls) {
+      if (DeclIsVisibleToUseInSameFile(redecl, *use, preprocessor_info)) {
         same_file_decl = redecl;
         break;
       }

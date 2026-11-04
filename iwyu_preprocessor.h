@@ -327,6 +327,14 @@ class IwyuPreprocessorInfo : public clang::PPCallbacks,
       clang::SourceLocation definition_loc,
       clang::SourceLocation use_loc, bool allow_later_root) const;
 
+  // Proves that one exact direct include occurrence introduces the declaration
+  // instance before the source-file use. This is intentionally not used for
+  // published headers, which must own their local forward declarations.
+  DirectIncludeCoverage DirectDeclarationCoverageAt(
+      const clang::FileEntry* includer,
+      clang::SourceLocation declaration_loc,
+      clang::SourceLocation use_loc) const;
+
   // Proves only the root associated-header occurrence and declaration
   // instance, for forward declarations supplied by the associated header.
   DirectIncludeCoverage AssociatedDeclarationCoverageAt(

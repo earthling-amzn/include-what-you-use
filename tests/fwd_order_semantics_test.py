@@ -234,6 +234,93 @@ CASES = [
             declaration("class Fwd004MappedAmbiguous;"),
         ],
     },
+    {
+        "name": "associated-declaration-only",
+        "source": "fwd006_associated_decl.cc",
+        "target": "fwd006_associated_decl.cc",
+        "decl": "class Fwd006AssociatedDeclared;",
+        "present": False,
+        "operations": [operation(
+            "remove", "forward_declaration",
+            "class Fwd006AssociatedDeclared;")],
+        "items": [include(
+            "fwd006_associated_decl.hpp", ["Fwd006AssociatedAnchor"])],
+    },
+    {
+        "name": "direct-declaration-only-source",
+        "source": "fwd006_direct_decl.cc",
+        "target": "fwd006_direct_decl.cc",
+        "decl": "class Fwd006DirectDeclared;",
+        "present": False,
+        "operations": [operation(
+            "remove", "forward_declaration",
+            "class Fwd006DirectDeclared;")],
+        "items": [include(
+            "fwd006_direct_decl_provider.hpp",
+            ["Fwd006DirectAnchor"])],
+    },
+    {
+        "name": "direct-declaration-only-header",
+        "source": "fwd006_direct_decl_header.cc",
+        "target": "fwd006_direct_decl_header.hpp",
+        "decl": "class Fwd006DirectDeclared;",
+        "present": True,
+        "operations": [],
+        "items": [
+            include("fwd006_direct_decl_provider.hpp", ["Fwd006DirectAnchor"]),
+            declaration("class Fwd006DirectDeclared;"),
+        ],
+    },
+    {
+        "name": "direct-dotted-inline-self",
+        "source": "fwd006_direct_inline_consumer.cc",
+        "target": "fwd006_direct_inline_consumer.cc",
+        "decl": "class Fwd006DirectInline;",
+        "present": False,
+        "operations": [operation(
+            "remove", "forward_declaration", "class Fwd006DirectInline;")],
+        "items": [include(
+            "fwd006_direct_inline.inline.hpp",
+            ["Fwd006DirectInline (ptr only)", "Fwd006DirectInlineAnchor"])],
+    },
+    {
+        "name": "direct-dotted-inline-nonself",
+        "source": "fwd006_nonself_inline_consumer.cc",
+        "target": "fwd006_nonself_inline_consumer.cc",
+        "decl": "class Fwd006NonselfInline;",
+        "present": True,
+        "operations": [],
+        "items": [
+            include("fwd006_nonself_inline.inline.hpp", ["Fwd006NonselfAnchor"]),
+            declaration("class Fwd006NonselfInline;"),
+        ],
+    },
+    {
+        "name": "direct-declaration-provider-removed",
+        "source": "fwd006_late_decl.cc",
+        "target": "fwd006_late_decl.cc",
+        "decl": "class Fwd006DirectDeclared;",
+        "present": True,
+        "operations": [operation(
+            "remove", "include",
+            '#include "tests/fwd_order/fwd006_direct_decl_provider.hpp"')],
+        "items": [
+            include("fwd006_late_decl.hpp", ["Fwd006LateOwner"]),
+            declaration("class Fwd006DirectDeclared;"),
+        ],
+    },
+    {
+        "name": "associated-declaration-only-header",
+        "source": "fwd006_header_owner.cc",
+        "target": "fwd006_header_owner.inline.hpp",
+        "decl": "class Fwd006HeaderAssociated;",
+        "present": True,
+        "operations": [],
+        "items": [
+            include("fwd006_header_owner.hpp", ["Fwd006HeaderAssociatedAnchor"]),
+            declaration("class Fwd006HeaderAssociated;"),
+        ],
+    },
 ]
 
 
