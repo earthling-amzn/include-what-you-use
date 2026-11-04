@@ -3843,6 +3843,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
     struct DeclarationFact {
       string qualified_name;
       string kind;
+      bool is_definition;
       StructuredLocationValue declaration;
     };
     vector<DeclarationFact> facts;
@@ -3856,15 +3857,22 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       StructuredLocationValue declaration;
       if (!StructuredLocation(GetLocation(identity), false, &declaration))
         continue;
+      bool is_definition = false;
+      if (const TagDecl* tag = DynCastFrom(identity))
+        is_definition = tag->isCompleteDefinition();
+      if (const ClassTemplateDecl* tpl = DynCastFrom(identity))
+        is_definition = tpl->getTemplatedDecl()->isCompleteDefinition();
       facts.push_back({internal::GetQualifiedNameAsString(identity), kind,
-                       declaration});
+                       is_definition, declaration});
     }
     std::sort(facts.begin(), facts.end(), [](const DeclarationFact& lhs,
                                              const DeclarationFact& rhs) {
-      return std::tie(lhs.qualified_name, lhs.kind, lhs.declaration.path,
-                      lhs.declaration.line, lhs.declaration.column) <
-             std::tie(rhs.qualified_name, rhs.kind, rhs.declaration.path,
-                      rhs.declaration.line, rhs.declaration.column);
+      return std::make_tuple(lhs.qualified_name, lhs.kind,
+                             !lhs.is_definition, lhs.declaration.path,
+                             lhs.declaration.line, lhs.declaration.column) <
+             std::make_tuple(rhs.qualified_name, rhs.kind,
+                             !rhs.is_definition, rhs.declaration.path,
+                             rhs.declaration.line, rhs.declaration.column);
     });
     facts.erase(std::unique(
         facts.begin(), facts.end(), [](const DeclarationFact& lhs,
