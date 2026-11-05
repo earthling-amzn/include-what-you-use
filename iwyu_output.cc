@@ -2597,6 +2597,20 @@ const NamedDecl* StructuredDeclarationIdentity(const NamedDecl* decl) {
   return decl;
 }
 
+const NamedDecl* StructuredDeclarationFactIdentity(const NamedDecl* decl) {
+  const NamedDecl* identity = StructuredDeclarationIdentity(decl);
+  if (const ClassTemplateDecl* tpl = dyn_cast<ClassTemplateDecl>(identity)) {
+    if (const CXXRecordDecl* definition = tpl->getTemplatedDecl()->getDefinition())
+      return StructuredDeclarationIdentity(definition);
+    return identity;
+  }
+  if (const TagDecl* tag = dyn_cast<TagDecl>(identity)) {
+    if (const TagDecl* definition = tag->getDefinition())
+      return StructuredDeclarationIdentity(definition);
+  }
+  return identity;
+}
+
 string StructuredDeclarationKind(const NamedDecl* input_decl) {
   const NamedDecl* decl = StructuredDeclarationIdentity(input_decl);
   if (!decl)
@@ -3291,7 +3305,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
       symbol["declaration"] = declaration_fact
           ? AvailableLocation(
                 GlobalFlags().output_schema_version >= 2
-                    ? GetLocation(StructuredDeclarationIdentity(
+                    ? GetLocation(StructuredDeclarationFactIdentity(
                           declaration_fact->use->decl()))
                     : declaration_fact->use->decl_loc(),
                 false)
@@ -3850,7 +3864,7 @@ void IwyuFileInfo::EmitStructuredOutputRecord() const {
     for (const OneUse& use : symbol_uses_) {
       if (!HasStableDeclarationIdentity(use))
         continue;
-      const NamedDecl* identity = StructuredDeclarationIdentity(use.decl());
+      const NamedDecl* identity = StructuredDeclarationFactIdentity(use.decl());
       const string kind = StructuredDeclarationKind(identity);
       if (kind.empty())
         continue;
