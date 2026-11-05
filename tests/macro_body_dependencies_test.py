@@ -14,6 +14,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -59,6 +60,25 @@ def source_location(path, content, needle):
     }
 
 
+def assert_schema2_records(records):
+    for record in records:
+        if record.get("schema_version") != 2:
+            raise AssertionError(f"macro record is not schema 2: {record}")
+        identity = record.get("source_identity")
+        digest = record.get("source_digest")
+        file_digest = record.get("file_digest")
+        if (not isinstance(identity, str) or not os.path.isabs(identity) or
+                not isinstance(digest, str) or
+                file_digest != {"status": "known", "value": digest} or
+                not isinstance(record.get("declaration_facts"), list) or
+                not isinstance(record.get("conditional_regions"), list)):
+            raise AssertionError(f"incomplete schema-2 macro envelope: {record}")
+        for operation in record["operations"]:
+            if (operation["subject_action"] in ("remove", "keep") and
+                    operation["source_range"]["status"] != "known"):
+                raise AssertionError(
+                    f"macro present operation lacks exact range: {operation}")
+
 def run_reviewer_case(*, root, analyzer, compiler, fixer, name, sources,
                       retained=(), removed=(), provenance=None, evidence=None,
                       consumers=("future.cpp",), link_sources=()):
@@ -75,10 +95,12 @@ def run_reviewer_case(*, root, analyzer, compiler, fixer, name, sources,
 
     json_args = [
         analyzer, "-Xiwyu", "--output_format=json", "-Xiwyu",
+        "--output_schema=2", "-Xiwyu",
         "--check_also=export.h", "-I", ".", "analysis.cc",
     ]
     json_run = run(json_args, cwd=case_root)
     records = [json.loads(line) for line in json_run.stdout.splitlines()]
+    assert_schema2_records(records)
     operations = [
         operation
         for record in records
@@ -233,6 +255,7 @@ def run_reviewer_case(*, root, analyzer, compiler, fixer, name, sources,
         if condition["status"] != expected.get("condition_status",
                                                 "not_applicable"):
             raise AssertionError(f"{name}: macro condition differs: {use}")
+
         if ("condition_expression" in expected and
                 condition["value"]["expression"] !=
                     expected["condition_expression"]):
@@ -253,6 +276,57 @@ def run_reviewer_case(*, root, analyzer, compiler, fixer, name, sources,
         run([compiler, "-std=c++17", "-I", ".", consumer,
              *link_sources, "-o", str(executable)], cwd=case_root)
         run([str(executable)], cwd=case_root)
+
+
+def run_silent_gap_case(*, root, analyzer, compiler, fixer, name, sources):
+    case_root = root / "silent-gap" / name
+    case_root.mkdir(parents=True)
+    write_sources(case_root, sources)
+    run([compiler, "-std=c++17", "-I", ".", "future.cpp", "-o", "before"],
+        cwd=case_root)
+    run([str(case_root / "before")], cwd=case_root)
+    advice_run = run([
+        analyzer, "-Xiwyu", "--verbose=3", "-Xiwyu",
+        "--check_also=export.h", "-I", ".", "analysis.cc"], cwd=case_root)
+    advice = advice_run.stdout + advice_run.stderr
+    json_run = run([
+        analyzer, "-Xiwyu", "--output_format=json", "-Xiwyu",
+        "--output_schema=2", "-Xiwyu", "--check_also=export.h",
+        "-I", ".", "analysis.cc"], cwd=case_root)
+    records = [json.loads(line) for line in json_run.stdout.splitlines()]
+    assert_schema2_records(records)
+    export_record = next(record for record in records
+                         if record["file"]["path"].endswith("export.h"))
+    provider_operations = [
+        operation for operation in export_record["operations"]
+        if operation["spelling"] == '#include "provider.h"']
+    if (len(provider_operations) != 1 or
+            provider_operations[0]["subject_action"] != "remove" or
+            provider_operations[0]["disposition"] != "apply" or
+            provider_operations[0]["reason_code"] !=
+                "undesired_item_present" or
+            export_record["diagnostics"] or
+            any(operation["reason_code"].startswith("macro_body_dependency")
+                for operation in export_record["operations"])):
+        raise AssertionError(
+            f"{name}: provider removal was not silent and ordinary: "
+            f"{export_record}")
+    if '- #include "provider.h"' not in advice:
+        raise AssertionError(f"{name}: silent-gap provider was not removable")
+    run([fixer, "--nosafe_headers", "--nocomments"], cwd=case_root,
+        input_text=advice)
+    export_text = (case_root / "export.h").read_text()
+    if '#include "provider.h"' in export_text:
+        raise AssertionError(f"{name}: provider removal did not apply")
+    for line in sources["export.h"].splitlines():
+        if "#include" in line and "IWYU pragma: keep" in line and \
+                line not in export_text.splitlines():
+            raise AssertionError(f"{name}: protected support include changed: {line}")
+    after = subprocess.run(
+        [compiler, "-std=c++17", "-I", ".", "future.cpp", "-o", "after"],
+        cwd=case_root, text=True, capture_output=True)
+    if after.returncode == 0:
+        raise AssertionError(f"{name}: provider removal unexpectedly compiled")
 
 
 def run_reviewer_reproducers(*, root, analyzer, compiler, fixer):
@@ -722,6 +796,32 @@ def run_reviewer_reproducers(*, root, analyzer, compiler, fixer):
     for case in cases:
         run_reviewer_case(root=root, analyzer=analyzer, compiler=compiler,
                           fixer=fixer, **case)
+
+    silent_gap_cases = [
+        ("object-like", {
+            "provider.h": "#pragma once\nnamespace object_gap { inline int select(int v) { return v + 1; } }\n",
+            "export.h": "#pragma once\n#include \"provider.h\"\n#define OBJECT_SELECT ::object_gap::select\n",
+            "analysis.cc": "#include \"export.h\"\nint analysis_anchor;\n",
+            "future.cpp": "#include \"export.h\"\nint main() { return OBJECT_SELECT(1) == 2 ? 0 : 1; }\n",
+        }),
+        ("type-alias-qualified", {
+            "provider.h": "#pragma once\nstruct TypeGap { static int select(int v) { return v + 2; } };\n",
+            "alias.h": "#pragma once\nstruct TypeGap;\nusing TypeAlias = TypeGap;\n",
+            "export.h": "#pragma once\n#include \"alias.h\"  // IWYU pragma: keep\n#include \"provider.h\"\n#define TYPE_ALIAS_SELECT(v) TypeAlias::select(v)\n",
+            "analysis.cc": "#include \"export.h\"\nint analysis_anchor;\n",
+            "future.cpp": "#include \"export.h\"\nint main() { return TYPE_ALIAS_SELECT(1) == 3 ? 0 : 1; }\n",
+        }),
+        ("alias-through-using", {
+            "provider.h": "#pragma once\nnamespace split_impl { inline int select(int v) { return v + 3; } }\n",
+            "exposure.h": "#pragma once\nnamespace split_alias = split_impl;\nnamespace split_api { using split_alias::select; }\n",
+            "export.h": "#pragma once\n#include \"provider.h\"\n#include \"exposure.h\"  // IWYU pragma: keep\n#define SPLIT_SELECT(v) ::split_api::select(v)\n",
+            "analysis.cc": "#include \"export.h\"\nint analysis_anchor;\n",
+            "future.cpp": "#include \"export.h\"\nint main() { return SPLIT_SELECT(1) == 4 ? 0 : 1; }\n",
+        }),
+    ]
+    for name, sources in silent_gap_cases:
+        run_silent_gap_case(root=root, analyzer=analyzer, compiler=compiler,
+                            fixer=fixer, name=name, sources=sources)
     consumer_count = sum(len(case.get("consumers", ("future.cpp",)))
                          for case in cases)
     print(f"reviewer reproducers passed: {len(cases)} cases, "
@@ -765,11 +865,13 @@ def main():
                 raise AssertionError(f"missing removal evidence for {expected}")
 
         json_run = run(
-            [analyzer, "-Xiwyu", "--output_format=json", *check_nested,
+            [analyzer, "-Xiwyu", "--output_format=json", "-Xiwyu",
+             "--output_schema=2", *check_nested,
              "-I", ".", translation_unit],
             cwd=root,
         )
         records = [json.loads(line) for line in json_run.stdout.splitlines()]
+        assert_schema2_records(records)
         macro_keeps = {
             operation["spelling"]: operation["reason"]
             for record in records
