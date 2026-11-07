@@ -1070,9 +1070,11 @@ void IwyuPreprocessorInfo::MacroDefined(const Token& id,
     }
   }
 
-  if (macro_loc.isValid() && macro->isFunctionLike()) {
-    const set<const clang::IdentifierInfo*> parameters(macro->param_begin(),
-                                                        macro->param_end());
+  if (macro_loc.isValid()) {
+    set<const clang::IdentifierInfo*> parameters;
+    if (macro->isFunctionLike()) {
+      parameters.insert(macro->param_begin(), macro->param_end());
+    }
     MacroBodyDependency body{macro, macro_loc, macro_name, {}, false};
     set<string> seen;
     const llvm::ArrayRef<Token> tokens = macro->tokens();
@@ -1952,6 +1954,7 @@ struct NamespaceAliasFact {
 struct MacroDeclarationIndex {
   map<string, vector<MacroLookupFact>> lookups;
   map<const NamedDecl*, vector<SourceLocation>> identity_locations;
+  // Both namespace aliases and type aliases rewrite a qualified lookup prefix.
   vector<NamespaceAliasFact> namespace_aliases;
 };
 
@@ -1997,6 +2000,18 @@ void IndexMacroBodyDeclarations(const clang::DeclContext* context,
     if (const auto* alias = clang::dyn_cast<clang::NamespaceAliasDecl>(decl)) {
       const string alias_name = AbsoluteQualifiedName(alias);
       const string target_name = AbsoluteQualifiedName(alias->getNamespace());
+      if (!alias_name.empty() && !target_name.empty()) {
+        index->namespace_aliases.push_back(
+            {alias_name, target_name, GetLocation(alias)});
+      }
+    }
+
+    if (const auto* alias = clang::dyn_cast<clang::TypedefNameDecl>(decl)) {
+      const clang::QualType canonical =
+          alias->getUnderlyingType().getCanonicalType();
+      const clang::TagDecl* target = canonical->getAsTagDecl();
+      const string alias_name = AbsoluteQualifiedName(alias);
+      const string target_name = target ? AbsoluteQualifiedName(target) : "";
       if (!alias_name.empty() && !target_name.empty()) {
         index->namespace_aliases.push_back(
             {alias_name, target_name, GetLocation(alias)});
@@ -2171,6 +2186,13 @@ void IwyuPreprocessorInfo::ResolveMacroBodyDependencies(
         if (identity_it == declarations.identity_locations.end())
           continue;
         const vector<SourceLocation>& identity_locations = identity_it->second;
+        const bool has_direct_exposure = !fact.is_using_exposure ||
+            std::any_of(direct_occurrences.begin(), direct_occurrences.end(),
+                        [&](const DirectIncludeCondition* include) {
+                          return include->includee_file_id.isValid() &&
+                              instance_contains_location(
+                                  include, fact.exposure_location);
+                        });
         for (const DirectIncludeCondition* include : direct_occurrences) {
           bool exposes_lookup = !fact.is_using_exposure;
           if (fact.is_using_exposure && include->includee_file_id.isValid()) {
@@ -2184,7 +2206,8 @@ void IwyuPreprocessorInfo::ResolveMacroBodyDependencies(
                           [&](SourceLocation location) {
                             return instance_contains_location(include, location);
                           });
-          if (exposes_lookup && contains_declaration) {
+          if ((exposes_lookup || has_direct_exposure) &&
+              contains_declaration) {
             if (reference.was_macro)
               uncertain_providers.insert(include->includee);
             else
@@ -2275,7 +2298,7 @@ void IwyuPreprocessorInfo::ResolveMacroBodyDependencies(
     if (!report.unavailable) {
       macro_file_info->ReportKnownDesiredFile(
           provider, "macro_body_dependency",
-          "Function-like macro " + report.macro_name + " reference " +
+          "Macro " + report.macro_name + " reference " +
               report.reference + " resolves uniquely to declaration " +
               report.resolved_name +
               " through this direct effective provider.");
@@ -2287,21 +2310,21 @@ void IwyuPreprocessorInfo::ResolveMacroBodyDependencies(
       }
       ERRSYM(macro_file)
           << "Keep #include " << provider->getName() << " in "
-          << macro_file->getName() << " because function-like macro "
+          << macro_file->getName() << " because macro "
           << report.macro_name << " reference " << report.reference
           << " resolves uniquely to " << report.resolved_name
           << " through that direct effective provider.\n";
     } else {
       macro_file_info->ReportKnownDesiredFile(
           provider, "macro_body_dependency_unavailable",
-          "Function-like macro " + report.macro_name + " reference " +
+          "Macro " + report.macro_name + " reference " +
               report.reference +
               " has ambiguous declaration or provider identity; schema-v1 "
               "provenance is unavailable, so the present candidate is "
               "retained conservatively.");
       ERRSYM(macro_file)
           << "Keep #include " << provider->getName() << " in "
-          << macro_file->getName() << " because function-like macro "
+          << macro_file->getName() << " because macro "
           << report.macro_name << " reference " << report.reference
           << " is ambiguous; retain the candidate with unavailable "
              "provenance.\n";

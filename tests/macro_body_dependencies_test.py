@@ -302,31 +302,27 @@ def run_silent_gap_case(*, root, analyzer, compiler, fixer, name, sources):
         if operation["spelling"] == '#include "provider.h"']
     if (len(provider_operations) != 1 or
             provider_operations[0]["subject_action"] != "remove" or
-            provider_operations[0]["disposition"] != "apply" or
-            provider_operations[0]["reason_code"] !=
-                "undesired_item_present" or
-            export_record["diagnostics"] or
-            any(operation["reason_code"].startswith("macro_body_dependency")
-                for operation in export_record["operations"])):
+            provider_operations[0]["disposition"] != "keep" or
+            not provider_operations[0]["reason_code"].startswith(
+                "macro_body_dependency") or
+            export_record["diagnostics"]):
         raise AssertionError(
-            f"{name}: provider removal was not silent and ordinary: "
+            f"{name}: provider was not retained by macro provenance: "
             f"{export_record}")
-    if '- #include "provider.h"' not in advice:
-        raise AssertionError(f"{name}: silent-gap provider was not removable")
+    if '- #include "provider.h"' in advice:
+        raise AssertionError(f"{name}: provider remained removable")
     run([fixer, "--nosafe_headers", "--nocomments"], cwd=case_root,
         input_text=advice)
     export_text = (case_root / "export.h").read_text()
-    if '#include "provider.h"' in export_text:
-        raise AssertionError(f"{name}: provider removal did not apply")
+    if '#include "provider.h"' not in export_text:
+        raise AssertionError(f"{name}: fixer removed macro provider")
     for line in sources["export.h"].splitlines():
         if "#include" in line and "IWYU pragma: keep" in line and \
                 line not in export_text.splitlines():
             raise AssertionError(f"{name}: protected support include changed: {line}")
-    after = subprocess.run(
-        [compiler, "-std=c++17", "-I", ".", "future.cpp", "-o", "after"],
-        cwd=case_root, text=True, capture_output=True)
-    if after.returncode == 0:
-        raise AssertionError(f"{name}: provider removal unexpectedly compiled")
+    run([compiler, "-std=c++17", "-I", ".", "future.cpp", "-o", "after"],
+        cwd=case_root)
+    run([str(case_root / "after")], cwd=case_root)
 
 
 def run_reviewer_reproducers(*, root, analyzer, compiler, fixer):
