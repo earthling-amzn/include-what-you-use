@@ -1126,6 +1126,13 @@ void IwyuPreprocessorInfo::MacroDefined(const Token& id,
         current += 2;
       }
       index = current;
+      // An unqualified token in an object-like replacement may be an include
+      // operand (for example `#define HEADER <locale>`). Without an expansion
+      // context it is not evidence of a semantic declaration dependency.
+      if (!macro->isFunctionLike() && !reference.globally_qualified &&
+          reference.components.size() == 1) {
+        continue;
+      }
       if (!contains_parameter && seen.insert(spelling).second)
         body.references.push_back(std::move(reference));
     }
